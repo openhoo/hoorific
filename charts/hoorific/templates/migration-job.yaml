@@ -1,0 +1,101 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "hoorific.fullname" . }}-migration
+  labels:
+    {{- include "hoorific.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        {{- include "hoorific.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migration
+          image: {{ include "hoorific.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toJson .Values.commands.migrate }}
+          args: ["--config", "/etc/hoorific/config.json"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: migration-config
+              mountPath: /etc/hoorific/config.json
+              subPath: config.json
+              readOnly: true
+            - name: postgres-secret
+              mountPath: /etc/hoorific/secrets/postgres-dsn
+              subPath: postgres-dsn
+              readOnly: true
+            - name: encryption-secret
+              mountPath: /etc/hoorific/secrets/encryption-master-key
+              subPath: encryption-master-key
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /var/lib/hoorific
+{{ if .Values.config.coordination.redis.enabled }}
+            - name: redis-secret
+              mountPath: /etc/hoorific/secrets/redis-url
+              subPath: redis-url
+              readOnly: true
+{{ end }}
+{{ if .Values.config.oidc.enabled }}
+            - name: oidc-secret
+              mountPath: /etc/hoorific/secrets/oidc-client-secret
+              subPath: oidc-client-secret
+              readOnly: true
+{{ end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpVolume.sizeLimit }}
+        - name: data
+          emptyDir:
+            sizeLimit: {{ .Values.dataVolume.sizeLimit }}
+        - name: migration-config
+          configMap:
+            name: {{ include "hoorific.fullname" . }}-migration-config
+        - name: postgres-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.postgres.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.postgres.key | quote }}
+                path: postgres-dsn
+        - name: encryption-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.encryption.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.encryption.key | quote }}
+                path: encryption-master-key
+{{ if .Values.config.coordination.redis.enabled }}
+        - name: redis-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.redis.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.redis.key | quote }}
+                path: redis-url
+{{ end }}
+{{ if .Values.config.oidc.enabled }}
+        - name: oidc-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.oidc.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.oidc.key | quote }}
+                path: oidc-client-secret
+{{ end }}

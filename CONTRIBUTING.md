@@ -1,0 +1,145 @@
+# Contributing to Hoorific
+
+Thanks for taking the time to improve Hoorific. Keep pull requests focused,
+explain the user-visible or operational reason for the change, and include the
+checks you actually ran. Do not put credentials, production data, databases,
+private configuration, browser storage state, or provider responses in a pull
+request or its artifacts.
+
+Hoorific does not publish a release or support-policy promise yet. Treat the
+current source and qualification commands as the repository contract, not as a
+claim of provider entitlement, production availability, or Kubernetes
+qualification.
+
+## Prerequisites
+
+- Go 1.27.0, as declared by `go.mod`.
+- Bun 1.3.14, matching the frontend image and CI.
+- Python 3.13 for the SDK/browser qualification.
+- Podman (preferred) or a Docker-compatible builder for the image. The full
+  deterministic `all` scenario also requires local Podman for its isolated FAL
+  namespace and a cached PostgreSQL 17 image.
+
+The verifier owns its temporary data, keys, loopback fixtures, and evidence
+paths. It does not use an operator database or ambient provider credentials.
+
+## Fresh-checkout build order
+
+Generated API types and console assets are source-only build outputs. Start from
+an empty generated directory and run the schema stage before the frontend; run
+both before Go tests or a runtime build:
+
+```sh
+mkdir -p .artifacts
+go run -trimpath ./tools/schema --output .artifacts/admin-openapi.json
+mkdir -p web/src/generated
+(
+  cd web
+  bun install --frozen-lockfile
+  bun run generate-api
+  bun run typecheck
+  bun run build
+)
+
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o .artifacts/hoorific ./cmd/hoorific
+CGO_ENABLED=0 go build -trimpath -tags qualification -ldflags='-s -w' \
+  -o .artifacts/hoorific-qualification ./cmd/hoorific
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+  -o .artifacts/hoorific-verify ./tools/verify
+
+go vet ./...
+go test -race ./...
+```
+
+The qualification-tagged gateway is test-only and must never be deployed.
+Neither `internal/console/assets/` nor `web/src/generated/` should be
+committed; both are rebuilt by the commands above and ignored by Git.
+
+## Deterministic qualification
+
+The complete standalone scenario includes the deep management/protocol checks,
+credential lifecycle, SDK checks, and the isolated FAL namespace. Install the
+SDK/browser requirements before running `all`; the verifier uses local images
+and never pulls them on its own:
+
+```sh
+python3 -m venv .artifacts/sdk-venv
+. .artifacts/sdk-venv/bin/activate
+python -m pip install \
+  --requirement tools/verify/sdk/requirements.txt \
+  --requirement tools/verify/sdk/requirements-browser.txt
+PLAYWRIGHT_SKIP_BROWSER_GC=1 python -m playwright install --with-deps chromium
+
+podman pull docker.io/library/postgres:17
+podman pull docker.io/library/redis:7.4-alpine
+
+.artifacts/hoorific-verify \
+  --binary .artifacts/hoorific \
+  --qualification-binary .artifacts/hoorific-qualification \
+  --mode standalone \
+  --scenario all \
+  --output .artifacts/verify-standalone.json
+```
+
+`passed`, `failed`, and `not-run` results are intentional evidence states. Do
+not turn a focused selector into a claim of complete coverage. The cluster
+selector is separate and must have both local images available:
+
+```sh
+HOORIFIC_POSTGRES_IMAGE=docker.io/library/postgres:17 \
+HOORIFIC_REDIS_IMAGE=docker.io/library/redis:7.4-alpine \
+.artifacts/hoorific-verify \
+  --binary .artifacts/hoorific \
+  --mode cluster \
+  --scenario cluster/governance \
+  --output .artifacts/verify-cluster-governance.json
+```
+
+This starts fresh, invocation-owned PostgreSQL and Redis containers, checks
+both services, and removes only those containers. It does not qualify an
+external Kubernetes cluster or a paid provider.
+
+## Browser qualification
+
+After the SDK and Chromium setup in the deterministic qualification section,
+run the actual authenticated console scenario:
+
+```sh
+HOORIFIC_VERIFY_PYTHON=.artifacts/sdk-venv/bin/python \
+  .artifacts/hoorific-verify \
+    --binary .artifacts/hoorific \
+    --mode standalone \
+    --scenario browser \
+    --output .artifacts/verify-browser-e2e.json
+```
+
+The browser scenario talks to the verifier's fresh local gateway and deterministic
+fixture. It does not use an operator browser session or contact a paid provider.
+Keep screenshots, storage state, temporary keys, databases, and diagnostics
+private; only deliberately redacted JSON/log evidence belongs in shared CI
+artifacts.
+
+## Container image
+
+Build locally with a Docker-compatible OCI builder after the source build above:
+
+```sh
+podman build --tag hoorific:local .
+# Docker is equivalent when Podman is unavailable:
+# docker build --tag hoorific:local .
+```
+
+The current workflow only builds and inspects a local image; no artifact is
+published by default. Any future registry or release publication must be a
+separate, explicitly permissioned and reviewed change.
+
+## Pull requests
+
+- Keep one coherent change per pull request and describe the risk or migration
+  impact.
+- Review generated diffs and remove local artifacts before committing.
+- Report the exact commands and meaningful result in the pull request; do not
+  claim checks that were not run.
+- Never include secrets in source, fixtures, logs, screenshots, or CI artifacts.
+- Changes to security behavior should include a focused deterministic
+  qualification case where a plausible regression would fail.

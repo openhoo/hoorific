@@ -1,0 +1,45 @@
+# Keep source and documentation deterministic across platforms.
+* text=auto eol=lf
+
+# Source and configuration
+*.go text diff=golang
+*.mod text
+*.sum text
+*.py text diff=python
+*.js text diff=javascript
+*.jsx text diff=javascript
+*.ts text diff=typescript
+*.tsx text diff=typescript
+*.css text
+*.html text
+*.json text
+*.md text
+*.sh text eol=lf
+*.sql text
+*.toml text
+*.xml text
+*.yaml text
+*.yml text
+*.lock text
+
+# Images, fonts, archives, and generated binary artifacts
+*.avif binary
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.tar binary
+*.tgz binary
+*.ttf binary
+*.webm binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.gz binary
+*.zip binary
+*.7z binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary

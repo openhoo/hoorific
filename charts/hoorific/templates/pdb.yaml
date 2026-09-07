@@ -1,0 +1,13 @@
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hoorific.fullname" . }}
+  labels:
+    {{- include "hoorific.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hoorific.selectorLabels" . | nindent 6 }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+{{- end }}

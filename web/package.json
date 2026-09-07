@@ -1,0 +1,21 @@
+{
+  "name": "hoorific-console",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "generate-api": "openapi-typescript ../.artifacts/admin-openapi.json -o src/generated/api.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "preact": "10.29.8",
+    "preact-iso": "2.12.2"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "2.10.6",
+    "typescript": "6.0.3",
+    "vite": "8.2.2",
+    "openapi-typescript": "7.13.0"
+  }
+}

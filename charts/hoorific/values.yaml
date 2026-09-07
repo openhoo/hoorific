@@ -1,0 +1,161 @@
+# Hoorific container image. Pin a digest in production rather than using latest.
+image:
+  repository: ghcr.io/example/hoorific
+  tag: "0.1.0"
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Number of stateless API replicas. Persistent state belongs in PostgreSQL.
+replicaCount: 2
+
+# Existing secrets are intentionally required; this chart never creates credentials.
+# postgres.secret must contain a key whose value is a PostgreSQL DSN.
+# encryption.secret must contain a key whose value is the keyring JSON
+# {"current":"key-id","keys":{"key-id":"<base64-key>"}}.
+existingSecrets:
+  postgres:
+    secretName: ""
+    key: dsn
+  encryption:
+    secretName: ""
+    key: master-key
+  # Optional Redis secret; its configured key contains a Redis URL.
+  redis:
+    secretName: ""
+    key: url
+  # Optional OIDC client secret; its configured key contains the client secret.
+  oidc:
+    secretName: ""
+    key: client-secret
+
+# Bootstrap configuration. File names are fixed by the templates below.
+config:
+  mode: cluster
+  schemaVersion: 1
+  dataDir: /var/lib/hoorific
+  listeners:
+    inference: ":8080"
+    management: ":8081"
+  storage:
+    postgres:
+      dsnFile: /etc/hoorific/secrets/postgres-dsn
+  encryption:
+    keyFile: /etc/hoorific/secrets/encryption-master-key
+  coordination:
+    redis:
+      enabled: false
+      urlFile: /etc/hoorific/secrets/redis-url
+  oidc:
+    enabled: false
+    issuer: ""
+    clientId: ""
+    clientSecretFile: /etc/hoorific/secrets/oidc-client-secret
+  # Public URL map is rendered as JSON and must not contain secret material.
+  publicUrls: {}
+  subscriptionConnectors:
+    enabled: false
+
+# The migration command runs before install/upgrade. Adjust only if the image
+# provides a compatible command; the chart does not validate the executable.
+commands:
+  serve: ["/usr/local/bin/hoorific", "serve"]
+  migrate: ["/usr/local/bin/hoorific", "migrate"]
+
+service:
+  inference:
+    type: ClusterIP
+    port: 8080
+  management:
+    type: ClusterIP
+    port: 8081
+
+# Requests and limits should be sized for the selected model workload.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1
+    memory: 1Gi
+
+# EmptyDir storage is deliberately ephemeral: pod replacement loses local data.
+tmpVolume:
+  sizeLimit: 256Mi
+dataVolume:
+  sizeLimit: 1Gi
+
+probes:
+  readiness:
+    path: /health/ready
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  liveness:
+    path: /health/live
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 6
+
+podAnnotations: {}
+podLabels: {}
+
+# Preferred anti-affinity spreads replicas without making a multi-node cluster mandatory.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: hoorific
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+serviceAccount:
+  # Deployment uses a chart-managed ServiceAccount; migration uses the namespace
+  # default with token automount disabled so its pre-install hook has no dependency.
+  create: true
+  automountServiceAccountToken: false
+  annotations: {}
+  name: ""
+
+pdb:
+  enabled: true
+  # With two replicas, one unavailable pod remains voluntarily evictable.
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  # Empty ingress is default-deny; add `from` peers (for example an ingress controller).
+  ingress: []
+  # Egress is default-deny except DNS. Add CIDRs for external PostgreSQL/Redis/OIDC.
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+  # Migration pods use this same egress allow-list via a separate policy selector.
+
+terminationGracePeriodSeconds: 30
+revisionHistoryLimit: 3

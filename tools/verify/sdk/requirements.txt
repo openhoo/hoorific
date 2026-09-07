@@ -1,0 +1,4 @@
+# Direct SDK dependencies are pinned separately from the gateway and browser.
+openai==3.8.0
+anthropic==1.4.0
+google-genai==2.22.0

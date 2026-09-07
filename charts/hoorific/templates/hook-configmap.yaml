@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hoorific.fullname" . }}-migration-config
+  labels:
+    {{- include "hoorific.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation
+    hoorific.io/secret-prerequisite: "Create referenced existing Secrets before Helm install"
+data:
+  config.json: {{ include "hoorific.config" . | quote }}

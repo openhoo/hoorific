@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hoorific.fullname" . }}
+  labels:
+    {{- include "hoorific.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "hoorific.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- include "hoorific.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "hoorific.config" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      automountServiceAccountToken: false
+      serviceAccountName: {{ include "hoorific.serviceAccountName" . }}
+      imagePullSecrets:
+        {{- toYaml .Values.image.pullSecrets | nindent 8 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      containers:
+        - name: hoorific
+          image: {{ include "hoorific.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toJson .Values.commands.serve }}
+          args: ["--config", "/etc/hoorific/config.json"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: inference
+              containerPort: 8080
+              protocol: TCP
+            - name: management
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: management
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: management
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/hoorific/config.json
+              subPath: config.json
+              readOnly: true
+            - name: postgres-secret
+              mountPath: /etc/hoorific/secrets/postgres-dsn
+              subPath: postgres-dsn
+              readOnly: true
+            - name: encryption-secret
+              mountPath: /etc/hoorific/secrets/encryption-master-key
+              subPath: encryption-master-key
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /var/lib/hoorific
+{{ if .Values.config.coordination.redis.enabled }}
+            - name: redis-secret
+              mountPath: /etc/hoorific/secrets/redis-url
+              subPath: redis-url
+              readOnly: true
+{{ end }}
+{{ if .Values.config.oidc.enabled }}
+            - name: oidc-secret
+              mountPath: /etc/hoorific/secrets/oidc-client-secret
+              subPath: oidc-client-secret
+              readOnly: true
+{{ end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "hoorific.fullname" . }}-config
+        - name: postgres-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.postgres.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.postgres.key | quote }}
+                path: postgres-dsn
+        - name: encryption-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.encryption.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.encryption.key | quote }}
+                path: encryption-master-key
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpVolume.sizeLimit }}
+        - name: data
+          emptyDir:
+            sizeLimit: {{ .Values.dataVolume.sizeLimit }}
+{{ if .Values.config.coordination.redis.enabled }}
+        - name: redis-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.redis.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.redis.key | quote }}
+                path: redis-url
+{{ end }}
+{{ if .Values.config.oidc.enabled }}
+        - name: oidc-secret
+          secret:
+            secretName: {{ .Values.existingSecrets.oidc.secretName | quote }}
+            items:
+              - key: {{ .Values.existingSecrets.oidc.key | quote }}
+                path: oidc-client-secret
+{{ end }}

@@ -1,0 +1,42 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "hoorific.fullname" . }}
+  labels:
+    {{- include "hoorific.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "hoorific.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- toYaml .Values.networkPolicy.ingress | nindent 4 }}
+  egress:
+    {{- toYaml .Values.networkPolicy.egress | nindent 4 }}
+---
+# This hook policy exists before the migration Job and carries the same egress
+# allow-list. It is deliberately separate from the release-managed policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "hoorific.fullname" . }}-migration
+  labels:
+    {{- include "hoorific.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    hoorific.io/secret-prerequisite: "Create referenced existing Secrets before Helm install"
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "hoorific.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: migration
+  policyTypes:
+    - Egress
+  egress:
+    {{- toYaml .Values.networkPolicy.egress | nindent 4 }}
+{{- end }}
