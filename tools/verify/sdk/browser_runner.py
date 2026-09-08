@@ -418,6 +418,7 @@ class BrowserUI:
         *,
         version: int | None = None,
         include_csrf: bool = True,
+        expected_tenant: str | None = None,
     ) -> dict[str, Any]:
         """Make a bounded authenticated management request from the real page.
 
@@ -427,7 +428,7 @@ class BrowserUI:
 
         result = self.page.evaluate(
             """
-            async ({method, path, body, version, includeCsrf}) => {
+            async ({method, path, body, version, includeCsrf, expectedTenant}) => {
               const sessionResponse = await fetch('/admin/api/v1/session', {
                 credentials: 'include',
                 headers: {Accept: 'application/json'}
@@ -440,6 +441,7 @@ class BrowserUI:
                 headers['X-CSRF-Token'] = session.csrf_token;
                 headers['Origin'] = window.location.origin;
               }
+              if (expectedTenant) headers['X-Hoorific-Expected-Tenant'] = expectedTenant;
               if (version !== null && version !== undefined) headers['If-Match'] = `"${version}"`;
               const init = {method, credentials: 'include', headers};
               if (body !== null && body !== undefined) init.body = JSON.stringify(body);
@@ -456,12 +458,14 @@ class BrowserUI:
                 "body": body,
                 "version": version,
                 "includeCsrf": include_csrf,
+                "expectedTenant": expected_tenant,
             },
         )
         return {
             "status": int(result.get("status", 0)),
             "body": redact(result.get("body")),
         }
+
 
     def track(self, kind: str, resource_id: str) -> None:
         entry = (kind, resource_id)
@@ -700,6 +704,7 @@ class BrowserCases:
         return tenant_id
 
     def tenant_lifecycle(self) -> dict[str, Any]:
+        original_tenant = self.current_tenant_id()
         resource_id = self.uid("tenant")
         editor = self.create(
             "tenants",
@@ -716,24 +721,34 @@ class BrowserCases:
         )
         self.selected_id = resource_id
         self.save("tenants", editor)
-        self.ui.page.once("dialog", lambda dialog: dialog.accept())
-        observed = self.ui.expect_response(
-            "DELETE",
-            f"/tenants/{quote(resource_id, safe='')}",
-            lambda: editor.get_by_role("button", name="Delete", exact=True).click(),
+        if editor.get_by_role("button", name="Delete", exact=True).count() != 0:
+            raise RuntimeError("tenant delete control must not be offered")
+        enabled = editor.get_by_label("Enabled", exact=True)
+        if not enabled.is_checked():
+            raise RuntimeError("new tenant was not enabled")
+        enabled.uncheck()
+        self.save("tenants", editor)
+        fetched = self.ui.admin_fetch(
+            "GET",
+            f"/admin/api/v1/tenants/{quote(resource_id, safe='')}",
+            expected_tenant=original_tenant,
         )
-        if observed["status"] not in (409, 412):
+        body = fetched.get("body")
+        data = body.get("data") if isinstance(body, dict) else None
+        if (
+            fetched["status"] != 200
+            or not isinstance(data, dict)
+            or data.get("enabled") is not False
+        ):
             raise RuntimeError(
-                f"tenant delete unexpectedly returned {observed['status']}"
+                f"tenant disable was not persisted: {fetched['status']} / "
+                f"{redact(body)}"
             )
-        self.ui.page.get_by_role("alert").wait_for(
-            state="visible", timeout=ROUTE_TIMEOUT_MS
-        )
         return {
             "created": True,
             "updated": True,
-            "delete_supported": False,
-            "delete_status": observed["status"],
+            "disabled": True,
+            "delete_offered": False,
             "retained_for_cleanup": True,
         }
 
@@ -743,7 +758,7 @@ class BrowserCases:
             "operators",
             resource_id,
             lambda form: (
-                form.get_by_label("Operator subject / ID", exact=True).fill(resource_id),
+                form.get_by_label("Operator ID (subject)", exact=True).fill(resource_id),
                 form.get_by_label("Identity issuer", exact=True).fill(
                     "https://browser.example.test"
                 ),
@@ -755,6 +770,13 @@ class BrowserCases:
                 ),
             ),
         )
+        for label in (
+            "Operator ID (subject)",
+            "Identity issuer",
+            "Identity subject (issuer sub claim)",
+        ):
+            if editor.get_by_label(label, exact=True).is_editable():
+                raise RuntimeError(f"operator identity field remained editable: {label}")
         self.selected_id = resource_id
         editor.get_by_label("Display name", exact=True).fill(
             "Browser lifecycle operator updated"
@@ -769,7 +791,7 @@ class BrowserCases:
             "operators",
             operator_id,
             lambda form: (
-                form.get_by_label("Operator subject / ID", exact=True).fill(operator_id),
+                form.get_by_label("Operator ID (subject)", exact=True).fill(operator_id),
                 form.get_by_label("Identity issuer", exact=True).fill(
                     "https://browser.example.test"
                 ),
@@ -781,11 +803,25 @@ class BrowserCases:
                 ),
             ),
         )
+        for label in (
+            "Operator ID (subject)",
+            "Identity issuer",
+            "Identity subject (issuer sub claim)",
+        ):
+            if operator_editor.get_by_label(label, exact=True).is_editable():
+                raise RuntimeError(f"operator identity field remained editable: {label}")
         del operator_editor
         self.ui.resource("role_bindings")
         self.ui.select_resource(operator_id)
         binding_editor = self.ui.editor()
-        binding_editor.get_by_label("Operator subject", exact=True).fill(operator_id)
+        subject = binding_editor.get_by_label(
+            "Operator subject (existing operator ID)", exact=True
+        )
+        if subject.is_editable() or subject.input_value() != operator_id:
+            raise RuntimeError("role binding subject was not immutable existing operator ID")
+        tenant_binding = binding_editor.get_by_label("Current tenant binding", exact=True)
+        if tenant_binding.is_editable():
+            raise RuntimeError("role binding tenant was not immutable")
         role_select = binding_editor.get_by_label("Role", exact=True)
         if role_select.input_value() != "viewer":
             raise RuntimeError("operator creation did not seed a viewer role binding")
@@ -801,6 +837,8 @@ class BrowserCases:
             "binding_deleted": True,
             "operator_cleanup_deferred": True,
         }
+
+
 
     def connection_lifecycle(self) -> dict[str, Any]:
         base = self.fixture_connection()
@@ -1049,6 +1087,176 @@ class BrowserCases:
             "server_version_reloaded": True,
             "deleted": True,
         }
+    def stale_tenant_context(self) -> dict[str, Any]:
+        """Prove a stale tab cannot mutate after its shared cookie changes tenant."""
+
+        original_tenant = self.current_tenant_id()
+        target_tenant = self.uid("stale-tenant")
+        resource_id = self.uid("stale-policy")
+        resource_path = f"/admin/api/v1/policy_limits/{quote(resource_id, safe='')}"
+        target_created = False
+        page2 = None
+        page2_ui: BrowserUI | None = None
+
+        def session_tenant(ui: BrowserUI) -> str | None:
+            # Compare the actual tenant ID, not evidence-redacted response data:
+            # long resource IDs can resemble opaque secrets to the redactor.
+            return ui.page.evaluate(
+                "async () => (await (await fetch('/admin/api/v1/session', "
+                "{credentials: 'include'})).json()).principal?.TenantID ?? null"
+            )
+
+        def remove_wrong_resource() -> None:
+            if page2_ui is None:
+                return
+            found = page2_ui.admin_fetch(
+                "GET",
+                resource_path,
+                expected_tenant=target_tenant,
+            )
+            if found["status"] == 404:
+                return
+            if found["status"] == 200 and isinstance(found.get("body"), dict):
+                version = found["body"].get("version")
+                if isinstance(version, int):
+                    removed = page2_ui.admin_fetch(
+                        "DELETE",
+                        resource_path,
+                        version=version,
+                        expected_tenant=target_tenant,
+                    )
+                    if removed["status"] not in (200, 204):
+                        raise RuntimeError(
+                            f"wrong-tenant stale resource cleanup returned {removed['status']}"
+                        )
+            raise RuntimeError(
+                f"stale submit left resource in switched tenant: {found['status']}"
+            )
+
+        try:
+            created = self.ui.admin_fetch(
+                "POST",
+                "/admin/api/v1/tenants",
+                {
+                    "id": target_tenant,
+                    "data": {
+                        "name": "Browser stale context tenant",
+                        "enabled": True,
+                        "allowed_origins": ["http://localhost"],
+                        "max_body_bytes": 0,
+                        "max_event_bytes": 0,
+                    },
+                },
+                expected_tenant=original_tenant,
+            )
+            if created["status"] != 200:
+                raise RuntimeError(
+                    f"stale-context tenant create returned {created['status']}: "
+                    f"{redact(created.get('body'))}"
+                )
+            self.ui.track("tenants", target_tenant)
+            target_created = True
+
+            self.ui.resource("policy_limits")
+            editor = self.ui.new_resource()
+            editor.get_by_label("ID", exact=True).fill(resource_id)
+            scope_id = editor.get_by_label("Scope ID", exact=True)
+            if scope_id.input_value() != original_tenant:
+                raise RuntimeError("stale draft did not load the original tenant scope")
+            requests = editor.get_by_label("Requests per minute", exact=True)
+            requests.fill("17")
+
+            page2 = self.ui.page.context.new_page()
+            page2.set_default_timeout(ROUTE_TIMEOUT_MS)
+            page2_ui = BrowserUI(page2, self.ui.console, self.ui.evidence_dir)
+            page2_ui.goto("/admin/", "Operations overview")
+            if session_tenant(page2_ui) != original_tenant:
+                raise RuntimeError("shared-cookie second page did not start in original tenant")
+            switched = page2_ui.admin_fetch(
+                "POST",
+                "/admin/api/v1/session/tenant",
+                {"tenant_id": target_tenant},
+                expected_tenant=original_tenant,
+            )
+            if switched["status"] != 200 or session_tenant(page2_ui) != target_tenant:
+                raise RuntimeError(
+                    f"second page tenant switch returned {switched['status']} / "
+                    f"{redact(switched.get('body'))}"
+                )
+
+            observed = self.ui.expect_response(
+                "POST",
+                "/policy_limits",
+                lambda: editor.get_by_role("button", name="Create", exact=True).click(),
+            )
+            body = observed.get("body")
+            code = body.get("code") if isinstance(body, dict) else None
+            if observed["status"] != 409 or code != "tenant_context_changed":
+                remove_wrong_resource()
+                raise RuntimeError(
+                    f"stale tenant submit returned {observed['status']} / {code}, "
+                    "expected 409 / tenant_context_changed"
+                )
+            editor.wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
+            if (
+                editor.get_by_label("ID", exact=True).input_value() != resource_id
+                or requests.input_value() != "17"
+                or scope_id.input_value() != original_tenant
+            ):
+                raise RuntimeError("stale tenant submit did not retain the original draft")
+            remove_wrong_resource()
+
+            restored = page2_ui.admin_fetch(
+                "POST",
+                "/admin/api/v1/session/tenant",
+                {"tenant_id": original_tenant},
+                expected_tenant=target_tenant,
+            )
+            if restored["status"] != 200 or session_tenant(page2_ui) != original_tenant:
+                raise RuntimeError(
+                    f"original tenant restoration returned {restored['status']} / "
+                    f"{redact(restored.get('body'))}"
+                )
+            if session_tenant(self.ui) != original_tenant:
+                raise RuntimeError("shared cookie did not restore original tenant")
+            return {
+                "tenant_create_status": created["status"],
+                "switch_status": switched["status"],
+                "stale_submit_status": observed["status"],
+                "stale_submit_code": code,
+                "wrong_tenant_resource_status": 404,
+                "draft_retained": True,
+                "original_tenant_restored": True,
+                "owned_tenant_retained_for_cleanup": target_created,
+            }
+        finally:
+            if page2_ui is not None and target_created:
+                try:
+                    if session_tenant(page2_ui) == target_tenant:
+                        try:
+                            remove_wrong_resource()
+                        finally:
+                            restore = page2_ui.admin_fetch(
+                                "POST",
+                                "/admin/api/v1/session/tenant",
+                                {"tenant_id": original_tenant},
+                                expected_tenant=target_tenant,
+                            )
+                            if restore["status"] != 200:
+                                raise RuntimeError(
+                                    f"cleanup tenant restoration returned {restore['status']}"
+                                )
+                except Exception as exc:
+                    self.ui.cleanup_errors.append(
+                        "stale tenant context restoration: " + safe_error(exc)
+                    )
+            if page2 is not None:
+                try:
+                    page2.close()
+                except Exception as exc:
+                    self.ui.cleanup_errors.append(
+                        "stale tenant context page close: " + safe_error(exc)
+                    )
 
     def connection_actions(self) -> dict[str, Any]:
         self.ui.resource("connections")
@@ -2108,6 +2316,7 @@ def main() -> int:
             runner.run_case("browser/resources-route-policies", runner.cases.route_lifecycle)
             runner.run_case("browser/resources-policy-limits", runner.cases.policy_limit_lifecycle)
             runner.run_case("browser/resources-stale-version", runner.cases.stale_version_conflict)
+            runner.run_case("browser/tenant-context-stale-tab", runner.cases.stale_tenant_context)
             runner.run_case("browser/connection-actions", runner.cases.connection_actions)
             runner.run_case("browser/credentials-metadata", runner.cases.credential_metadata)
             runner.run_case("browser/credentials-lifecycle", runner.cases.credential_lifecycle)

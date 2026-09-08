@@ -8,8 +8,12 @@ import (
 
 // Principal is established by a server-side credential/session lookup.
 type Principal struct {
-	TenantID, SubjectID, KeyID, Role  string
-	SessionID                         string `json:"-"`
+	TenantID, SubjectID, KeyID, Role string
+	SessionID                        string `json:"-"`
+	// AuthSource identifies the server-side credential path without exposing it
+	// in the administrative API. Admin bearer tokens are tenant-confined even
+	// when their subject has memberships in multiple tenants.
+	AuthSource                        string `json:"-"`
 	KeyRevision                       int64
 	Permissions                       []string
 	Aliases, Connections              []string

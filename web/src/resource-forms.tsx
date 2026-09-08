@@ -81,13 +81,14 @@ function TextField({ label, value, onChange, required = false, readOnly = false 
     <Input id={id} value={value ?? ''} required={required} readOnly={readOnly} onInput={event => onChange(event.currentTarget.value)} />
   </FieldShell>;
 }
-function BooleanField({ label, value, onChange }: FieldProps<boolean>) {
+function BooleanField({ label, value, onChange, disabled = false, description }: FieldProps<boolean> & { disabled?: boolean; description?: ReactNode }) {
   const id = useId();
   return <div className="field field-check min-w-0">
     <div className="flex min-w-0 items-center gap-3">
-      <Input id={id} type="checkbox" checked={value} className="h-4 w-4 shrink-0 rounded border-input p-0 accent-primary" onChange={event => onChange(event.currentTarget.checked)} />
-      <label htmlFor={id} className="min-w-0 cursor-pointer break-words text-sm font-medium leading-snug text-foreground">{label}</label>
+      <Input id={id} type="checkbox" checked={value} disabled={disabled} aria-describedby={description ? `${id}-description` : undefined} className="h-4 w-4 shrink-0 rounded border-input p-0 accent-primary" onChange={event => onChange(event.currentTarget.checked)} />
+      <label htmlFor={id} className={`min-w-0 break-words text-sm font-medium leading-snug text-foreground${disabled ? '' : ' cursor-pointer'}`}>{label}</label>
     </div>
+    {description && <p id={`${id}-description`} className="text-xs leading-relaxed text-muted-foreground">{description}</p>}
   </div>;
 }
 function SelectField({ label, value, onChange, options }: FieldProps<string> & { options: readonly string[] }) {
@@ -176,9 +177,9 @@ function fields<T extends object>(value: T, onChange: (value: T) => void) {
   const set = (key: keyof T, next: string | number | boolean | string[] | Record<string, string> | null | undefined) => onChange({ ...value, [key]: next });
   return {
     text: (key: Keys<T, string>, label: string, required = false, readOnly = false) => <TextField key={String(key)} label={label} value={value[key] as string | undefined} required={required} readOnly={readOnly} onChange={next => set(key, next)} />,
-    bool: (key: Keys<T, boolean>, label: string) => <BooleanField key={String(key)} label={label} value={Boolean(value[key])} onChange={next => set(key, next)} />,
     integer: (key: Keys<T, number>, label: string, optional = false) => <IntegerField key={String(key)} label={label} value={value[key] as number | undefined} optional={optional} onChange={next => set(key, next)} />,
     list: (key: Keys<T, string[]>, label: string) => <StringList key={String(key)} label={label} value={value[key] as string[] | null | undefined} onChange={next => set(key, next)} />,
+    bool: (key: Keys<T, boolean>, label: string, disabled = false, description?: ReactNode) => <BooleanField key={String(key)} label={label} value={Boolean(value[key])} disabled={disabled} description={description} onChange={next => set(key, next)} />,
     map: (key: Keys<T, Record<string, string>>, label: string, features = false) => <StringMap key={String(key)} label={label} value={value[key] as Record<string, string> | undefined} features={features} onChange={next => set(key, next)} />,
     select: (key: Keys<T, string>, label: string, options: readonly string[]) => <SelectField key={String(key)} label={label} value={String(value[key] ?? '')} options={options} onChange={next => set(key, next)} />,
   };
@@ -282,18 +283,17 @@ function RouteFields({ value, onChange }: FieldProps<DTO['RoutePolicyData']>) {
     </fieldset>
   </FormLayout>;
 }
-
-export type ResourceFormProps = { kind: string; value: ResourceData; onChange: (value: ResourceData) => void };
+export type ResourceFormProps = { kind: string; value: ResourceData; onChange: (value: ResourceData) => void; readOnlyIdentity?: boolean; activeTenant?: boolean };
 // Parent must pair kind with its corresponding DTO and remount on resource ID or
 // tenant changes. This component owns fields, not a nested form or submit action.
-export function ResourceForm({ kind, value, onChange }: ResourceFormProps) {
+export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, activeTenant = false }: ResourceFormProps) {
   switch (kind) {
     case 'tenants': {
       const f = fields(value as DTO['TenantData'], onChange as (value: DTO['TenantData']) => void);
       return <FormLayout>
-        <FormSection title="Tenant identity">
+        <FormSection title="Tenant identity" description="The active tenant cannot be disabled from this session. Switch to another enabled tenant first; re-enable a disabled tenant from another tenant.">
           {f.text('name', 'Tenant name', true)}
-          {f.bool('enabled', 'Enabled')}
+          {f.bool('enabled', 'Enabled', activeTenant, activeTenant ? 'The active tenant cannot be disabled from this session. Switch to another enabled tenant first.' : undefined)}
         </FormSection>
         {f.list('allowed_origins', 'Allowed browser origins')}
         <FormSection title="Request limits">
@@ -305,10 +305,10 @@ export function ResourceForm({ kind, value, onChange }: ResourceFormProps) {
     case 'operators': {
       const f = fields(value as DTO['OperatorData'], onChange as (value: DTO['OperatorData']) => void);
       return <FormLayout>
-        <FormSection title="Operator identity">
-          {f.text('subject', 'Operator subject / ID', true)}
-          {f.text('issuer', 'Identity issuer', true)}
-          {f.text('identity_subject', 'Identity subject (issuer sub claim)', true)}
+        <FormSection title="Operator identity" description="The operator ID is globally unique. Identity issuer and identity subject establish its external login mapping and cannot change after creation.">
+          {f.text('subject', 'Operator ID (subject)', true, readOnlyIdentity)}
+          {f.text('issuer', 'Identity issuer', true, readOnlyIdentity)}
+          {f.text('identity_subject', 'Identity subject (issuer sub claim)', true, readOnlyIdentity)}
           {f.text('display_name', 'Display name', true)}
           {f.bool('enabled', 'Enabled')}
         </FormSection>
@@ -317,10 +317,10 @@ export function ResourceForm({ kind, value, onChange }: ResourceFormProps) {
     case 'role_bindings': {
       const f = fields(value as DTO['RoleBindingData'], onChange as (value: DTO['RoleBindingData']) => void);
       return <FormLayout>
-        <FormSection title="Role binding">
-          {f.text('subject', 'Operator subject', true)}
-          {f.text('tenant_id', 'Current tenant binding', true, true)}
-          {f.select('role', 'Role', ['owner', 'admin', 'operator', 'auditor', 'viewer'])}
+        <FormSection title="Role binding" description="This binding grants one existing operator access to the active tenant. Viewer is the least-privileged default; choose a stronger role only when required.">
+          {f.text('subject', 'Operator subject (existing operator ID)', true, readOnlyIdentity)}
+          {f.text('tenant_id', 'Current tenant binding', true, readOnlyIdentity)}
+          {f.select('role', 'Role', ['viewer', 'operator', 'auditor', 'admin', 'owner'])}
         </FormSection>
       </FormLayout>;
     }

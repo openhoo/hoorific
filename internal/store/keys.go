@@ -185,6 +185,7 @@ func (s *Store) resolvePrincipalTx(ctx context.Context, tx *sql.Tx, p core.Princ
 		return core.Principal{}, err
 	}
 	current.SessionID = p.SessionID
+	current.AuthSource = p.AuthSource
 	current.Permissions = append([]string(nil), p.Permissions...)
 	return current, nil
 }
@@ -298,9 +299,12 @@ func (s *Store) RotateKey(ctx context.Context, p core.Principal, id string, expe
 		if revoked != 0 || version != expectedVersion {
 			return storeError("version_conflict", 412)
 		}
-		var kd keyData
-		if e := json.Unmarshal([]byte(data), &kd); e != nil {
+		kd, e := decodeKeyData(json.RawMessage(data))
+		if e != nil {
 			return storeError("invalid_key_metadata", 500)
+		}
+		if !issuerAllowsKey(current, kd) {
+			return storeError("forbidden", 403)
 		}
 		next := version + 1
 		res, e := tx.ExecContext(ctx, s.Query("UPDATE api_keys SET version=?,verifier=? WHERE tenant_id=? AND id=? AND version=?"), next, verifier, current.TenantID, id, version)
@@ -324,7 +328,6 @@ func (s *Store) RotateKey(ctx context.Context, p core.Principal, id string, expe
 			return e
 		}
 		out = core.Resource{ID: id, TenantID: current.TenantID, Kind: "api_keys", Version: next, Data: json.RawMessage(data)}
-		_ = kd
 		return nil
 	})
 	if err != nil {

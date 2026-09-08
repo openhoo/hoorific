@@ -42,6 +42,11 @@ export class AdminAPI {
     if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
     if (mutation.has(method) && this.session?.csrf_token) headers.set('X-CSRF-Token', this.session.csrf_token);
     if (mutation.has(method) && !headers.has('Origin')) headers.set('Origin', window.location.origin);
+    // /session is deliberately context-free so a stale tab can explicitly
+    // reload the server-selected tenant. Bootstrap and OIDC are pre-session
+    // authentication; every other authenticated request is tenant-scoped.
+    const contextFree = path === '/session' || path.startsWith('/auth/bootstrap') || path.startsWith('/auth/login') || path.startsWith('/auth/callback');
+    if (!contextFree && this.session?.principal.TenantID) headers.set('X-Hoorific-Expected-Tenant', this.session.principal.TenantID);
     const response = await fetch(`${this.base}${path}`, { ...init, method, headers, credentials: 'include' });
     const text = await response.text();
     let body: unknown;
@@ -70,7 +75,7 @@ export class AdminAPI {
   async credentialAction(item: Resource, action: CredentialAction, data: CredentialActionData) {
     return this.action<CredentialActionResult>(`/connections/${encodeURIComponent(item.id)}/${action}`, {data}, action === 'status' ? undefined : item.version);
   }
-  async stream(path: string, body: unknown, signal: AbortSignal, onChunk: (text: string) => void) { const headers = new Headers({'Content-Type':'application/json','Accept':'text/event-stream, application/json'}); if (this.session?.csrf_token) headers.set('X-CSRF-Token', this.session.csrf_token); headers.set('Origin', window.location.origin); const response = await fetch(`${this.base}${path}`, {method:'POST', credentials:'include', headers, body:JSON.stringify(body), signal}); if (!response.ok) { const text = await response.text(); throw new APIError(response.status, text); } if (!response.body) return; const reader = response.body.getReader(); const decoder = new TextDecoder(); try { while (true) { const next = await reader.read(); if (next.done) break; onChunk(decoder.decode(next.value, {stream:true})); } onChunk(decoder.decode()); } finally { reader.releaseLock(); } }
+  async stream(path: string, body: unknown, signal: AbortSignal, onChunk: (text: string) => void) { const headers = new Headers({'Content-Type':'application/json','Accept':'text/event-stream, application/json'}); if (this.session?.csrf_token) headers.set('X-CSRF-Token', this.session.csrf_token); headers.set('Origin', window.location.origin); if (this.session?.principal.TenantID) headers.set('X-Hoorific-Expected-Tenant', this.session.principal.TenantID); const response = await fetch(`${this.base}${path}`, {method:'POST', credentials:'include', headers, body:JSON.stringify(body), signal}); if (!response.ok) { const text = await response.text(); let body: unknown; if (text) { try { body = JSON.parse(text); } catch { body = text; } } throw new APIError(response.status, body); } if (!response.body) return; const reader = response.body.getReader(); const decoder = new TextDecoder(); try { while (true) { const next = await reader.read(); if (next.done) break; onChunk(decoder.decode(next.value, {stream:true})); } onChunk(decoder.decode()); } finally { reader.releaseLock(); } }
 }
 export type AdminPaths = paths;
 export const api = new AdminAPI();

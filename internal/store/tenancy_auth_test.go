@@ -327,3 +327,137 @@ func mustOperatorJSON(t *testing.T, subject, issuer, identity string, enabled bo
 	}
 	return data
 }
+
+func TestAdminTokenTenantScopeConfinesTenantManagement(t *testing.T) {
+	ctx := context.Background()
+	s := newTenancyAuthTestStore(t)
+	owner := bootstrapTenant(t, s, "tenant-a", "owner-a")
+	tenantData, err := json.Marshal(admin.TenantData{Name: "Tenant B", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Mutate(ctx, owner, core.Mutation{Kind: "tenants", ID: "tenant-b", Data: tenantData}); err != nil {
+		t.Fatal(err)
+	}
+	rawToken, err := s.IssueAdminToken(ctx, owner, owner.SubjectID, []string{"tenant:read", "tenant:write"}, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := s.ResolveAdminToken(ctx, sha256SumForTest(rawToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := s.List(ctx, scoped, "tenants", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != owner.TenantID {
+		t.Fatalf("tenant-scoped token enumerated memberships outside its tenant: %+v", page.Items)
+	}
+	if _, err = s.Get(ctx, scoped, "tenants", "tenant-b"); err == nil {
+		t.Fatal("tenant-scoped token read another tenant")
+	}
+	if _, err = s.Mutate(ctx, scoped, core.Mutation{Kind: "tenants", ID: "tenant-b", ExpectedVersion: 1, Data: tenantData}); err == nil {
+		t.Fatal("tenant-scoped token mutated another tenant")
+	}
+}
+
+func TestResolveIdentityFallsBackToActiveMembership(t *testing.T) {
+	ctx := context.Background()
+	s := newTenancyAuthTestStore(t)
+	owner := bootstrapTenant(t, s, "tenant-a", "owner-a")
+	tenantData, err := json.Marshal(admin.TenantData{Name: "Tenant B", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Mutate(ctx, owner, core.Mutation{Kind: "tenants", ID: "tenant-b", Data: tenantData}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Mutate(ctx, owner, operatorMutation(t, owner.SubjectID, "https://issuer.example", "owner-a-oidc", true)); err != nil {
+		t.Fatal(err)
+	}
+	disabled := json.RawMessage(`{"name":"Tenant A","enabled":false}`)
+	if _, err = s.Mutate(ctx, owner, core.Mutation{Kind: "tenants", ID: owner.TenantID, ExpectedVersion: 1, Data: disabled}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := s.ResolveIdentity(ctx, "https://issuer.example", "owner-a-oidc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.TenantID != "tenant-b" || resolved.SubjectID != owner.SubjectID {
+		t.Fatalf("identity did not fall back to active membership: %+v", resolved)
+	}
+}
+
+func TestSessionCannotDisableActiveTenant(t *testing.T) {
+	ctx := context.Background()
+	s := newTenancyAuthTestStore(t)
+	owner := bootstrapTenant(t, s, "tenant-a", "owner-a")
+	childData := json.RawMessage(`{"name":"Tenant B","enabled":true}`)
+	if _, err := s.Mutate(ctx, owner, core.Mutation{Kind: "tenants", ID: "tenant-b", Data: childData}); err != nil {
+		t.Fatal(err)
+	}
+	sessionHash := "active-tenant-session"
+	if err := s.CreateSession(ctx, admin.Session{Hash: sessionHash, Principal: owner, ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	sessionPrincipal := owner
+	sessionPrincipal.SessionID = sessionHash
+	disabled := json.RawMessage(`{"name":"Tenant A","enabled":false}`)
+	if _, err := s.Mutate(ctx, sessionPrincipal, core.Mutation{Kind: "tenants", ID: owner.TenantID, ExpectedVersion: 1, Data: disabled}); err == nil {
+		t.Fatal("active session disabled its current tenant")
+	}
+	var raw string
+	if err := s.DB.QueryRowContext(ctx, s.Query("SELECT data FROM tenants WHERE id=?"), owner.TenantID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var data admin.TenantData
+	if err := json.Unmarshal([]byte(raw), &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.Enabled {
+		t.Fatal("tenant disable guard changed durable tenant state")
+	}
+	if _, err := s.ResolveSession(ctx, sessionHash); err != nil {
+		t.Fatalf("session became unusable after rejected disable: %v", err)
+	}
+	childDisabled := json.RawMessage(`{"name":"Tenant B","enabled":false}`)
+	if _, err := s.Mutate(ctx, sessionPrincipal, core.Mutation{Kind: "tenants", ID: "tenant-b", ExpectedVersion: 1, Data: childDisabled}); err != nil {
+		t.Fatalf("active session could not disable inactive child tenant: %v", err)
+	}
+	if _, err := s.Mutate(ctx, sessionPrincipal, core.Mutation{Kind: "tenants", ID: "tenant-b", ExpectedVersion: 2, Data: childData}); err != nil {
+		t.Fatalf("owner could not re-enable inactive child tenant: %v", err)
+	}
+}
+
+func TestRotateKeyRequiresIssuerAttenuation(t *testing.T) {
+	ctx := context.Background()
+	s := newTenancyAuthTestStore(t)
+	owner := bootstrapTenant(t, s, "tenant-a", "owner-a")
+	rawKeyData, err := json.Marshal(keyData{Role: "operator", Permissions: []string{"inference:invoke"}, Operations: []core.Operation{"generate"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _, err := s.IssueKey(ctx, owner, "inference-key", rawKeyData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawToken, err := s.IssueAdminToken(ctx, owner, owner.SubjectID, []string{"key:write"}, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := s.ResolveAdminToken(ctx, sha256SumForTest(rawToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = s.RotateKey(ctx, scoped, key.ID, key.Version); err == nil {
+		t.Fatal("scoped key:write token rotated a key with ungranted inference permissions")
+	}
+	current, err := s.Get(ctx, scoped, "api_keys", key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Version != key.Version {
+		t.Fatalf("rejected rotation changed key version from %d to %d", key.Version, current.Version)
+	}
+}

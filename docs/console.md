@@ -8,6 +8,7 @@ The Hoorific console is the embedded React operator UI at `/admin/`. It is a wor
 
 - [Before you sign in](#before-you-sign-in)
 - [Sign in and bootstrap](#sign-in-and-bootstrap)
+- [Tenant scope and roles](#tenant-scope-and-roles)
 - [Operations overview](#operations-overview)
 - [Collection workflow](#collection-workflow)
 - [Recommended setup order](#recommended-setup-order)
@@ -33,7 +34,29 @@ Do not paste provider secrets, API keys, bootstrap codes, cookies, or token resp
 
 The login page is titled **Hoorific operations** and offers **Sign in with OIDC** plus the local bootstrap form. For a native standalone setup, run the README's `admin bootstrap` command, enter the printed one-time code, and submit it once. The bootstrap endpoint deliberately accepts only a loopback peer; a request arriving through a container bridge generally has a non-loopback peer and fails that check. Use the native quickstart for first bootstrap, or configure OIDC and an intentional network/TLS design for a non-loopback deployment. See [Deployment](deployment.md#standalone-compose) for the container boundary.
 
-After sign-in, the sidebar shows the current session role, subject, and tenant. If the session can access more than one enabled tenant, a **Tenant** selector appears; changing it reloads the console in that tenant's context. **Sign out** ends the management session.
+After sign-in, the sidebar and header show the active tenant, subject, and **per-tenant** role. If the session can access more than one enabled tenant, a **Tenant** selector appears. Switching asks for confirmation because unsaved page state will be discarded; cancelling leaves both the selected tenant and the server session unchanged. **Sign out** ends the management session.
+
+## Tenant scope and roles
+
+Hoorific does not currently have a separate global `platform-admin` role. Even `owner` and its wildcard permissions apply through tenant membership. The **Tenants** collection lists memberships, not every tenant in the installation; the remaining collections use the active tenant.
+
+| Role | Console access |
+| --- | --- |
+| `owner` | Tenant administration, operator identities and role bindings, plus runtime administration. An active owner may create a tenant and becomes its owner. |
+| `admin` | Runtime administration, configuration, credentials, keys, routing and limits. Tenant, operator and binding collections are read-only. |
+| `operator` | Read catalog/connections, test and discover connections, operate jobs and playground, and inspect usage. No catalog or identity administration. |
+| `auditor` | Read usage, audit and limits. |
+| `viewer` | Read catalog collections. |
+
+The server remains authoritative; controls follow effective permissions rather than treating a role name as an implicit global grant. A shared operator identity is globally unique, but its role bindings are per tenant. Creating an operator also creates a `viewer` binding in the active tenant. New binding forms default to `viewer`; choose stronger access deliberately. Existing operator ID/issuer/identity-subject fields and binding subject/tenant coordinates are read-only; mutable display names, enabled state and roles retain their normal version checks. Updating a shared operator requires owner authority in every affected tenant.
+
+Tenant deletion is unsupported and has no console button. The active tenant cannot be disabled from its own session: switch to another enabled tenant where you have the required owner access, then disable or re-enable the target. Last-enabled-owner protection remains enforced. Disabling a tenant invalidates its active sessions; fresh OIDC login can choose another enabled membership when the original enrollment tenant is no longer accessible.
+
+### Another tab changed the tenant
+
+Console API and playground requests carry `X-Hoorific-Expected-Tenant` from the page's loaded session. A mismatch with the authenticated tenant returns `409 tenant_context_changed` before resource or inference dispatch. Rejected requests are not automatically retried. Resource and playground drafts remain available until you explicitly reload the context; retain any needed edits before choosing **Reload tenant context**, which replaces the old tenant workspace.
+
+The selector and action panels also offer explicit context reload on this error. API clients may send the same header; it is optional for existing clients, so clients that omit it do not receive this stale-page protection. Admin bearer tokens are independently confined to their issuing tenant and granted scopes, including key rotation; cookie-session tenant switching does not broaden a bearer token.
 
 ## Operations overview
 
@@ -43,7 +66,7 @@ After sign-in, the sidebar shows the current session role, subject, and tenant. 
 
 The **Operations overview** has two useful starting points:
 
-- **Start with a workflow** links to **Connect a provider**, **Add a model or alias**, **Set routing and limits**, and **Run a request**.
+- **Start with a workflow** links to **Connect a provider**, **Add a model or alias**, **Set routing and limits**, and **Run a request** when permitted. Read-only users see review-oriented wording instead of creation instructions.
 - **Browse collections** groups resources under **Connections**, **Catalog**, **Policy**, **Operations**, and **Access & identity**.
 
 The sidebar repeats these destinations and adds **Overview**, **Playground**, and, when permitted, **Configuration**. Visible collections are permission filtered: an absent link can mean that the session cannot read that resource, not that the resource type does not exist. The header also provides the theme toggle and a shortcut back to the overview.
@@ -64,7 +87,7 @@ Every resource page starts with its collection. It does not force an editor open
 
 A selected writable item opens an editor beside the list. A new editor asks for an **ID**; an existing item's ID is read-only and shows its current **Version**. Edit the labeled fields, then choose **Create** or **Save changes**. A successful save updates the version and returns a `Created.` or `Saved.` notice. Existing resource saves and deletes use an `If-Match` version check, so the console does not silently overwrite a newer server record.
 
-**Return to list** closes the editor. If the draft is dirty, the console asks whether to discard it before selecting another resource, starting a new resource, or returning to the list. These are the explicit draft-guard paths; do not assume that every route change or browser reload prompts in the same way. Delete is available for writable existing resources and asks for confirmation.
+**Return to list** closes the editor. If the draft is dirty, the console asks whether to discard it before selecting another resource, starting a new resource, or returning to the list. Tenant switching also asks for confirmation. Do not assume that every route change or browser reload prompts in the same way. Delete is available for writable existing resources other than tenants and asks for confirmation.
 
 ![Selected fixture-model editor showing its ID, fixture connection, generate operation, and capability fields](assets/console-model-editor.webp)
 

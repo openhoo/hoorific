@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type FormEvent,
   type ReactNode,
 } from 'react';
@@ -148,9 +149,9 @@ const SINGULAR_LABELS: Record<string, string> = {
 };
 
 const RESOURCE_DESCRIPTIONS: Record<string, string> = {
-  tenants: 'Define tenant boundaries, origins, and request limits.',
-  operators: 'Manage operator identities allowed to work in this tenant.',
-  role_bindings: 'Grant a subject a role for the active tenant.',
+  tenants: 'Review tenants where this identity is a member. The active tenant is the current scope; roles and permissions are per-tenant and do not grant platform-wide access.',
+  operators: 'Manage globally unique operator identities. Creating an operator enrolls it in the active tenant as a viewer; role bindings control access per tenant.',
+  role_bindings: 'Assign an existing operator a role in the active tenant. Bindings are per-tenant, and creating an operator starts with viewer access.',
   connections: 'Register provider endpoints and the account they serve.',
   credentials: 'Review credential metadata without exposing secret values.',
   api_keys: 'Review tenant API-key metadata and issue keys when permitted.',
@@ -180,8 +181,10 @@ const RESOURCE_GROUPS: Array<{
   { label: 'Access & identity', icon: KeyRound, kinds: ['api_keys', 'tenants', 'operators', 'role_bindings'] },
 ];
 
+const TENANCY_KINDS = ['tenants', 'operators', 'role_bindings'] as const;
+
 function requiredPermission(kind: string) {
-  if (kind === 'tenants' || kind === 'operators' || kind === 'role_bindings') return 'tenant:read';
+  if (TENANCY_KINDS.includes(kind as typeof TENANCY_KINDS[number])) return 'tenant:read';
   if (kind === 'audit_events') return 'audit:read';
   if (kind === 'oauth_sessions') return 'session:read';
   if (kind === 'usage_ledger' || kind === 'admissions' || kind === 'reconciliations') return 'usage:read';
@@ -207,23 +210,23 @@ function permissionsFor(session: Session) {
 }
 
 function hasPermission(session: Session, permission: string) {
-  const role = principalRole(session);
   const permissions = permissionsFor(session);
-  return role === 'owner' || role === 'admin' || permissions.includes('*') || permissions.includes(permission);
+  return permissions.includes('*') || permissions.includes(permission);
 }
 
 function canRead(session: Session, kind: string) {
-  return hasPermission(session, requiredPermission(kind)) || (
-    principalRole(session) === 'operator' &&
-    ['connections', 'models', 'model_aliases', 'upstream_operations'].includes(kind)
-  );
+  return hasPermission(session, requiredPermission(kind));
 }
 
 function canWrite(session: Session, kind: string) {
+  // Tenancy mutations are deliberately owner-only in the server store and
+  // still require the explicit tenant-write capability.
+  if (TENANCY_KINDS.includes(kind as typeof TENANCY_KINDS[number])) return principalRole(session) === 'owner' && hasPermission(session, 'tenant:write');
   return hasPermission(session, writePermission(kind));
 }
 function hasResourceActions(kind: string, session: Session) {
-  if (kind === 'connections' || kind === 'credentials') return true;
+  if (kind === 'connections') return ['connection:test', 'connection:discover', 'connection:write'].some(permission => hasPermission(session, permission));
+  if (kind === 'credentials') return hasPermission(session, 'connection:read');
   if (kind === 'api_keys') return hasPermission(session, 'key:write');
   if (kind === 'route_policies') return hasPermission(session, 'route:write');
   if (kind === 'upstream_operations') return hasPermission(session, 'job:write');
@@ -233,6 +236,18 @@ function hasResourceActions(kind: string, session: Session) {
 
 function ErrorNotice({ error, onClose }: { error: unknown; onClose?: () => void }) {
   if (!error) return null;
+  if (apiErrorCode(error) === 'tenant_disable_would_lockout') {
+    return (
+      <Alert variant="destructive" className="notice error my-4">
+        <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+        <AlertTitle>Cannot disable the active tenant</AlertTitle>
+        <AlertDescription className="flex flex-wrap items-center gap-3">
+          <span className="break-words">Switch to another enabled tenant first, then disable this tenant. Re-enable it from another tenant if needed.</span>
+          {onClose && <Button type="button" variant="ghost" size="sm" onClick={onClose} aria-label="Dismiss error">Dismiss</Button>}
+        </AlertDescription>
+      </Alert>
+    );
+  }
   const text = error instanceof Error ? error.message : String(error);
   return (
     <Alert variant="destructive" className="notice error my-4">
@@ -245,6 +260,36 @@ function ErrorNotice({ error, onClose }: { error: unknown; onClose?: () => void 
             Dismiss
           </Button>
         )}
+      </AlertDescription>
+    </Alert>
+  );
+}
+function apiErrorCode(error: unknown): string {
+  if (!(error instanceof APIError) || !error.body || typeof error.body !== 'object' || Array.isArray(error.body)) return '';
+  const code = (error.body as Record<string, unknown>).code;
+  return typeof code === 'string' ? code : '';
+}
+
+function isTenantContextChanged(error: unknown) {
+  return error instanceof APIError && error.status === 409 && apiErrorCode(error) === 'tenant_context_changed';
+}
+
+async function reloadTenantContext(onSession?: (next: Session) => void) {
+  const next = await api.loadSession();
+  onSession?.(next);
+}
+
+function TenantContextNotice({ onReload, loading = false }: { onReload: () => void; loading?: boolean }) {
+  return (
+    <Alert variant="destructive" className="notice error my-4">
+      <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+      <AlertTitle>Tenant context changed</AlertTitle>
+      <AlertDescription className="flex flex-wrap items-center gap-3">
+        <span className="break-words">Another tab changed the active tenant. Nothing was retried. Reload the tenant context before continuing.</span>
+        <Button type="button" variant="outline" size="sm" disabled={loading} onClick={onReload}>
+          {loading ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : <RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />}
+          {loading ? 'Reloading…' : 'Reload tenant context'}
+        </Button>
       </AlertDescription>
     </Alert>
   );
@@ -362,6 +407,7 @@ function ResourceTable({
   onSelect,
   loading,
   filter,
+  tenantMemberships,
 }: {
   kind: string;
   page?: ResourcePage;
@@ -369,6 +415,7 @@ function ResourceTable({
   onSelect: (resource: Resource) => void;
   loading: boolean;
   filter: string;
+  tenantMemberships?: Session['tenants'];
 }) {
   if (!page) {
     if (loading) {
@@ -396,13 +443,14 @@ function ResourceTable({
             const selectedRow = selected?.id === item.id;
             const status = resourceStatus(kind, item.data);
             const statusVariant = status && ['disabled', 'revoked', 'expired', 'failed'].includes(status.toLowerCase()) ? 'destructive' : 'secondary';
+            const tenantRole = kind === 'tenants' ? tenantMemberships?.find((tenant) => tenant.tenant_id === item.id)?.role : undefined;
             return (
               <tr key={item.id} className={cn('transition-colors hover:bg-indigo-50/60 dark:hover:bg-indigo-950/30', selectedRow && 'bg-indigo-50 dark:bg-indigo-950/40')} aria-current={selectedRow ? 'true' : undefined}>
                 <td className="px-4 py-3 align-top">
                   <button type="button" className="table-link max-w-[18rem] break-all text-left font-mono text-sm font-medium text-indigo-700 underline-offset-4 hover:underline dark:text-indigo-300" onClick={() => onSelect(item)} aria-label={item.id}>{item.id}</button>
                 </td>
                 <td className="whitespace-nowrap px-4 py-3 align-top font-mono text-xs text-zinc-600 dark:text-zinc-300">{item.version}</td>
-                <td className="max-w-[34rem] px-4 py-3 align-top text-zinc-700 dark:text-zinc-200"><div className="flex flex-wrap items-center gap-2"><span>{summarize(kind, item.data)}</span>{status && <Badge variant={statusVariant}>{status}</Badge>}</div></td>
+                <td className="max-w-[34rem] px-4 py-3 align-top text-zinc-700 dark:text-zinc-200"><div className="flex flex-wrap items-center gap-2"><span>{summarize(kind, item.data)}</span>{tenantRole && <Badge variant="outline">{tenantRole} access</Badge>}{status && <Badge variant={statusVariant}>{status}</Badge>}</div></td>
               </tr>
             );
           }) : <tr><td colSpan={3} className="px-5 py-10 text-center text-sm text-zinc-500 dark:text-zinc-400"><p className="empty">{emptyMessage}</p></td></tr>}
@@ -429,6 +477,10 @@ function ResourceView({
   const session = api.session!;
   const tenantID = session.principal.TenantID ?? '';
   const writable = isWritableResourceKind(kind) && canWrite(session, kind);
+  const canEditResource = (resource?: Resource) => {
+    if (!writable || !resource || kind !== 'tenants') return writable;
+    return session.tenants?.some((tenant) => tenant.tenant_id === resource.id && tenant.role === 'owner') ?? false;
+  };
   const blankDraft = useMemo(
     () => (writable ? initialResourceData(kind, tenantID) as ResourceData : undefined),
     [kind, tenantID, writable],
@@ -441,6 +493,7 @@ function ResourceView({
   const [error, setError] = useState<unknown>();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [reloadingContext, setReloadingContext] = useState(false);
   const [notice, setNotice] = useState('');
   const [conflict, setConflict] = useState<Resource>();
   const [filter, setFilter] = useState('');
@@ -454,6 +507,17 @@ function ResourceView({
   useEffect(() => {
     if (activeEditor !== null) editorHeading.current?.focus();
   }, [activeEditor]);
+  const reloadContext = async () => {
+    setReloadingContext(true);
+    setError(undefined);
+    try {
+      await reloadTenantContext(onSession);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setReloadingContext(false);
+    }
+  };
 
   const load = useCallback(async (next?: string) => {
     const sequence = ++loadSequence.current;
@@ -495,8 +559,8 @@ function ResourceView({
     if (selected?.id === resource.id && draft) return;
     if (!confirmDiscard('Discard unsaved changes and open this resource?')) return;
     setSelected(resource);
-    setDraft(writable ? resource.data as ResourceData : undefined);
-    setDraftBaseline(writable ? serializeResourceData(resource.data) : '');
+    setDraft(canEditResource(resource) ? resource.data as ResourceData : undefined);
+    setDraftBaseline(canEditResource(resource) ? serializeResourceData(resource.data) : '');
     setEditorEpoch((epoch) => epoch + 1);
     setConflict(undefined);
     setNotice('');
@@ -530,7 +594,7 @@ function ResourceView({
 
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!writable || !draft) return;
+    if (!writable || !draft || (selected && !canEditResource(selected))) return;
     setSaving(true);
     setError(undefined);
     setNotice('');
@@ -558,7 +622,9 @@ function ResourceView({
       }
       await load();
     } catch (failure) {
-      if (failure instanceof APIError && failure.status === 412 && selected) {
+      if (isTenantContextChanged(failure)) {
+        setError(failure);
+      } else if (failure instanceof APIError && failure.status === 412 && selected) {
         setError(undefined);
         setNotice('This resource changed on the server. Your draft is retained.');
         try {
@@ -575,7 +641,7 @@ function ResourceView({
   };
 
   const remove = async () => {
-    if (!writable || !selected || !window.confirm(`Delete ${selected.id}?`)) return;
+    if (!writable || !selected || !canEditResource(selected) || !window.confirm(`Delete ${selected.id}?`)) return;
     setSaving(true);
     setError(undefined);
     try {
@@ -616,6 +682,7 @@ function ResourceView({
   const metadata = selected && !draft ? displayResourceData(kind, selected.data) : undefined;
   const detailOpen = Boolean(draft || metadata !== undefined);
   const showActions = selected && hasResourceActions(kind, session);
+  const selectedTenantRole = kind === 'tenants' && selected ? session.tenants?.find((tenant) => tenant.tenant_id === selected.id)?.role : undefined;
 
   return (
     <section className="resource space-y-6" aria-busy={loading}>
@@ -638,12 +705,12 @@ function ResourceView({
         </div>
       </div>
       {loading && page && <p className="text-sm text-zinc-500 dark:text-zinc-400" role="status"><RefreshCw className="mr-2 inline h-4 w-4 animate-spin" aria-hidden="true" />Refreshing this page…</p>}
-      <ErrorNotice error={error} />
+      {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ErrorNotice error={error} />}
       {notice && <p className="notice rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-800 dark:border-indigo-900 dark:bg-indigo-950/40 dark:text-indigo-200" role="status">{notice}</p>}
       <div className={cn('resource-grid grid grid-cols-1 gap-6', detailOpen && 'xl:grid-cols-[minmax(18rem,0.8fr)_minmax(0,1.2fr)]')}>
         <div className="min-w-0 space-y-4">
           {page && <label className="grid max-w-sm gap-1.5"><span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Filter this page</span><Input value={filter} onChange={(event) => setFilter(event.currentTarget.value)} placeholder="ID or summary" /></label>}
-          <ResourceTable kind={kind} page={page} selected={selected} onSelect={choose} loading={loading} filter={filter} />
+          <ResourceTable kind={kind} page={page} selected={selected} onSelect={choose} loading={loading} filter={filter} tenantMemberships={session.tenants} />
           {cursor && (
             <Button type="button" variant="outline" onClick={() => void load(cursor)} disabled={loading}>
               Next page <ChevronRight className="ml-2 h-4 w-4" aria-hidden="true" />
@@ -663,10 +730,10 @@ function ResourceView({
               </div>
             </div>
             <label className="field mb-5 grid gap-2"><span className="text-sm font-medium text-zinc-800 dark:text-zinc-200">ID</span><Input value={selected?.id ?? newID} onChange={(event) => setNewID(event.currentTarget.value)} readOnly={Boolean(selected)} required aria-label="ID" /></label>
-            <ResourceForm key={`${kind}:${selected?.id ?? 'new'}:${tenantID}:fields:${editorEpoch}`} kind={kind} value={draft} onChange={setDraft} />
+            <ResourceForm key={`${kind}:${selected?.id ?? 'new'}:${tenantID}:fields:${editorEpoch}`} kind={kind} value={draft} onChange={setDraft} readOnlyIdentity={Boolean(selected)} activeTenant={kind === 'tenants' && selected?.id === tenantID} />
             <div className="actions-row mt-6 flex flex-wrap gap-2 border-t border-zinc-200 pt-4 dark:border-zinc-800">
               <Button type="submit" disabled={saving}>{saving ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : <Check className="mr-2 h-4 w-4" aria-hidden="true" />}{saving ? (selected ? 'Saving…' : 'Creating…') : (selected ? 'Save changes' : 'Create')}</Button>
-              {selected && <Button type="button" variant="destructive" disabled={saving} onClick={() => void remove()}>Delete</Button>}
+              {selected && kind !== 'tenants' && <Button type="button" variant="destructive" disabled={saving} onClick={() => void remove()}>Delete</Button>}
             </div>
             {selected && <p className="mt-4 text-xs leading-5 text-zinc-500 dark:text-zinc-400">Version {selected.version}. Saves use an If-Match concurrency check.</p>}
           </form>
@@ -674,9 +741,10 @@ function ResourceView({
           <Card className="metadata min-w-0">
             <CardHeader>
               <CardTitle className="text-base">Selected {singular}</CardTitle>
-              <CardDescription><span className="font-mono">{selected.id}</span> · Version {selected.version}</CardDescription>
+              <CardDescription><span className="font-mono">{selected.id}</span> · Version {selected.version}{selectedTenantRole ? ` · ${selectedTenantRole} access` : ''}</CardDescription>
             </CardHeader>
             <CardContent>
+              {kind === 'tenants' && selectedTenantRole && selectedTenantRole !== 'owner' && <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">This tenant is read-only here. Tenant changes require an owner of that tenant.</p>}
               <pre className="max-h-[26rem] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-zinc-950 p-4 text-xs leading-relaxed text-zinc-100">{JSON.stringify(metadata, null, 2)}</pre>
             </CardContent>
           </Card>
@@ -701,7 +769,7 @@ function ResourceView({
           <CardFooter><Button type="button" variant="outline" onClick={reloadServerVersion}>Reload server version</Button></CardFooter>
         </Card>
       )}
-      {kind === 'api_keys' && hasPermission(session, 'key:write') && <APIKeyIssuePanel tenantID={tenantID} onIssued={() => void load()} />}
+      {kind === 'api_keys' && hasPermission(session, 'key:write') && <APIKeyIssuePanel tenantID={tenantID} onIssued={() => void load()} onSession={onSession} />}
     </section>
   );
 }
@@ -710,7 +778,7 @@ function parseEntries(value: string) {
   return value.split(/[,\s]+/).map((entry) => entry.trim()).filter(Boolean);
 }
 
-function APIKeyIssuePanel({ tenantID, onIssued }: { tenantID: string; onIssued: () => void }) {
+function APIKeyIssuePanel({ tenantID, onIssued, onSession }: { tenantID: string; onIssued: () => void; onSession?: (next: Session) => void }) {
   const [id, setID] = useState('');
   const [name, setName] = useState('');
   const [role, setRole] = useState<APIKeyGrantData['role']>('viewer');
@@ -724,6 +792,19 @@ function APIKeyIssuePanel({ tenantID, onIssued }: { tenantID: string; onIssued: 
   const [result, setResult] = useState<unknown>();
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
+  const [reloadingContext, setReloadingContext] = useState(false);
+
+  const reloadContext = async () => {
+    setReloadingContext(true);
+    setError(undefined);
+    try {
+      await reloadTenantContext(onSession);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setReloadingContext(false);
+    }
+  };
 
   const issue = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -766,7 +847,7 @@ function APIKeyIssuePanel({ tenantID, onIssued }: { tenantID: string; onIssued: 
         <div className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"><KeyRound className="h-5 w-5" aria-hidden="true" /></div>
         <div><h2 className="text-lg font-semibold">Issue API key</h2><p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">The token is returned once and is not stored in resource metadata.</p></div>
       </div>
-      <ErrorNotice error={error} onClose={() => setError(undefined)} />
+      {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ErrorNotice error={error} onClose={() => setError(undefined)} />}
       <form onSubmit={issue} className="grid gap-1">
         <label className="field"><span>Key ID</span><Input required value={id} onChange={(event) => setID(event.currentTarget.value)} /></label>
         <label className="field"><span>Name</span><Input required value={name} onChange={(event) => setName(event.currentTarget.value)} /></label>
@@ -823,7 +904,7 @@ function ActionResult({ value, error, onDismiss }: { value: unknown; error: unkn
   );
 }
 
-function ConnectionCredentialActions({ item, initialCredentialStatus }: { item: Resource; initialCredentialStatus?: string }) {
+function ConnectionCredentialActions({ item, initialCredentialStatus, onSession }: { item: Resource; initialCredentialStatus?: string; onSession?: (next: Session) => void }) {
   const data = item.data as Record<string, unknown>;
   const provider = String(data.connector ?? '');
   const accountID = String(data.account_id ?? '');
@@ -831,11 +912,24 @@ function ConnectionCredentialActions({ item, initialCredentialStatus }: { item: 
   const [result, setResult] = useState<CredentialActionResult>();
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
+  const [reloadingContext, setReloadingContext] = useState(false);
   const [credentialRevoked, setCredentialRevoked] = useState(() => (initialCredentialStatus ?? String(data.status ?? '')) === 'revoked');
   const [oauthAuthorizationURL, setOAuthAuthorizationURL] = useState('');
   const [deviceAuthorizationURL, setDeviceAuthorizationURL] = useState('');
   const [deviceUserCode, setDeviceUserCode] = useState('');
   const canManage = hasPermission(api.session!, 'connection:write');
+
+  const reloadContext = async () => {
+    setReloadingContext(true);
+    setError(undefined);
+    try {
+      await reloadTenantContext(onSession);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setReloadingContext(false);
+    }
+  };
 
   const invoke = async (
     action: 'status' | 'import' | 'revoke-credential' | 'oauth-start' | 'oauth-callback' | 'device-start' | 'device-poll',
@@ -914,18 +1008,30 @@ function ConnectionCredentialActions({ item, initialCredentialStatus }: { item: 
         <fieldset className="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-700"><legend className="px-1 text-sm font-semibold">Device authorization</legend><Button type="button" variant="outline" disabled={busy} onClick={() => void invoke('device-start')}>Start device flow</Button>{deviceUserCode && <p className="text-sm" role="status">Provider device code: <strong>{deviceUserCode}</strong></p>}{deviceAuthorizationURL && <p><a className="text-sm font-medium text-indigo-700 underline underline-offset-4 dark:text-indigo-300" href={deviceAuthorizationURL} target="_blank" rel="noreferrer">Open device verification</a></p>}<label className="field"><span>Device flow ID</span><Input value={form.flow_id} onChange={(event) => setForm({ ...form, flow_id: event.currentTarget.value })} /><small>Filled automatically when the provider starts a device flow.</small></label><Button type="button" disabled={busy || !form.flow_id} onClick={() => void invoke('device-poll', { flow_id: form.flow_id })}>Poll device flow</Button></fieldset>
         <fieldset className="danger-zone space-y-3 rounded-lg border border-red-200 p-4 dark:border-red-950"><legend className="px-1 text-sm font-semibold">Destructive action</legend><p className="text-sm text-zinc-600 dark:text-zinc-300">Revocation is version checked and prevents new requests from leasing this credential.</p><Button type="button" variant="destructive" disabled={busy || credentialRevoked || !form.credential_version} onClick={revoke}>{credentialRevoked ? 'Credential revoked' : 'Revoke credential'}</Button></fieldset>
       </div>}
-      <ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} />
+      {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} />}
     </aside>
   );
 }
 
-function CredentialMetadataActions({ item }: { item: Resource }) {
+function CredentialMetadataActions({ item, onSession }: { item: Resource; onSession?: (next: Session) => void }) {
   const metadata = safeCredentialMetadata(item.data);
   const connectionID = String(metadata.connection_id ?? '');
   const tenantID = api.session?.principal.TenantID ?? '';
   const [connection, setConnection] = useState<Resource>();
   const [error, setError] = useState<unknown>();
+  const [reloadingContext, setReloadingContext] = useState(false);
 
+  const reloadContext = async () => {
+    setReloadingContext(true);
+    setError(undefined);
+    try {
+      await reloadTenantContext(onSession);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setReloadingContext(false);
+    }
+  };
   useEffect(() => {
     let active = true;
     setConnection(undefined);
@@ -939,18 +1045,31 @@ function CredentialMetadataActions({ item }: { item: Resource }) {
   }, [connectionID, tenantID]);
 
   if (!connectionID) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Credential lifecycle</h2><p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">This credential has no owning connection metadata.</p></aside>;
-  if (error) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Credential lifecycle</h2><ErrorNotice error={error} /></aside>;
+  if (error) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Credential lifecycle</h2>{isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ErrorNotice error={error} />}</aside>;
   if (!connection) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Credential lifecycle</h2><p className="mt-3 text-sm text-zinc-500 dark:text-zinc-400" role="status"><RefreshCw className="mr-2 inline h-4 w-4 animate-spin" aria-hidden="true" />Loading connection metadata…</p></aside>;
-  return <ConnectionCredentialActions item={connection} initialCredentialStatus={String(metadata.status ?? '')} />;
+  return <ConnectionCredentialActions item={connection} initialCredentialStatus={String(metadata.status ?? '')} onSession={onSession} />;
 }
 
-function ActionPanel({ kind, item, onKeyChanged }: { kind: string; item: Resource; onKeyChanged: (change: KeyMetadataChange) => void }) {
+function ActionPanel({ kind, item, onKeyChanged, onSession }: { kind: string; item: Resource; onKeyChanged: (change: KeyMetadataChange) => void; onSession?: (next: Session) => void }) {
   const [result, setResult] = useState<unknown>();
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
+  const [reloadingContext, setReloadingContext] = useState(false);
   const [keyRevoked, setKeyRevoked] = useState(false);
   const [currentKey, setCurrentKey] = useState(item);
   const [reconcile, setReconcile] = useState({ reconciliation_id: '', mode: 'provider_evidence', reason: '', source_reference: '', cost: '', input: '', output: '', total: '', source: '' });
+
+  const reloadContext = async () => {
+    setReloadingContext(true);
+    setError(undefined);
+    try {
+      await reloadTenantContext(onSession);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setReloadingContext(false);
+    }
+  };
 
   const invoke = async (path: string, data?: ActionBody) => {
     setBusy(true);
@@ -997,12 +1116,89 @@ function ActionPanel({ kind, item, onKeyChanged }: { kind: string; item: Resourc
     }
   };
 
-  if (kind === 'credentials') return <CredentialMetadataActions item={item} />;
-  if (kind === 'connections') return <div className="space-y-5"><aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Connection actions</h2><div className="mt-4 flex flex-wrap gap-2">{hasPermission(api.session!, 'connection:test') && <Button variant="outline" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/test`)}>Test</Button>}{hasPermission(api.session!, 'connection:discover') && <Button variant="outline" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/discover`)}>Discover models</Button>}{hasPermission(api.session!, 'resource:write') && <Button variant="destructive" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/disable`)}>Disable</Button>}</div><ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} /></aside><ConnectionCredentialActions item={item} /></div>;
-  if (kind === 'api_keys' && hasPermission(api.session!, 'key:write')) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Key actions</h2><div className="mt-4 flex flex-wrap gap-2"><Button disabled={busy || keyRevoked} onClick={() => void rotateKey()}>Rotate</Button><Button variant="destructive" disabled={busy || keyRevoked} onClick={() => void revokeKey()}>Revoke</Button></div>{keyRevoked && <p className="mt-3 text-sm text-zinc-600 dark:text-zinc-300" role="status">This key is revoked.</p>}<ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} /></aside>;
-  if (kind === 'route_policies' && hasPermission(api.session!, 'route:write')) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Route analysis</h2><Button className="mt-4" disabled={busy} onClick={() => void invoke(`/route_policies/${encodeURIComponent(item.id)}/dry-run`, { data: item.data })}>Explain dry-run</Button><ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} /></aside>;
-  if (kind === 'upstream_operations' && hasPermission(api.session!, 'job:write')) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Job actions</h2><Button className="mt-4" variant="destructive" disabled={busy} onClick={() => void invoke(`/upstream_operations/${encodeURIComponent(item.id)}/cancel`)}>Request cancellation</Button><ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} /></aside>;
-  if (kind === 'admissions' && hasPermission(api.session!, 'accounting:reconcile')) return <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"><h2 className="text-lg font-semibold">Reconcile admission</h2><div className="mt-4 space-y-1"><label className="field"><span>Reconciliation ID</span><Input value={reconcile.reconciliation_id} onChange={(event) => setReconcile({ ...reconcile, reconciliation_id: event.currentTarget.value })} /></label><label className="field"><span>Mode</span><NativeSelect value={reconcile.mode} onChange={(event) => setReconcile({ ...reconcile, mode: event.currentTarget.value })}><option value="provider_evidence">Provider evidence</option><option value="charge_reserved_maximum">Charge reserved maximum</option></NativeSelect></label><label className="field"><span>Reason</span><Textarea value={reconcile.reason} onChange={(event) => setReconcile({ ...reconcile, reason: event.currentTarget.value })} /></label><label className="field"><span>Source reference</span><Input value={reconcile.source_reference} onChange={(event) => setReconcile({ ...reconcile, source_reference: event.currentTarget.value })} /></label><label className="field"><span>Cost (nanodollars)</span><Input inputMode="numeric" value={reconcile.cost} onChange={(event) => setReconcile({ ...reconcile, cost: event.currentTarget.value })} /></label><fieldset className="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-700"><legend className="px-1 text-sm font-medium">Usage</legend><label className="field"><span>Input tokens</span><Input inputMode="numeric" value={reconcile.input} onChange={(event) => setReconcile({ ...reconcile, input: event.currentTarget.value })} /></label><label className="field"><span>Output tokens</span><Input inputMode="numeric" value={reconcile.output} onChange={(event) => setReconcile({ ...reconcile, output: event.currentTarget.value })} /></label><label className="field"><span>Total tokens</span><Input inputMode="numeric" value={reconcile.total} onChange={(event) => setReconcile({ ...reconcile, total: event.currentTarget.value })} /></label><label className="field"><span>Usage source</span><Input value={reconcile.source} onChange={(event) => setReconcile({ ...reconcile, source: event.currentTarget.value })} /></label></fieldset><Button className="mt-3" disabled={busy || !reconcile.reconciliation_id || !reconcile.reason} onClick={() => void invoke(`/admissions/${encodeURIComponent(item.id)}/reconcile`, { reconciliation_id: reconcile.reconciliation_id, mode: reconcile.mode, reason: reconcile.reason, source_reference: reconcile.source_reference || undefined, cost: reconcile.cost === '' ? undefined : Number(reconcile.cost), usage: { Input: reconcile.input === '' ? null : Number(reconcile.input), Output: reconcile.output === '' ? null : Number(reconcile.output), Total: reconcile.total === '' ? null : Number(reconcile.total), Source: reconcile.source } })}>Reconcile</Button></div><ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} /></aside>;
+  const actionResult = isTenantContextChanged(error)
+    ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} />
+    : <ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} />;
+
+  if (kind === 'credentials') return <CredentialMetadataActions item={item} onSession={onSession} />;
+  if (kind === 'connections') return (
+    <div className="space-y-5">
+      <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+        <h2 className="text-lg font-semibold">Connection actions</h2>
+        <div className="mt-4 flex flex-wrap gap-2">
+          {hasPermission(api.session!, 'connection:test') && <Button variant="outline" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/test`)}>Test</Button>}
+          {hasPermission(api.session!, 'connection:discover') && <Button variant="outline" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/discover`)}>Discover models</Button>}
+          {hasPermission(api.session!, 'connection:write') && <Button variant="destructive" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/disable`)}>Disable</Button>}
+        </div>
+        {actionResult}
+      </aside>
+      <ConnectionCredentialActions item={item} onSession={onSession} />
+    </div>
+  );
+  if (kind === 'api_keys' && hasPermission(api.session!, 'key:write')) return (
+    <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+      <h2 className="text-lg font-semibold">Key actions</h2>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button disabled={busy || keyRevoked} onClick={() => void rotateKey()}>Rotate</Button>
+        <Button variant="destructive" disabled={busy || keyRevoked} onClick={() => void revokeKey()}>Revoke</Button>
+      </div>
+      {keyRevoked && <p className="mt-3 text-sm text-zinc-600 dark:text-zinc-300" role="status">This key is revoked.</p>}
+      {actionResult}
+    </aside>
+  );
+  if (kind === 'route_policies' && hasPermission(api.session!, 'route:write')) return (
+    <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+      <h2 className="text-lg font-semibold">Route analysis</h2>
+      <Button className="mt-4" disabled={busy} onClick={() => void invoke(`/route_policies/${encodeURIComponent(item.id)}/dry-run`, { data: item.data })}>Explain dry-run</Button>
+      {actionResult}
+    </aside>
+  );
+  if (kind === 'upstream_operations' && hasPermission(api.session!, 'job:write')) return (
+    <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+      <h2 className="text-lg font-semibold">Job actions</h2>
+      <Button className="mt-4" variant="destructive" disabled={busy} onClick={() => void invoke(`/upstream_operations/${encodeURIComponent(item.id)}/cancel`)}>Request cancellation</Button>
+      {actionResult}
+    </aside>
+  );
+  if (kind === 'admissions' && hasPermission(api.session!, 'accounting:reconcile')) return (
+    <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+      <h2 className="text-lg font-semibold">Reconcile admission</h2>
+      <div className="mt-4 space-y-1">
+        <label className="field"><span>Reconciliation ID</span><Input value={reconcile.reconciliation_id} onChange={(event) => setReconcile({ ...reconcile, reconciliation_id: event.currentTarget.value })} /></label>
+        <label className="field"><span>Mode</span><NativeSelect value={reconcile.mode} onChange={(event) => setReconcile({ ...reconcile, mode: event.currentTarget.value })}><option value="provider_evidence">Provider evidence</option><option value="charge_reserved_maximum">Charge reserved maximum</option></NativeSelect></label>
+        <label className="field"><span>Reason</span><Textarea value={reconcile.reason} onChange={(event) => setReconcile({ ...reconcile, reason: event.currentTarget.value })} /></label>
+        <label className="field"><span>Source reference</span><Input value={reconcile.source_reference} onChange={(event) => setReconcile({ ...reconcile, source_reference: event.currentTarget.value })} /></label>
+        <label className="field"><span>Cost (nanodollars)</span><Input inputMode="numeric" value={reconcile.cost} onChange={(event) => setReconcile({ ...reconcile, cost: event.currentTarget.value })} /></label>
+        <fieldset className="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
+          <legend className="px-1 text-sm font-medium">Usage</legend>
+          <label className="field"><span>Input tokens</span><Input inputMode="numeric" value={reconcile.input} onChange={(event) => setReconcile({ ...reconcile, input: event.currentTarget.value })} /></label>
+          <label className="field"><span>Output tokens</span><Input inputMode="numeric" value={reconcile.output} onChange={(event) => setReconcile({ ...reconcile, output: event.currentTarget.value })} /></label>
+          <label className="field"><span>Total tokens</span><Input inputMode="numeric" value={reconcile.total} onChange={(event) => setReconcile({ ...reconcile, total: event.currentTarget.value })} /></label>
+          <label className="field"><span>Usage source</span><Input value={reconcile.source} onChange={(event) => setReconcile({ ...reconcile, source: event.currentTarget.value })} /></label>
+        </fieldset>
+        <Button
+          className="mt-3"
+          disabled={busy || !reconcile.reconciliation_id || !reconcile.reason}
+          onClick={() => void invoke(`/admissions/${encodeURIComponent(item.id)}/reconcile`, {
+            reconciliation_id: reconcile.reconciliation_id,
+            mode: reconcile.mode,
+            reason: reconcile.reason,
+            source_reference: reconcile.source_reference || undefined,
+            cost: reconcile.cost === '' ? undefined : Number(reconcile.cost),
+            usage: {
+              Input: reconcile.input === '' ? null : Number(reconcile.input),
+              Output: reconcile.output === '' ? null : Number(reconcile.output),
+              Total: reconcile.total === '' ? null : Number(reconcile.total),
+              Source: reconcile.source,
+            },
+          })}
+        >
+          Reconcile
+        </Button>
+      </div>
+      {actionResult}
+    </aside>
+  );
   return null;
 }
 
@@ -1018,7 +1214,7 @@ function ResourceRoute({ kind, onSession }: { kind: string; onSession?: (next: S
       <ResourceView kind={kind} onSelected={setSelected} onSession={onSession} keyChange={keyChange} />
       {selected && hasResourceActions(kind, api.session!) && (
         <div id="resource-actions" className="mt-6 scroll-mt-24">
-          <ActionPanel key={kind === 'api_keys' ? selected.id : `${selected.id}:${selected.version}`} kind={kind} item={selected} onKeyChanged={keyChanged} />
+          <ActionPanel key={kind === 'api_keys' ? selected.id : `${selected.id}:${selected.version}`} kind={kind} item={selected} onKeyChanged={keyChanged} onSession={onSession} />
         </div>
       )}
     </>
@@ -1030,20 +1226,58 @@ function TenantSelector({ session, onChanged }: { session: Session; onChanged: (
   const current = session.principal.TenantID;
   const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<unknown>();
+  const [reloadingContext, setReloadingContext] = useState(false);
+
+  const reloadContext = async () => {
+    setReloadingContext(true);
+    try {
+      await reloadTenantContext(onChanged);
+      setError(undefined);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setReloadingContext(false);
+    }
+  };
+
+  const handleChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    const id = event.currentTarget.value;
+    if (id === current) return;
+    if (!window.confirm('Switching the active tenant may discard unsaved page drafts. Continue?')) {
+      event.currentTarget.value = current;
+      return;
+    }
+    setSwitching(true);
+    setError(undefined);
+    void api.selectTenant(id).then(onChanged).catch(setError).finally(() => setSwitching(false));
+  };
+
   if (tenants.length < 2) return null;
-  return <div className="space-y-2"><label className="tenant-selector grid gap-2"><span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Tenant</span><NativeSelect value={current} disabled={switching} onChange={(event) => { const id = event.currentTarget.value; if (id === current) return; setSwitching(true); setError(undefined); void api.selectTenant(id).then(onChanged).catch(setError).finally(() => setSwitching(false)); }}>{tenants.map((tenant) => <option key={tenant.tenant_id} value={tenant.tenant_id}>{tenant.name || tenant.tenant_id} ({tenant.role})</option>)}</NativeSelect>{switching && <small className="text-xs text-zinc-400" role="status">Switching…</small>}</label><ErrorNotice error={error} onClose={() => setError(undefined)} /></div>;
+  return (
+    <div className="space-y-2">
+      <label className="tenant-selector grid gap-2">
+        <span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Tenant</span>
+        <NativeSelect value={current} disabled={switching} onChange={handleChange}>
+          {tenants.map((tenant) => <option key={tenant.tenant_id} value={tenant.tenant_id}>{tenant.name || tenant.tenant_id} ({tenant.role})</option>)}
+        </NativeSelect>
+        <small className="text-xs leading-5 text-zinc-500 dark:text-zinc-400">Active tenant; the role shown for each membership applies only to that tenant.</small>
+        {switching && <small className="text-xs text-zinc-400" role="status">Switching…</small>}
+      </label>
+      {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ErrorNotice error={error} onClose={() => setError(undefined)} />}
+    </div>
+  );
 }
 
-function Overview({ visible, canPlayground }: { visible: string[]; canPlayground: boolean }) {
+function Overview({ visible, canPlayground, session }: { visible: string[]; canPlayground: boolean; session: Session }) {
   const groups = RESOURCE_GROUPS
     .map((group) => ({ ...group, kinds: group.kinds.filter((kind) => visible.includes(kind)) }))
     .filter((group) => group.kinds.length);
   const modelKind = visible.includes('models') ? 'models' : visible.includes('model_aliases') ? 'model_aliases' : undefined;
   const policyKind = visible.includes('route_policies') ? 'route_policies' : visible.includes('policy_limits') ? 'policy_limits' : undefined;
   const workflows = [
-    { key: 'connections', title: 'Connect a provider', detail: 'Register a connection before cataloging models.', href: '/admin/connections', available: visible.includes('connections') },
-    { key: 'catalog', title: 'Add a model or alias', detail: 'Build the catalog that routes can target.', href: modelKind ? `/admin/${modelKind}` : '', available: Boolean(modelKind) },
-    { key: 'policy', title: 'Set routing and limits', detail: 'Shape traffic with an alias route and tenant limits.', href: policyKind ? `/admin/${policyKind}` : '', available: Boolean(policyKind) },
+    { key: 'connections', title: canWrite(session, 'connections') ? 'Connect a provider' : 'Review connections', detail: canWrite(session, 'connections') ? 'Register a connection before cataloging models.' : 'Inspect provider connections available to this tenant; creation requires connection write access.', href: '/admin/connections', available: visible.includes('connections') },
+    { key: 'catalog', title: modelKind && canWrite(session, modelKind) ? 'Add a model or alias' : 'Review models and aliases', detail: modelKind && canWrite(session, modelKind) ? 'Build the catalog that routes can target.' : 'Review the catalog available to this tenant; adding models or aliases requires catalog write access.', href: modelKind ? `/admin/${modelKind}` : '', available: Boolean(modelKind) },
+    { key: 'policy', title: policyKind && canWrite(session, policyKind) ? 'Set routing and limits' : 'Review routing and limits', detail: policyKind && canWrite(session, policyKind) ? 'Shape traffic with an alias route and tenant limits.' : 'Review routing and limits for this tenant; changes require route or budget write access.', href: policyKind ? `/admin/${policyKind}` : '', available: Boolean(policyKind) },
     { key: 'playground', title: 'Run a request', detail: 'Exercise an allowed operation from the playground.', href: '/admin/playground', available: canPlayground },
   ].filter((workflow) => workflow.available);
 
@@ -1182,10 +1416,9 @@ function Login({ onSession }: { onSession: (session: Session) => void }) {
 
 function Dashboard({ session, onChanged }: { session: Session; onChanged: (next: Session) => void }) {
   const visible = RESOURCE_KINDS.filter((kind) => canRead(session, kind));
-  const permissions = permissionsFor(session);
   const role = principalRole(session);
-  const canPlayground = role === 'owner' || role === 'admin' || permissions.includes('*') || permissions.includes('playground:execute');
-  const canConfig = role === 'owner' || role === 'admin' || permissions.includes('*') || permissions.includes('config:read');
+  const canPlayground = hasPermission(session, 'playground:execute');
+  const canConfig = hasPermission(session, 'config:read');
   const tenantID = session.principal.TenantID;
   const location = useLocation();
   const routeKey = location.pathname.replace(/^\/admin\/?/, '').split('/')[0] || 'overview';
@@ -1294,9 +1527,10 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
           <button type="button" className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 md:hidden" onClick={closeMobileNav} aria-label="Close navigation"><X className="h-5 w-5" aria-hidden="true" /></button>
         </div>
         <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2.5 dark:border-zinc-800 dark:bg-zinc-950/50">
-          <div className="flex items-center justify-between gap-2"><span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Session</span><Badge variant="outline" className="capitalize">{role || 'operator'}</Badge></div>
+          <div className="flex items-center justify-between gap-2"><span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Session</span><Badge variant="outline" className="capitalize">{role || 'unknown'} role</Badge></div>
           <p className="mt-1.5 truncate text-sm font-medium text-zinc-800 dark:text-zinc-100">{session.principal.SubjectID}</p>
-          <p className="mt-0.5 truncate text-xs text-zinc-500 dark:text-zinc-400">Tenant {tenantID}</p>
+          <p className="mt-0.5 truncate text-xs text-zinc-500 dark:text-zinc-400">Active tenant: {tenantID}</p>
+          <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">Role applies only to this tenant.</p>
         </div>
         <div className="mt-3"><TenantSelector session={session} onChanged={onChanged} /></div>
         <Separator className="my-4" />
@@ -1317,7 +1551,7 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
           <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
               <button ref={toggleRef} type="button" className="rounded-lg border border-zinc-200 bg-white p-2 text-zinc-700 shadow-sm hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800 md:hidden" onClick={() => setMobileNavOpen((open) => !open)} aria-expanded={mobileNavOpen} aria-label={mobileNavOpen ? 'Close navigation' : 'Open navigation'}>{mobileNavOpen ? <PanelLeftClose className="h-5 w-5" aria-hidden="true" /> : <PanelLeftOpen className="h-5 w-5" aria-hidden="true" />}</button>
-              <div className="min-w-0"><p className="truncate text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">{routeLabel}</p><p className="truncate text-sm font-medium text-zinc-800 dark:text-zinc-100">Tenant {tenantID} · {role || 'operator'}</p></div>
+              <div className="min-w-0"><p className="truncate text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">{routeLabel}</p><p className="truncate text-sm font-medium text-zinc-800 dark:text-zinc-100">Active tenant {tenantID} · {role || 'unknown'} role</p></div>
             </div>
             <div className="flex items-center gap-1">
               <button type="button" className="rounded-lg p-2 text-zinc-600 hover:bg-zinc-200/70 dark:text-zinc-300 dark:hover:bg-zinc-800" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>{theme === 'dark' ? <Sun className="h-5 w-5" aria-hidden="true" /> : <Moon className="h-5 w-5" aria-hidden="true" />}</button>
@@ -1327,9 +1561,9 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
         </header>
         <div key={tenantID} className="mx-auto w-full max-w-[100rem]">
           <Routes>
-            <Route index element={<Overview visible={visible} canPlayground={canPlayground} />} />
+            <Route index element={<Overview visible={visible} canPlayground={canPlayground} session={session} />} />
             {visible.map((kind) => <Route key={kind} path={kind} element={<ResourceRoute key={kind} kind={kind} onSession={onChanged} />} />)}
-            <Route path="playground" element={canPlayground ? <Playground /> : <NotFound />} />
+            <Route path="playground" element={canPlayground ? <Playground onReloadTenantContext={() => reloadTenantContext(onChanged)} /> : <NotFound />} />
             <Route path="config" element={canConfig ? <ConfigPage /> : <NotFound />} />
             <Route path="*" element={<NotFound />} />
           </Routes>

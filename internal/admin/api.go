@@ -41,6 +41,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 401, "authentication_required", "authentication required")
 				return
 			}
+			if status, code, message, failed := expectedTenantError(r, p); failed {
+				writeError(w, status, code, message)
+				return
+			}
 			ctx = core.WithPrincipal(ctx, p)
 		}
 		r = r.WithContext(ctx)
@@ -92,6 +96,19 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	id := requestID(w)
 	writeJSON(w, status, map[string]any{"type": "about:blank", "title": msg, "status": status, "code": code, "request_id": id})
 }
+func expectedTenantError(r *http.Request, p core.Principal) (int, string, string, bool) {
+	values := r.Header.Values("X-Hoorific-Expected-Tenant")
+	if len(values) == 0 {
+		return 0, "", "", false
+	}
+	if len(values) > 1 || values[0] == "" {
+		return http.StatusBadRequest, "invalid_tenant_context", "invalid expected tenant", true
+	}
+	if values[0] != p.TenantID {
+		return http.StatusConflict, "tenant_context_changed", "active tenant changed; reload the session", true
+	}
+	return 0, "", "", false
+}
 func requestID(w http.ResponseWriter) string {
 	b := make([]byte, 12)
 	if _, e := rand.Read(b); e != nil {
@@ -114,6 +131,10 @@ func (s *Server) require(w http.ResponseWriter, r *http.Request, permission stri
 	p, e := s.authenticate(r)
 	if e != nil {
 		writeError(w, 401, "authentication_required", "authentication required")
+		return p, false
+	}
+	if status, code, message, failed := expectedTenantError(r, p); failed {
+		writeError(w, status, code, message)
 		return p, false
 	}
 	allowed := hasPermission(p, permission)

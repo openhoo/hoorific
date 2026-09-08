@@ -13,6 +13,11 @@ import { api, APIError } from './api';
 type Operation = 'chat' | 'responses' | 'image' | 'audio' | 'video';
 type RunStatus = 'ready' | 'streaming' | 'completed' | 'error' | 'cancelled';
 
+function isTenantContextChanged(error: unknown) {
+  if (!(error instanceof APIError) || error.status !== 409 || !error.body || typeof error.body !== 'object' || Array.isArray(error.body)) return false;
+  return (error.body as Record<string, unknown>).code === 'tenant_context_changed';
+}
+
 const operationPaths: Record<Operation, string> = {
   chat: '/playground/v1/chat/completions',
   responses: '/playground/v1/responses',
@@ -55,7 +60,7 @@ function isSafePreviewURL(value: string) {
   }
 }
 
-export function Playground() {
+export function Playground({ onReloadTenantContext }: { onReloadTenantContext: () => Promise<void> }) {
   const [operation, setOperation] = useState<Operation>('chat');
   const [path, setPath] = useState(operationPaths.chat);
   const [payload, setPayload] = useState('{\n  "model": "",\n  "messages": [{"role":"user","content":""}],\n  "stream": true\n}');
@@ -67,6 +72,7 @@ export function Playground() {
   const [status, setStatus] = useState<RunStatus>('ready');
   const [copying, setCopying] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<'copied' | 'failed'>();
+  const [reloadingContext, setReloadingContext] = useState(false);
   const controller = useRef<AbortController | null>(null);
   const mounted = useRef(true);
 
@@ -175,6 +181,24 @@ export function Playground() {
       if (mounted.current) setCopying(false);
     }
   };
+  const reloadContext = async () => {
+    if (reloadingContext) return;
+    setReloadingContext(true);
+    try {
+      await onReloadTenantContext();
+      if (mounted.current) {
+        setError(undefined);
+        setStatus('ready');
+      }
+    } catch (failure) {
+      if (mounted.current) {
+        setError(failure);
+        setStatus('error');
+      }
+    } finally {
+      if (mounted.current) setReloadingContext(false);
+    }
+  };
   const errorMessage = error instanceof APIError || error instanceof Error ? error.message : String(error);
   const statusLabel = statusLabels[status];
   const statusDescription = statusDescriptions[status];
@@ -230,7 +254,19 @@ export function Playground() {
               </PlaygroundField>
             </fieldset>
 
-            {Boolean(error) && <Alert id="playground-request-error" variant="destructive"><AlertTitle>Request failed</AlertTitle><AlertDescription>{errorMessage}</AlertDescription></Alert>}
+            {Boolean(error) && (isTenantContextChanged(error) ? (
+              <Alert id="playground-request-error" variant="destructive">
+                <AlertTitle>Tenant context changed</AlertTitle>
+                <AlertDescription className="flex flex-wrap items-center gap-3">
+                  <span>Another tab changed the active tenant. Nothing was retried. Reload the tenant context before continuing.</span>
+                  <Button type="button" variant="outline" size="sm" disabled={reloadingContext} onClick={() => void reloadContext()}>
+                    {reloadingContext ? 'Reloading…' : 'Reload tenant context'}
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            ) : (
+              <Alert id="playground-request-error" variant="destructive"><AlertTitle>Request failed</AlertTitle><AlertDescription>{errorMessage}</AlertDescription></Alert>
+            ))}
           </CardContent>
         </form>
       </Card>

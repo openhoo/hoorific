@@ -41,6 +41,7 @@ func (s *Store) tenancyCursor(p core.Principal, kind, cursor string, limit int) 
 
 // Canonical reads and their membership decision share the serialization boundary.
 func (s *Store) readTenancy(ctx context.Context, p core.Principal, kind, id, cursor string, limit int, single bool) (core.ResourcePage, error) {
+	tokenTenant := p.AuthSource == "admin_token"
 	out := core.ResourcePage{Items: []core.Resource{}}
 	if limit == 0 {
 		limit = 100
@@ -67,6 +68,10 @@ func (s *Store) readTenancy(ctx context.Context, p core.Principal, kind, id, cur
 		case "tenants":
 			q = "SELECT t.id,t.version,t.data,o.data FROM tenants t JOIN role_bindings b ON b.tenant_id=t.id JOIN operators o ON o.id=b.subject_id WHERE b.subject_id=?"
 			args = []any{p.SubjectID}
+			if tokenTenant {
+				q += " AND t.id=?"
+				args = append(args, p.TenantID)
+			}
 		case "operators":
 			q = "SELECT t.id,t.version,t.data FROM operators t JOIN role_bindings b ON b.subject_id=t.id WHERE b.tenant_id=?"
 			args = []any{p.TenantID}
@@ -278,6 +283,8 @@ func (s *Store) bootstrapResourceTx(ctx context.Context, tx *sql.Tx, p core.Prin
 }
 
 func (s *Store) mutateTenancy(ctx context.Context, p core.Principal, m core.Mutation) (core.Resource, error) {
+	tokenTenant := p.AuthSource == "admin_token"
+	activeSession := p.SessionID != "" || tokenTenant
 	var out core.Resource
 	var revision int64
 	var affected []string
@@ -290,6 +297,9 @@ func (s *Store) mutateTenancy(ctx context.Context, p core.Principal, m core.Muta
 			return e
 		}
 		p = current
+		if tokenTenant && m.Kind == "tenants" && m.ID != p.TenantID {
+			return storeError("forbidden", 403)
+		}
 		tenant := p.TenantID
 		if m.Kind == "tenants" {
 			tenant = m.ID
@@ -329,6 +339,9 @@ func (s *Store) mutateTenancy(ctx context.Context, p core.Principal, m core.Muta
 				return storeError("operator_collision", 409)
 			}
 			for _, bound := range affected {
+				if tokenTenant && bound != p.TenantID {
+					return storeError("forbidden", 403)
+				}
 				if e = s.requireTenantOwnerTx(ctx, tx, bound, p.SubjectID); e != nil {
 					return e
 				}
@@ -357,6 +370,13 @@ func (s *Store) mutateTenancy(ctx context.Context, p core.Principal, m core.Muta
 			data, e = validateTenantData(m.Data)
 			if e != nil {
 				return e
+			}
+			var tenantCandidate admin.TenantData
+			if json.Unmarshal(data, &tenantCandidate) != nil {
+				return storeError("invalid_tenant", 400)
+			}
+			if activeSession && !tenantCandidate.Enabled && tenant == p.TenantID {
+				return storeError("tenant_disable_would_lockout", 409)
 			}
 		case "operators":
 			if exists {

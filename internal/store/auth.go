@@ -280,9 +280,51 @@ func (s *Store) ResolveIdentity(ctx context.Context, issuer, subject string) (ou
 		if issuer == "" || subject == "" || json.Unmarshal([]byte(operatorRaw), &operator) != nil || authoritativeIssuer != issuer || authoritativeSubject != subject || operator.Subject != row.Principal.SubjectID || operator.Issuer != issuer || operator.IdentitySubject != subject {
 			return storeError("unauthorized", 401)
 		}
-		p, e := s.resolveMembershipTx(ctx, tx, row.Principal.TenantID, row.Principal.SubjectID)
-		if e != nil {
-			return e
+		p, membershipErr := s.resolveMembershipTx(ctx, tx, row.Principal.TenantID, row.Principal.SubjectID)
+		if membershipErr != nil {
+			retry := errors.Is(membershipErr, sql.ErrNoRows)
+			var gateway core.GatewayError
+			if errors.As(membershipErr, &gateway) && gateway.HTTPStatus == 401 {
+				retry = true
+			}
+			if !retry {
+				return membershipErr
+			}
+			rows, queryErr := tx.QueryContext(ctx, s.Query("SELECT tenant_id FROM role_bindings WHERE subject_id=? ORDER BY tenant_id"), row.Principal.SubjectID)
+			if queryErr != nil {
+				return queryErr
+			}
+			var candidates []string
+			for rows.Next() {
+				var candidateTenant string
+				if queryErr = rows.Scan(&candidateTenant); queryErr != nil {
+					rows.Close()
+					return queryErr
+				}
+				candidates = append(candidates, candidateTenant)
+			}
+			if queryErr = rows.Err(); queryErr != nil {
+				rows.Close()
+				return queryErr
+			}
+			if queryErr = rows.Close(); queryErr != nil {
+				return queryErr
+			}
+			for _, candidateTenant := range candidates {
+				candidate, candidateErr := s.resolveMembershipTx(ctx, tx, candidateTenant, row.Principal.SubjectID)
+				if candidateErr == nil {
+					p = candidate
+					membershipErr = nil
+					break
+				}
+				var candidateGateway core.GatewayError
+				if !errors.Is(candidateErr, sql.ErrNoRows) && (!errors.As(candidateErr, &candidateGateway) || candidateGateway.HTTPStatus != 401) {
+					return candidateErr
+				}
+			}
+			if membershipErr != nil {
+				return storeError("unauthorized", 401)
+			}
 		}
 		out = p
 		_ = tenant
@@ -314,6 +356,7 @@ func (s *Store) ResolveAdminToken(ctx context.Context, hash string) (out core.Pr
 			return sql.ErrNoRows
 		}
 		p.Permissions = scopes
+		p.AuthSource = "admin_token"
 		out = p
 		return nil
 	})

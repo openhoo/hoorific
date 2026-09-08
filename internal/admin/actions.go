@@ -164,6 +164,7 @@ func (s *Server) playground(w http.ResponseWriter, r *http.Request) {
 	// This in-process dispatch is not a browser request to the inference listener.
 	r = r.Clone(core.WithPrincipal(r.Context(), p))
 	r.Header.Del("Origin")
+	r.Header.Del("X-Hoorific-Expected-Tenant")
 	http.StripPrefix("/admin/api/v1/playground", s.deps.Playground).ServeHTTP(w, r)
 }
 func (s *Server) exportConfig(w http.ResponseWriter, r *http.Request) { s.configAction("export", w, r) }

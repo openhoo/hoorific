@@ -93,7 +93,7 @@ func rolePermissions(role string) []string {
 	case "owner":
 		return []string{"*"}
 	case "admin":
-		return []string{"tenant:read", "tenant:write", "connection:read", "connection:write", "connection:test", "connection:discover", "key:read", "key:write", "route:read", "route:write", "budget:read", "budget:write", "accounting:reconcile", "config:read", "config:write", "job:read", "job:write", "catalog:read", "catalog:write", "usage:read", "audit:read", "playground:execute", "session:read"}
+		return []string{"tenant:read", "connection:read", "connection:write", "connection:test", "connection:discover", "key:read", "key:write", "route:read", "route:write", "budget:read", "budget:write", "accounting:reconcile", "config:read", "config:write", "job:read", "job:write", "catalog:read", "catalog:write", "usage:read", "audit:read", "playground:execute", "session:read"}
 	case "operator":
 		return []string{"connection:read", "connection:test", "connection:discover", "catalog:read", "job:read", "job:write", "playground:execute", "usage:read"}
 	case "auditor":
