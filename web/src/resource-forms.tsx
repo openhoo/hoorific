@@ -6,7 +6,7 @@ import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
 import { NativeSelect } from './components/ui/select';
 import { Textarea } from './components/ui/textarea';
-import { Plus, Trash2 } from 'lucide-react';
+import { Lock, Plus, Trash2 } from 'lucide-react';
 
 type DTO = components['schemas'];
 type TenantData = DTO['TenantData'];
@@ -57,28 +57,31 @@ type FieldShellProps = {
   label: string;
   htmlFor: string;
   required?: boolean;
+  readOnly?: boolean;
   description?: ReactNode;
   error?: string;
   children: ReactNode;
   className?: string;
 };
-function FieldShell({ label, htmlFor, required = false, description, error, children, className }: FieldShellProps) {
+function FieldShell({ label, htmlFor, required = false, readOnly = false, description, error, children, className }: FieldShellProps) {
   const descriptionID = `${htmlFor}-description`;
   const errorID = `${htmlFor}-error`;
   return <div className={`field min-w-0${className ? ` ${className}` : ''}`}>
-    <label htmlFor={htmlFor} className="flex min-w-0 items-center gap-1 text-sm font-medium leading-snug text-foreground">
-      <span className="min-w-0 break-words">{label}</span>
-    </label>
+    <div className="flex min-w-0 items-center gap-1 text-sm font-medium leading-snug text-foreground">
+      <label htmlFor={htmlFor} className="min-w-0 break-words">{label}</label>
+      {required && <span aria-hidden="true" title="Required" className="text-destructive">*</span>}
+      {readOnly && <span aria-hidden="true" title="Read-only" className="inline-flex shrink-0 text-muted-foreground"><Lock className="h-3 w-3" /></span>}
+    </div>
     {children}
     {description && <p id={descriptionID} className="text-xs leading-relaxed text-muted-foreground">{description}</p>}
     {error && <p id={errorID} role="alert" className="text-xs font-medium leading-relaxed text-destructive">{error}</p>}
   </div>;
 }
-
-function TextField({ label, value, onChange, required = false, readOnly = false }: FieldProps<string | undefined> & { required?: boolean; readOnly?: boolean }) {
+type TextFieldProps = FieldProps<string | undefined> & { required?: boolean; readOnly?: boolean; description?: ReactNode };
+function TextField({ label, value, onChange, required = false, readOnly = false, description }: TextFieldProps) {
   const id = useId();
-  return <FieldShell label={label} htmlFor={id} required={required}>
-    <Input id={id} value={value ?? ''} required={required} readOnly={readOnly} onInput={event => onChange(event.currentTarget.value)} />
+  return <FieldShell label={label} htmlFor={id} required={required} readOnly={readOnly} description={description}>
+    <Input id={id} value={value ?? ''} required={required} readOnly={readOnly} aria-readonly={readOnly || undefined} aria-describedby={description ? `${id}-description` : undefined} onInput={event => onChange(event.currentTarget.value)} />
   </FieldShell>;
 }
 function BooleanField({ label, value, onChange, disabled = false, description }: FieldProps<boolean> & { disabled?: boolean; description?: ReactNode }) {
@@ -91,50 +94,123 @@ function BooleanField({ label, value, onChange, disabled = false, description }:
     {description && <p id={`${id}-description`} className="text-xs leading-relaxed text-muted-foreground">{description}</p>}
   </div>;
 }
-function SelectField({ label, value, onChange, options }: FieldProps<string> & { options: readonly string[] }) {
+type SelectFieldProps = FieldProps<string> & { options: readonly string[]; required?: boolean; description?: ReactNode };
+function SelectField({ label, value, onChange, options, required = true, description }: SelectFieldProps) {
   const id = useId();
-  return <FieldShell label={label} htmlFor={id} required>
-    <NativeSelect id={id} value={value} required onChange={event => onChange(event.currentTarget.value)}>
-      {!options.includes(value) && <option value={value} disabled>{value || 'Select a value'}</option>}
+  return <FieldShell label={label} htmlFor={id} required={required} description={description}>
+    <NativeSelect id={id} value={value} required={required} aria-describedby={description ? `${id}-description` : undefined} onChange={event => onChange(event.currentTarget.value)}>
+      {!required && <option value="">Server default (total)</option>}
+      {!options.includes(value) && (value !== '' || required) && <option value={value} disabled>{value || 'Select a value'}</option>}
       {options.map(option => <option key={option} value={option}>{option}</option>)}
     </NativeSelect>
   </FieldShell>;
 }
-export function IntegerField({ label, value, onChange, optional = false }: FieldProps<number | undefined> & { optional?: boolean }) {
+
+export function IntegerField({ label, value, onChange, optional = false, minimum = 0 }: FieldProps<number | undefined> & { optional?: boolean; minimum?: number }) {
   const [invalid, setInvalid] = useState<string>();
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const message = 'Enter a nonnegative safe integer (at most 9007199254740991).';
+  const maxSafeInteger = Number.MAX_SAFE_INTEGER;
+  const message = minimum > 0
+    ? `Enter a safe integer from ${minimum} to ${maxSafeInteger}.`
+    : `Enter a nonnegative safe integer (at most ${maxSafeInteger}).`;
   const text = invalid ?? (value === undefined ? '' : String(value));
-  const error = (text === '' && optional) || (/^\d+$/.test(text) && Number.isSafeInteger(Number(text))) ? '' : message;
+  const textIsValid = text === ''
+    ? optional
+    : /^\d+$/.test(text) && Number.isSafeInteger(Number(text)) && Number(text) >= minimum;
+  const error = textIsValid ? '' : message;
   useEffect(() => {
     inputRef.current?.setCustomValidity(error);
   }, [error]);
   const id = useId();
   const handleInput = (event: FormEvent<HTMLInputElement>) => {
     const raw = event.currentTarget.value;
-    const valid = raw === '' ? optional : /^\d+$/.test(raw) && Number.isSafeInteger(Number(raw));
-    event.currentTarget.setCustomValidity(valid ? '' : message);
-    setInvalid(valid ? undefined : raw);
-    if (valid) onChange(raw === '' ? undefined : Number(raw));
+    const isValid = raw === ''
+      ? optional
+      : /^\d+$/.test(raw) && Number.isSafeInteger(Number(raw)) && Number(raw) >= minimum;
+    event.currentTarget.setCustomValidity(isValid ? '' : message);
+    setInvalid(isValid ? undefined : raw);
+    if (isValid) onChange(raw === '' ? undefined : Number(raw));
   };
   return <FieldShell label={label} htmlFor={id} required={!optional} error={error}>
     <Input id={id} ref={inputRef} type="text" inputMode="numeric" value={text} required={!optional} aria-invalid={Boolean(error)} aria-errormessage={error ? `${id}-error` : undefined} onInput={handleInput} />
   </FieldShell>;
 }
-function StringList({ label, value, onChange }: FieldProps<string[] | null | undefined>) {
+
+function validateReference(value: string): string | undefined {
+  if (!value) return 'Enter a value.';
+  if (value.length > 512) return 'Use 512 characters or fewer.';
+  if (value.trim() !== value) return 'Do not use leading or trailing spaces.';
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) return 'Control characters are not allowed.';
+  return undefined;
+}
+function validateName(value: string): string | undefined {
+  return value === '*' ? 'Wildcard entries are not allowed here.' : undefined;
+}
+function validateOperation(value: string): string | undefined {
+  return /[\/\\\s]/.test(value) ? 'Do not use spaces, slashes, or backslashes.' : undefined;
+}
+function validateOrigin(value: string): string | undefined {
+  try {
+    const origin = new URL(value);
+    const authority = value.slice(value.indexOf('://') + 3);
+    if (!['http:', 'https:'].includes(origin.protocol) || !origin.hostname || origin.username || origin.password || /[/?#]/.test(authority)) {
+      return 'Use an http(s) origin without a path, query, credentials, or fragment.';
+    }
+  } catch {
+    return 'Use an http(s) origin without a path, query, credentials, or fragment.';
+  }
+  return undefined;
+}
+
+type StringListOptions = {
+  description?: ReactNode;
+  itemLabel?: string;
+  minItems?: number;
+  unique?: boolean;
+  validateItem?: (value: string) => string | undefined;
+};
+function StringList({ label, value, onChange, description, itemLabel, minItems = 0, unique = false, validateItem }: FieldProps<string[] | null | undefined> & StringListOptions) {
   const rows = value ?? [];
-  const itemName = label.toLowerCase();
-  return <fieldset className="field resource-form-list min-w-0 @min-[28rem]:col-span-2">
-    <legend className="resource-form-list-legend">{label}</legend>
+  const itemName = itemLabel ?? label.toLowerCase();
+  const id = useId();
+  const descriptionID = `${id}-description`;
+  const errorID = `${id}-error`;
+  const inputRefs = useRef<Array<HTMLInputElement | null>>([]);
+  const itemErrors = rows.map((row, index) => {
+    const referenceError = validateReference(row);
+    if (referenceError) return referenceError;
+    const itemError = validateItem?.(row);
+    if (itemError) return itemError;
+    return unique && rows.some((item, otherIndex) => otherIndex !== index && item === row)
+      ? `Duplicate ${itemName} entries are not allowed.`
+      : undefined;
+  });
+  const listError = minItems > 0 && rows.length < minItems
+    ? `At least ${minItems === 1 ? `one ${itemName}` : `${minItems} ${itemName} entries`} is required.`
+    : undefined;
+  const firstErrorIndex = itemErrors.findIndex(Boolean);
+  const error = listError ?? (firstErrorIndex >= 0 ? `${itemName} ${firstErrorIndex + 1}: ${itemErrors[firstErrorIndex]}` : undefined);
+  const describedBy = [description ? descriptionID : undefined, error ? errorID : undefined].filter(Boolean).join(' ') || undefined;
+  useEffect(() => {
+    inputRefs.current.length = rows.length;
+    inputRefs.current.forEach((input, index) => input?.setCustomValidity(itemErrors[index] ?? ''));
+  }, [itemErrors]);
+  return <fieldset className="field resource-form-list min-w-0 @min-[28rem]:col-span-2" aria-describedby={describedBy} aria-invalid={Boolean(error)} aria-required={minItems > 0 || undefined}>
+    <legend className="resource-form-list-legend">
+      <span>{label}</span>
+      {minItems > 0 && <span aria-hidden="true" title="At least one entry required" className="ml-1 text-destructive">*</span>}
+    </legend>
+    {description && <p id={descriptionID} className="text-xs leading-relaxed text-muted-foreground">{description}</p>}
+    {error && <p id={errorID} role="alert" className="text-xs font-medium leading-relaxed text-destructive">{error}</p>}
     {rows.length === 0 ? <p className="resource-form-empty">No {itemName} yet. Add an entry below.</p> :
       <div className="resource-form-list-rows">
         {rows.map((row, index) => <div key={index} className="resource-form-list-row">
           <span className="resource-form-list-index" aria-hidden="true">{index + 1}</span>
-          <Input aria-label={`${label} ${index + 1}`} value={row} required onInput={event => onChange(rows.map((item, i) => i === index ? event.currentTarget.value : item))} />
+          <Input ref={element => { inputRefs.current[index] = element; }} aria-label={`${label} ${index + 1}`} value={row} required aria-describedby={describedBy} aria-invalid={Boolean(itemErrors[index])} aria-errormessage={itemErrors[index] ? errorID : undefined} onInput={event => onChange(rows.map((item, i) => i === index ? event.currentTarget.value : item))} />
           <Button type="button" variant="outline" size="sm" className="shrink-0 whitespace-normal" aria-label={`Remove ${itemName} entry ${index + 1}`} onClick={() => onChange(rows.filter((_, i) => i !== index))}><Trash2 aria-hidden="true" />Remove</Button>
         </div>)}
       </div>}
-    <Button type="button" variant="outline" size="sm" className="resource-form-add h-auto min-h-10 w-full justify-start whitespace-normal text-left @min-[28rem]:w-auto" onClick={() => onChange([...rows, ''])}><Plus aria-hidden="true" />Add {itemName} entry</Button>
+    <Button type="button" variant="outline" size="sm" className="resource-form-add h-auto min-h-10 w-full justify-start whitespace-normal text-left @min-[28rem]:w-auto" aria-invalid={Boolean(listError)} aria-errormessage={listError ? errorID : undefined} onClick={() => onChange([...rows, ''])}><Plus aria-hidden="true" />Add {itemName} entry</Button>
   </fieldset>;
 }
 function StringMap({ label, value, onChange, features = false }: FieldProps<Record<string, string> | undefined> & { features?: boolean }) {
@@ -142,6 +218,7 @@ function StringMap({ label, value, onChange, features = false }: FieldProps<Reco
   const [error, setError] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const id = useId();
+  const description = features ? 'Feature values must be supported, unsupported, or unknown.' : 'Use {} to clear this map.';
   useEffect(() => {
     textareaRef.current?.setCustomValidity(error);
   }, [error]);
@@ -166,8 +243,8 @@ function StringMap({ label, value, onChange, features = false }: FieldProps<Reco
       event.currentTarget.setCustomValidity(message);
     }
   };
-  return <FieldShell label={`${label} (JSON object of string values)`} htmlFor={id} error={error} description={features ? 'Feature values must be supported, unsupported, or unknown.' : undefined} className="@min-[28rem]:col-span-2">
-    <Textarea id={id} ref={textareaRef} value={draft ?? JSON.stringify(value ?? {}, null, 2)} aria-invalid={Boolean(error)} aria-errormessage={error ? `${id}-error` : undefined} aria-describedby={features ? `${id}-description` : undefined} onInput={handleInput} className="min-h-32 resize-y font-mono text-sm" />
+  return <FieldShell label={`${label} (JSON object of string values)`} htmlFor={id} error={error} description={description} className="@min-[28rem]:col-span-2">
+    <Textarea id={id} ref={textareaRef} value={draft ?? JSON.stringify(value ?? {}, null, 2)} aria-invalid={Boolean(error)} aria-errormessage={error ? `${id}-error` : undefined} aria-describedby={`${id}-description`} onInput={handleInput} className="min-h-32 resize-y font-mono text-sm" />
   </FieldShell>;
 }
 
@@ -176,12 +253,12 @@ type Keys<T, V> = { [K in keyof T]-?: NonNullable<T[K]> extends V ? K : never }[
 function fields<T extends object>(value: T, onChange: (value: T) => void) {
   const set = (key: keyof T, next: string | number | boolean | string[] | Record<string, string> | null | undefined) => onChange({ ...value, [key]: next });
   return {
-    text: (key: Keys<T, string>, label: string, required = false, readOnly = false) => <TextField key={String(key)} label={label} value={value[key] as string | undefined} required={required} readOnly={readOnly} onChange={next => set(key, next)} />,
-    integer: (key: Keys<T, number>, label: string, optional = false) => <IntegerField key={String(key)} label={label} value={value[key] as number | undefined} optional={optional} onChange={next => set(key, next)} />,
-    list: (key: Keys<T, string[]>, label: string) => <StringList key={String(key)} label={label} value={value[key] as string[] | null | undefined} onChange={next => set(key, next)} />,
+    text: (key: Keys<T, string>, label: string, required = false, readOnly = false, description?: ReactNode) => <TextField key={String(key)} label={label} value={value[key] as string | undefined} required={required} readOnly={readOnly} description={description} onChange={next => set(key, next)} />,
+    integer: (key: Keys<T, number>, label: string, optional = false, minimum = 0) => <IntegerField key={String(key)} label={label} value={value[key] as number | undefined} optional={optional} minimum={minimum} onChange={next => set(key, next)} />,
+    list: (key: Keys<T, string[]>, label: string, options: StringListOptions = {}) => <StringList key={String(key)} label={label} value={value[key] as string[] | null | undefined} {...options} onChange={next => set(key, next)} />,
     bool: (key: Keys<T, boolean>, label: string, disabled = false, description?: ReactNode) => <BooleanField key={String(key)} label={label} value={Boolean(value[key])} disabled={disabled} description={description} onChange={next => set(key, next)} />,
     map: (key: Keys<T, Record<string, string>>, label: string, features = false) => <StringMap key={String(key)} label={label} value={value[key] as Record<string, string> | undefined} features={features} onChange={next => set(key, next)} />,
-    select: (key: Keys<T, string>, label: string, options: readonly string[]) => <SelectField key={String(key)} label={label} value={String(value[key] ?? '')} options={options} onChange={next => set(key, next)} />,
+    select: (key: Keys<T, string>, label: string, options: readonly string[], required = true, description?: ReactNode) => <SelectField key={String(key)} label={label} value={String(value[key] ?? '')} options={options} required={required} description={description} onChange={next => set(key, next)} />,
   };
 }
 
@@ -191,25 +268,27 @@ function FormLayout({ children }: { children: ReactNode }) {
   </div>;
 }
 function FormSection({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
-  return <section className="resource-form-section min-w-0 @min-[28rem]:col-span-2">
+  const headingID = useId();
+  const descriptionID = `${headingID}-description`;
+  return <section className="resource-form-section min-w-0 @min-[28rem]:col-span-2" aria-labelledby={headingID} aria-describedby={description ? descriptionID : undefined}>
     <div className="resource-form-section-head">
-      <h3>{title}</h3>
-      {description && <p>{description}</p>}
+      <h3 id={headingID}>{title}</h3>
+      {description && <p id={descriptionID}>{description}</p>}
     </div>
     <div className="grid min-w-0 gap-x-5 gap-y-4 @min-[28rem]:grid-cols-2">{children}</div>
   </section>;
 }
 function PriceFields({ value, onChange }: FieldProps<DTO['PriceSchedule']>) {
   const f = fields(value, onChange);
-  return <FormSection title="Price schedule — integer nanodollars (10⁻⁹ USD)" description="Blank rates mean unknown, not free. Enter zero only for a known zero price.">
+  return <FormSection title="Price schedule — integer nanodollars (10⁻⁹ USD)" description="Blank rates mean unknown, not free. Enter zero only for a known zero price. A maximum cost applies only when Unit operation is set.">
     {f.text('version', 'Price version', true)}
-    {f.integer('input_per_million', 'Input nanodollars per million tokens', true)}
-    {f.integer('output_per_million', 'Output nanodollars per million tokens', true)}
-    {f.integer('cached_input_per_million', 'Cache-read nanodollars per million tokens', true)}
-    {f.integer('cache_write_input_per_million', 'Cache-write nanodollars per million tokens', true)}
-    {f.integer('cache_write_5m_per_million', '5-minute cache-write nanodollars per million tokens', true)}
-    {f.integer('cache_write_1h_per_million', '1-hour cache-write nanodollars per million tokens', true)}
-    {f.integer('maximum_unit_cost', 'Maximum nanodollars per operation unit', true)}
+    {f.integer('input_per_million', 'Input per million tokens', true)}
+    {f.integer('output_per_million', 'Output per million tokens', true)}
+    {f.integer('cached_input_per_million', 'Cache-read per million tokens', true)}
+    {f.integer('cache_write_input_per_million', 'Cache-write per million tokens', true)}
+    {f.integer('cache_write_5m_per_million', '5-minute cache-write per million tokens', true)}
+    {f.integer('cache_write_1h_per_million', '1-hour cache-write per million tokens', true)}
+    {f.integer('maximum_unit_cost', 'Maximum cost per operation unit', true)}
     {f.text('unit_operation', 'Unit operation')}
   </FormSection>;
 }
@@ -221,10 +300,10 @@ function ModelFields({ value, onChange }: FieldProps<DTO['ModelData']>) {
       {f.text('connection_id', 'Connection ID', true)}
       {f.text('upstream_id', 'Upstream model ID', true)}
     </FormSection>
-    <FormSection title="Capabilities">
-      {f.list('operations', 'Operations')}
-      {f.list('input_modalities', 'Input modalities')}
-      {f.list('output_modalities', 'Output modalities')}
+    <FormSection title="Capabilities" description="Add at least one operation. Other lists are optional; entries must be unique and cannot contain surrounding whitespace.">
+      {f.list('operations', 'Operations', { itemLabel: 'operation', minItems: 1, unique: true, validateItem: validateOperation })}
+      {f.list('input_modalities', 'Input modalities', { itemLabel: 'input modality', unique: true, validateItem: validateName })}
+      {f.list('output_modalities', 'Output modalities', { itemLabel: 'output modality', unique: true, validateItem: validateName })}
       {f.map('features', 'Features', true)}
     </FormSection>
     <FormSection title="Limits and status">
@@ -232,7 +311,7 @@ function ModelFields({ value, onChange }: FieldProps<DTO['ModelData']>) {
       {f.integer('output_limit', 'Output token limit (blank = unknown)', true)}
       {f.text('provenance', 'Provenance')}
       {f.bool('enabled', 'Enabled')}
-      <BooleanField label="Provide price schedule" value={hasPrice} onChange={enabled => onChange({ ...value, price: enabled ? { version: '' } : undefined })} />
+      <BooleanField label="Provide price schedule" value={hasPrice} description="Unchecking removes the current schedule from this draft." onChange={enabled => onChange({ ...value, price: enabled ? { version: '' } : undefined })} />
     </FormSection>
     {hasPrice && <PriceFields label="Price" value={value.price!} onChange={price => onChange({ ...value, price })} />}
   </FormLayout>;
@@ -242,8 +321,18 @@ function RouteFields({ value, onChange }: FieldProps<DTO['RoutePolicyData']>) {
   const targets = value.targets ?? [];
   const targetKeys = useRef<string[]>([]);
   const nextTargetKey = useRef(0);
+  const targetListID = useId();
+  const targetErrorID = `${targetListID}-error`;
   while (targetKeys.current.length < targets.length) targetKeys.current.push(`target-${nextTargetKey.current++}`);
   if (targetKeys.current.length > targets.length) targetKeys.current.length = targets.length;
+  const duplicateTargetIndex = targets.findIndex((target, index) =>
+    Boolean(target.connection_id && target.model_id) && targets.some((other, otherIndex) =>
+      otherIndex !== index && other.connection_id === target.connection_id && other.model_id === target.model_id));
+  const targetError = targets.length === 0
+    ? 'At least one route target is required.'
+    : duplicateTargetIndex >= 0
+      ? `Route target ${duplicateTargetIndex + 1} duplicates another target.`
+      : undefined;
   const removeTarget = (index: number) => {
     targetKeys.current.splice(index, 1);
     onChange({ ...value, targets: targets.filter((_, i) => i !== index) });
@@ -253,15 +342,19 @@ function RouteFields({ value, onChange }: FieldProps<DTO['RoutePolicyData']>) {
     onChange({ ...value, targets: [...targets, { connection_id: '', model_id: '', priority: 0, weight: 1 }] });
   };
   return <FormLayout>
-    <FormSection title="Routing options">
+    <FormSection title="Routing options" description="Add at least one compatible target. Lower priority values run first; weights must be at least 1. Residency and account pools must match the selected targets.">
       {f.text('alias', 'Model alias', true)}
-      {f.list('residency', 'Allowed residency regions')}
+      {f.list('residency', 'Allowed residency regions', { itemLabel: 'residency region', unique: true, validateItem: validateName })}
       {f.bool('fallback', 'Allow fallback')}
       {f.text('account_pool_id', 'Account pool ID')}
       {f.bool('affinity', 'Enable affinity')}
     </FormSection>
-    <fieldset className="field resource-form-list resource-form-target-list min-w-0 @min-[28rem]:col-span-2">
-      <legend className="resource-form-list-legend">Route targets</legend>
+    <fieldset className="field resource-form-list resource-form-target-list min-w-0 @min-[28rem]:col-span-2" aria-describedby={targetError ? targetErrorID : undefined} aria-invalid={Boolean(targetError)} aria-required="true">
+      <legend className="resource-form-list-legend">
+        <span>Route targets</span>
+        <span aria-hidden="true" title="At least one entry required" className="ml-1 text-destructive">*</span>
+      </legend>
+      {targetError && <p id={targetErrorID} role="alert" className="text-xs font-medium leading-relaxed text-destructive">{targetError}</p>}
       {targets.length === 0 ? <p className="resource-form-empty">No route targets yet. Add a target below.</p> :
         <div className="resource-form-list-rows">
           {targets.map((target, index) => {
@@ -272,14 +365,14 @@ function RouteFields({ value, onChange }: FieldProps<DTO['RoutePolicyData']>) {
                 {t.text('connection_id', 'Connection ID', true)}
                 {t.text('model_id', 'Model ID', true)}
                 {t.integer('priority', 'Priority')}
-                {t.integer('weight', 'Weight')}
+                {t.integer('weight', 'Weight', false, 1)}
                 {t.text('region', 'Region')}
               </div>
               <Button type="button" variant="outline" size="sm" className="shrink-0 whitespace-normal" aria-label={`Remove route target ${index + 1}`} onClick={() => removeTarget(index)}><Trash2 aria-hidden="true" />Remove target</Button>
             </fieldset>;
           })}
         </div>}
-      <Button type="button" variant="outline" size="sm" className="resource-form-add h-auto min-h-10 w-full justify-start whitespace-normal text-left @min-[28rem]:w-auto" onClick={addTarget}><Plus aria-hidden="true" />Add target</Button>
+      <Button type="button" variant="outline" size="sm" className="resource-form-add h-auto min-h-10 w-full justify-start whitespace-normal text-left @min-[28rem]:w-auto" aria-invalid={Boolean(targetError)} aria-errormessage={targetError ? targetErrorID : undefined} onClick={addTarget}><Plus aria-hidden="true" />Add target</Button>
     </fieldset>
   </FormLayout>;
 }
@@ -291,14 +384,14 @@ export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, 
     case 'tenants': {
       const f = fields(value as DTO['TenantData'], onChange as (value: DTO['TenantData']) => void);
       return <FormLayout>
-        <FormSection title="Tenant identity" description="The active tenant cannot be disabled from this session. Switch to another enabled tenant first; re-enable a disabled tenant from another tenant.">
+        <FormSection title="Tenant identity" description="Switch to another enabled tenant before disabling the active tenant. A disabled tenant can be re-enabled from another tenant.">
           {f.text('name', 'Tenant name', true)}
-          {f.bool('enabled', 'Enabled', activeTenant, activeTenant ? 'The active tenant cannot be disabled from this session. Switch to another enabled tenant first.' : undefined)}
+          {f.bool('enabled', 'Enabled', activeTenant, activeTenant ? 'Switch to another enabled tenant first.' : undefined)}
         </FormSection>
-        {f.list('allowed_origins', 'Allowed browser origins')}
-        <FormSection title="Request limits">
-          {f.integer('max_body_bytes', 'Maximum request body bytes (0 = default)', true)}
-          {f.integer('max_event_bytes', 'Maximum stream event bytes (0 = default)', true)}
+        {f.list('allowed_origins', 'Allowed browser origins', { itemLabel: 'origin', unique: true, validateItem: validateOrigin, description: 'Optional. Use an http(s) origin such as https://app.example without a path, query, credentials, or fragment.' })}
+        <FormSection title="Request limits" description="Leave either value blank or enter 0 to use the server default.">
+          {f.integer('max_body_bytes', 'Maximum request body (bytes)', true)}
+          {f.integer('max_event_bytes', 'Maximum stream event (bytes)', true)}
         </FormSection>
       </FormLayout>;
     }
@@ -309,7 +402,7 @@ export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, 
           {f.text('subject', 'Operator ID (subject)', true, readOnlyIdentity)}
           {f.text('issuer', 'Identity issuer', true, readOnlyIdentity)}
           {f.text('identity_subject', 'Identity subject (issuer sub claim)', true, readOnlyIdentity)}
-          {f.text('display_name', 'Display name', true)}
+          {f.text('display_name', 'Display name')}
           {f.bool('enabled', 'Enabled')}
         </FormSection>
       </FormLayout>;
@@ -317,9 +410,9 @@ export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, 
     case 'role_bindings': {
       const f = fields(value as DTO['RoleBindingData'], onChange as (value: DTO['RoleBindingData']) => void);
       return <FormLayout>
-        <FormSection title="Role binding" description="This binding grants one existing operator access to the active tenant. Viewer is the least-privileged default; choose a stronger role only when required.">
+        <FormSection title="Role binding" description="This binding grants one existing operator access to the active tenant. The tenant is fixed to the current tenant. Viewer is the least-privileged default; choose a stronger role only when required.">
           {f.text('subject', 'Operator subject (existing operator ID)', true, readOnlyIdentity)}
-          {f.text('tenant_id', 'Current tenant binding', true, readOnlyIdentity)}
+          {f.text('tenant_id', 'Current tenant binding', true, true)}
           {f.select('role', 'Role', ['viewer', 'operator', 'auditor', 'admin', 'owner'])}
         </FormSection>
       </FormLayout>;
@@ -327,10 +420,10 @@ export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, 
     case 'connections': {
       const f = fields(value as DTO['ConnectionData'], onChange as (value: DTO['ConnectionData']) => void);
       return <FormLayout>
-        <FormSection title="Connection identity">
+        <FormSection title="Connection identity" description="Account ID and Base URL are optional for connectors that provide them at runtime.">
           {f.text('connector', 'Connector', true)}
-          {f.text('account_id', 'Account ID', true)}
-          {f.text('base_url', 'Base URL', true)}
+          {f.text('account_id', 'Account ID')}
+          {f.text('base_url', 'Base URL', false, false, 'Optional. Use an HTTPS URL, or HTTP only where the server private-network policy permits it.')}
           {f.text('region', 'Region')}
           {f.text('project', 'Project')}
         </FormSection>
@@ -344,37 +437,37 @@ export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, 
     case 'account_pools': {
       const f = fields(value as DTO['AccountPoolData'], onChange as (value: DTO['AccountPoolData']) => void);
       return <FormLayout>
-        <FormSection title="Account pool identity">
+        <FormSection title="Account pool identity" description="The provider should match the connector provider used by each account. Runtime routing requires at least one account ID.">
           {f.text('provider', 'Provider', true)}
         </FormSection>
-        {f.list('account_ids', 'Account IDs')}
+        {f.list('account_ids', 'Account IDs', { itemLabel: 'account ID', minItems: 1, unique: true, validateItem: validateName })}
       </FormLayout>;
     }
     case 'models': return <ModelFields label="Model" value={value as DTO['ModelData']} onChange={onChange as (value: DTO['ModelData']) => void} />;
     case 'model_aliases': {
-      const f = fields(value as DTO['AliasData'], onChange as (value: DTO['AliasData']) => void);
+      const alias = value as DTO['AliasData'];
+      const f = fields(alias, onChange as (value: DTO['AliasData']) => void);
       return <FormLayout>
-        <FormSection title="Alias details">
+        <FormSection title="Alias details" description={alias.enabled ? 'Enabled aliases need at least one existing model ID.' : 'Disabled aliases may be left without model IDs.'}>
           {f.text('description', 'Description')}
           {f.bool('enabled', 'Enabled')}
         </FormSection>
-        {f.list('model_ids', 'Model IDs')}
+        {f.list('model_ids', 'Model IDs', { itemLabel: 'model ID', minItems: alias.enabled ? 1 : 0, unique: true, validateItem: validateName, description: 'Use existing model IDs; duplicates are not allowed.' })}
       </FormLayout>;
     }
     case 'route_policies': return <RouteFields label="Route policy" value={value as DTO['RoutePolicyData']} onChange={onChange as (value: DTO['RoutePolicyData']) => void} />;
     case 'policy_limits': {
       const f = fields(value as DTO['PolicyLimitData'], onChange as (value: DTO['PolicyLimitData']) => void);
       return <FormLayout>
-        <FormSection title="Limit scope">
+        <FormSection title="Limit scope" description="Scope ID must identify a resource in the selected scope. Tenant scope uses the active tenant; changing scope does not change this ID.">
           {f.select('scope', 'Policy scope', ['tenant', 'key', 'connection', 'account', 'model'])}
-          {f.text('scope_id', 'Scope ID', true)}
-          <p className="resource-form-note @min-[28rem]:col-span-2">Zero means no configured limit for these policy quantities.</p>
+          {f.text('scope_id', 'Scope ID', true, false, 'Use the ID from the selected scope.')}
         </FormSection>
-        <FormSection title="Policy limits">
+        <FormSection title="Policy limits" description="Use 0 or leave a quantity blank for no configured limit. A blank cost window uses the total window.">
           {f.integer('requests_per_minute', 'Requests per minute', true)}
           {f.integer('tokens_per_minute', 'Tokens per minute', true)}
           {f.integer('max_cost', 'Maximum cost (integer nanodollars)', true)}
-          {f.select('cost_window', 'Cost window', ['total', 'daily', 'monthly'])}
+          {f.select('cost_window', 'Cost window', ['total', 'daily', 'monthly'], false)}
           {f.integer('concurrency', 'Concurrent requests', true)}
           {f.integer('outstanding_jobs', 'Outstanding jobs', true)}
         </FormSection>

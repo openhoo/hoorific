@@ -21,6 +21,11 @@ export type ActionResult = unknown;
 type HTTPMethod = NonNullable<RequestInit['method']>;
 const mutation = new Set<HTTPMethod>(['POST', 'PUT', 'DELETE']);
 
+export type StreamOptions = {
+  onMedia?: (blob: Blob, contentType: string) => void;
+};
+
+
 export class APIError extends Error {
   status: number;
   body: unknown;
@@ -75,7 +80,39 @@ export class AdminAPI {
   async credentialAction(item: Resource, action: CredentialAction, data: CredentialActionData) {
     return this.action<CredentialActionResult>(`/connections/${encodeURIComponent(item.id)}/${action}`, {data}, action === 'status' ? undefined : item.version);
   }
-  async stream(path: string, body: unknown, signal: AbortSignal, onChunk: (text: string) => void) { const headers = new Headers({'Content-Type':'application/json','Accept':'text/event-stream, application/json'}); if (this.session?.csrf_token) headers.set('X-CSRF-Token', this.session.csrf_token); headers.set('Origin', window.location.origin); if (this.session?.principal.TenantID) headers.set('X-Hoorific-Expected-Tenant', this.session.principal.TenantID); const response = await fetch(`${this.base}${path}`, {method:'POST', credentials:'include', headers, body:JSON.stringify(body), signal}); if (!response.ok) { const text = await response.text(); let body: unknown; if (text) { try { body = JSON.parse(text); } catch { body = text; } } throw new APIError(response.status, body); } if (!response.body) return; const reader = response.body.getReader(); const decoder = new TextDecoder(); try { while (true) { const next = await reader.read(); if (next.done) break; onChunk(decoder.decode(next.value, {stream:true})); } onChunk(decoder.decode()); } finally { reader.releaseLock(); } }
+  async stream(path: string, body: unknown, signal: AbortSignal, onChunk: (text: string) => void, options: StreamOptions = {}) {
+    const headers = new Headers({'Content-Type':'application/json','Accept':'text/event-stream, application/json'});
+    if (this.session?.csrf_token) headers.set('X-CSRF-Token', this.session.csrf_token);
+    headers.set('Origin', window.location.origin);
+    if (this.session?.principal.TenantID) headers.set('X-Hoorific-Expected-Tenant', this.session.principal.TenantID);
+    const response = await fetch(`${this.base}${path}`, {method:'POST', credentials:'include', headers, body:JSON.stringify(body), signal});
+    if (!response.ok) {
+      const text = await response.text();
+      let body: unknown;
+      if (text) { try { body = JSON.parse(text); } catch { body = text; } }
+      throw new APIError(response.status, body);
+    }
+    const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim();
+    if (options.onMedia && (/^(?:audio|image|video)\//i.test(contentType) || contentType.toLowerCase() === 'application/octet-stream')) {
+      const blob = await response.blob();
+      if (blob.size === 0) throw new Error('Gateway returned an empty media response.');
+      options.onMedia(blob, blob.type || contentType || 'application/octet-stream');
+      return;
+    }
+    if (!response.body) throw new Error('Gateway returned an empty response body.');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        onChunk(decoder.decode(next.value, {stream:true}));
+      }
+      onChunk(decoder.decode());
+    } finally {
+      reader.releaseLock();
+    }
+  }
 }
 export type AdminPaths = paths;
 export const api = new AdminAPI();

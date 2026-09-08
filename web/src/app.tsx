@@ -352,6 +352,15 @@ function resourceStatus(kind: string, data: unknown): string | undefined {
   if (typeof obj.enabled === 'boolean') return obj.enabled ? 'Enabled' : 'Disabled';
   return undefined;
 }
+function statusBadgeVariant(status?: string): 'secondary' | 'success' | 'warning' | 'destructive' {
+  const normalized = status?.toLowerCase();
+  if (!normalized) return 'secondary';
+  if (['disabled', 'revoked', 'expired', 'failed', 'error'].includes(normalized)) return 'destructive';
+  if (['pending', 'processing', 'queued', 'expiring', 'requires_credentials'].includes(normalized)) return 'warning';
+  if (['active', 'enabled', 'completed', 'succeeded', 'healthy'].includes(normalized)) return 'success';
+  return 'secondary';
+}
+
 
 function summarize(kind: string, data: unknown) {
   const obj = resourceRecord(displayResourceData(kind, data));
@@ -382,12 +391,15 @@ function summarize(kind: string, data: unknown) {
       return [resourceText(obj.scope) || 'Scope not set', resourceText(obj.scope_id) || 'Scope ID not set', obj.requests_per_minute === undefined ? '' : `${String(obj.requests_per_minute)} RPM`].filter(Boolean).join(' · ');
     case 'usage_ledger':
       return [resourceText(obj.kind) || 'Usage entry', resourceText(obj.attempt_id) || 'Attempt not set'].join(' · ');
-    case 'audit_events':
-      return [resourceText(obj.action) || 'Action not set', resourceText(obj.actor) ? `by ${resourceText(obj.actor)}` : 'Actor not set'].join(' · ');
     case 'upstream_operations':
       return [resourceText(obj.operation) || 'Operation not set', resourceText(obj.connection_id) || 'Connection not set'].join(' · ');
     case 'admissions':
       return [resourceText(obj.state) || 'State not set', resourceText(obj.request_id) || 'Request not set'].join(' · ');
+    case 'audit_events': {
+      const target = [resourceText(obj.kind), resourceText(obj.resource_id)].filter(Boolean).join('/');
+      const created = resourceText(obj.created_at);
+      return [resourceText(obj.action) || 'Action not set', target || 'Target not set', resourceText(obj.actor) ? `by ${resourceText(obj.actor)}` : 'Actor not set', created].join(' · ');
+    }
     case 'reconciliations':
       return [resourceText(obj.state) || 'State not set', resourceText(obj.mode) || 'Mode not set', resourceText(obj.reconciliation_id) || 'Reconciliation not set'].join(' · ');
     default:
@@ -429,6 +441,7 @@ function ResourceTable({
   const emptyMessage = allItems.length ? 'No matching resources on this page.' : `No ${LABELS[kind]?.toLowerCase() ?? 'resources'} found for this tenant.`;
   return (
     <div className="table-wrap overflow-x-auto rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900" aria-busy={loading}>
+      <p className="table-scroll-hint" role="note">Swipe horizontally to see version and summary.</p>
       <table className="w-full min-w-[38rem] text-left text-sm">
         <caption className="sr-only">{LABELS[kind] ?? kind}</caption>
         <thead className="border-b border-zinc-200 bg-zinc-50 text-xs uppercase tracking-wide text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950/50 dark:text-zinc-400">
@@ -442,7 +455,7 @@ function ResourceTable({
           {items.length ? items.map((item) => {
             const selectedRow = selected?.id === item.id;
             const status = resourceStatus(kind, item.data);
-            const statusVariant = status && ['disabled', 'revoked', 'expired', 'failed'].includes(status.toLowerCase()) ? 'destructive' : 'secondary';
+            const statusVariant = statusBadgeVariant(status);
             const tenantRole = kind === 'tenants' ? tenantMemberships?.find((tenant) => tenant.tenant_id === item.id)?.role : undefined;
             return (
               <tr key={item.id} className={cn('transition-colors hover:bg-indigo-50/60 dark:hover:bg-indigo-950/30', selectedRow && 'bg-indigo-50 dark:bg-indigo-950/40')} aria-current={selectedRow ? 'true' : undefined}>
@@ -468,11 +481,13 @@ function ResourceView({
   onSelected,
   onSession,
   keyChange,
+  onViewActions,
 }: {
   kind: string;
   onSelected?: (resource?: Resource) => void;
   onSession?: (next: Session) => void;
   keyChange?: KeyMetadataChange;
+  onViewActions?: () => void;
 }) {
   const session = api.session!;
   const tenantID = session.principal.TenantID ?? '';
@@ -539,18 +554,28 @@ function ResourceView({
     void load();
   }, [load]);
 
+  const draftDirty = Boolean((draft && serializeResourceData(draft) !== draftBaseline) || (!selected && newID.trim()));
   useEffect(() => {
-    if (kind !== 'api_keys' || !keyChange) return;
+    if (!keyChange) return;
     setPage((previous) => previous && ({
       ...previous,
       items: keyChange.resource
         ? previous.items.map((row) => row.id === keyChange.id ? keyChange.resource! : row)
         : previous.items.filter((row) => row.id !== keyChange.id),
     }));
-    setSelected((previous) => previous?.id === keyChange.id ? keyChange.resource : previous);
+    if (selected?.id !== keyChange.id) return;
+    if (keyChange.resource && draftDirty) {
+      setNotice('Server status/version refreshed; your draft was retained.');
+      return;
+    }
+    if (keyChange.resource && draft) {
+      setDraft(keyChange.resource.data as ResourceData);
+      setDraftBaseline(serializeResourceData(keyChange.resource.data));
+    }
+    setSelected(keyChange.resource);
+    if (keyChange.resource) onSelected?.(keyChange.resource);
   }, [keyChange, kind]);
 
-  const draftDirty = Boolean((draft && serializeResourceData(draft) !== draftBaseline) || (!selected && newID.trim()));
 
   const confirmDiscard = (message: string) =>
     (!draftDirty && !editorForm.current?.querySelector('[aria-invalid="true"]')) || window.confirm(message);
@@ -595,6 +620,14 @@ function ResourceView({
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!writable || !draft || (selected && !canEditResource(selected))) return;
+    const invalid = event.currentTarget.querySelector<HTMLElement>('[aria-invalid="true"]');
+    if (invalid) {
+      const control = invalid.matches('input, select, textarea, button')
+        ? invalid
+        : invalid.querySelector<HTMLElement>('input, select, textarea, button');
+      control?.focus();
+      return;
+    }
     setSaving(true);
     setError(undefined);
     setNotice('');
@@ -678,7 +711,7 @@ function ResourceView({
 
   const singular = SINGULAR_LABELS[kind] ?? kind;
   const description = RESOURCE_DESCRIPTIONS[kind] ?? 'Review server-owned resources for the active tenant.';
-  const editorTitle = selected ? `Edit ${singular} ${selected.id}` : `New ${singular}`;
+  const editorTitle = selected ? `Edit ${singular}` : `New ${singular}`;
   const metadata = selected && !draft ? displayResourceData(kind, selected.data) : undefined;
   const detailOpen = Boolean(draft || metadata !== undefined);
   const showActions = selected && hasResourceActions(kind, session);
@@ -688,20 +721,16 @@ function ResourceView({
     <section className="resource space-y-6" aria-busy={loading}>
       <div className="section-head flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            <Badge variant="secondary">Collection</Badge>
-            <span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">{kind.replaceAll('_', ' ')}</span>
-          </div>
           <h1 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white sm:text-3xl">{LABELS[kind] ?? kind}</h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-600 dark:text-zinc-300">{description}</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
-          <Button type="button" variant="outline" onClick={() => void load()} disabled={loading}>
+          <Button type="button" variant="outline" title="Refresh the collection list without changing an open editor" onClick={() => void load()} disabled={loading}>
             <RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />
             Refresh
           </Button>
           {writable && <Button ref={newResourceButton} type="button" onClick={newResource} disabled={loading || !page} aria-label="New resource">New {singular}</Button>}
-          {showActions && <a href="#resource-actions" className="inline-flex h-10 items-center gap-1 rounded-md px-3 text-sm font-medium text-indigo-700 underline-offset-4 hover:underline dark:text-indigo-300">View actions<ArrowRight className="h-4 w-4" aria-hidden="true" /></a>}
+          {showActions && <a href="#resource-actions" onClick={(event) => { if (!onViewActions) return; event.preventDefault(); onViewActions(); }} className="inline-flex h-10 items-center gap-1 rounded-md px-3 text-sm font-medium text-indigo-700 underline-offset-4 hover:underline dark:text-indigo-300">View actions<ArrowRight className="h-4 w-4" aria-hidden="true" /></a>}
         </div>
       </div>
       {loading && page && <p className="text-sm text-zinc-500 dark:text-zinc-400" role="status"><RefreshCw className="mr-2 inline h-4 w-4 animate-spin" aria-hidden="true" />Refreshing this page…</p>}
@@ -735,7 +764,6 @@ function ResourceView({
               <Button type="submit" disabled={saving}>{saving ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : <Check className="mr-2 h-4 w-4" aria-hidden="true" />}{saving ? (selected ? 'Saving…' : 'Creating…') : (selected ? 'Save changes' : 'Create')}</Button>
               {selected && kind !== 'tenants' && <Button type="button" variant="destructive" disabled={saving} onClick={() => void remove()}>Delete</Button>}
             </div>
-            {selected && <p className="mt-4 text-xs leading-5 text-zinc-500 dark:text-zinc-400">Version {selected.version}. Saves use an If-Match concurrency check.</p>}
           </form>
         ) : selected && metadata !== undefined ? (
           <Card className="metadata min-w-0">
@@ -843,29 +871,40 @@ function APIKeyIssuePanel({ tenantID, onIssued, onSession }: { tenantID: string;
 
   return (
     <section className="actions key-issue rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-      <div className="mb-5 flex items-start gap-3">
-        <div className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"><KeyRound className="h-5 w-5" aria-hidden="true" /></div>
-        <div><h2 className="text-lg font-semibold">Issue API key</h2><p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">The token is returned once and is not stored in resource metadata.</p></div>
-      </div>
-      {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ErrorNotice error={error} onClose={() => setError(undefined)} />}
-      <form onSubmit={issue} className="grid gap-1">
-        <label className="field"><span>Key ID</span><Input required value={id} onChange={(event) => setID(event.currentTarget.value)} /></label>
-        <label className="field"><span>Name</span><Input required value={name} onChange={(event) => setName(event.currentTarget.value)} /></label>
-        <label className="field"><span>Role</span><NativeSelect value={role} onChange={(event) => setRole(event.currentTarget.value as APIKeyGrantData['role'])}><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></NativeSelect></label>
-        <label className="field"><span>Permissions (space or comma separated)</span><Input value={permissions} onChange={(event) => setPermissions(event.currentTarget.value)} /></label>
-        <label className="field"><span>Aliases (space or comma separated)</span><Input value={aliases} onChange={(event) => setAliases(event.currentTarget.value)} /></label>
-        <label className="field"><span>Connections (space or comma separated)</span><Input value={connections} onChange={(event) => setConnections(event.currentTarget.value)} /></label>
-        <label className="field"><span>Operations (exact operation names, space or comma separated)</span><Input value={operations} onChange={(event) => setOperations(event.currentTarget.value)} /></label>
-        <label className="field"><span>Tenant</span><Input value={tenantID} readOnly /></label>
-        <label className="field flex-row items-center gap-2"><span className="flex items-center gap-2"><Input type="checkbox" checked={portable} onChange={(event) => setPortable(event.currentTarget.checked)} /> Portable</span></label>
-        <label className="field flex-row items-center gap-2"><span className="flex items-center gap-2"><Input type="checkbox" checked={nativeAccount} onChange={(event) => setNativeAccount(event.currentTarget.checked)} /> Native account</span></label>
-        <label className="field flex-row items-center gap-2"><span className="flex items-center gap-2"><Input type="checkbox" checked={realtime} onChange={(event) => setRealtime(event.currentTarget.checked)} /> Realtime</span></label>
-        <Button type="submit" className="mt-3 w-fit" disabled={busy || !id.trim() || !name.trim() || !permissions.trim() || !operations.trim()}>
-          {busy ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : <KeyRound className="mr-2 h-4 w-4" aria-hidden="true" />}
-          Issue API key
-        </Button>
-      </form>
-      <ActionResult value={result} error={undefined} onDismiss={() => setResult(undefined)} />
+      <details className="disclosure">
+        <summary className="disclosure-summary">
+          <span>
+            <strong>Issue an API key</strong>
+            <small>Tenant-scoped; the token is shown once and is not stored in resource metadata.</small>
+          </span>
+        </summary>
+        <div className="disclosure-body">
+          <div className="mb-5 flex items-start gap-3">
+            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"><KeyRound className="h-5 w-5" aria-hidden="true" /></div>
+            <div><h2 className="text-lg font-semibold">New tenant API key</h2><p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">Choose the smallest set of permissions and operations needed by the client.</p></div>
+          </div>
+          {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ErrorNotice error={error} onClose={() => setError(undefined)} />}
+          <form onSubmit={issue} className="grid gap-1">
+            <label className="field"><span>Key ID</span><Input required value={id} onChange={(event) => setID(event.currentTarget.value)} /></label>
+            <label className="field"><span>Name</span><Input required value={name} onChange={(event) => setName(event.currentTarget.value)} /></label>
+            <label className="field"><span>Role</span><NativeSelect value={role} onChange={(event) => setRole(event.currentTarget.value as APIKeyGrantData['role'])}><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></NativeSelect></label>
+            <label className="field"><span>Permissions (space or comma separated)</span><Input value={permissions} onChange={(event) => setPermissions(event.currentTarget.value)} /></label>
+            <label className="field"><span>Aliases (space or comma separated)</span><Input value={aliases} onChange={(event) => setAliases(event.currentTarget.value)} /></label>
+            <label className="field"><span>Connections (space or comma separated)</span><Input value={connections} onChange={(event) => setConnections(event.currentTarget.value)} /></label>
+            <label className="field"><span>Operations (exact operation names, space or comma separated)</span><Input value={operations} onChange={(event) => setOperations(event.currentTarget.value)} /></label>
+            <label className="field"><span>Tenant</span><Input value={tenantID} readOnly /></label>
+            <label className="field flex-row items-center gap-2"><span className="flex items-center gap-2"><Input type="checkbox" checked={portable} onChange={(event) => setPortable(event.currentTarget.checked)} /> Portable</span></label>
+            <label className="field flex-row items-center gap-2"><span className="flex items-center gap-2"><Input type="checkbox" checked={nativeAccount} onChange={(event) => setNativeAccount(event.currentTarget.checked)} /> Native account</span></label>
+            <label className="field flex-row items-center gap-2"><span className="flex items-center gap-2"><Input type="checkbox" checked={realtime} onChange={(event) => setRealtime(event.currentTarget.checked)} /> Realtime</span></label>
+            <Button type="submit" className="mt-3 w-fit" disabled={busy || !id.trim() || !name.trim() || !permissions.trim() || !operations.trim()}>
+              {busy ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" /> : <KeyRound className="mr-2 h-4 w-4" aria-hidden="true" />}
+              Issue API key
+            </Button>
+          </form>
+          {result !== undefined && <p className="mt-4 text-sm font-medium text-emerald-700 dark:text-emerald-300" role="status">API key issued. The token is shown once below.</p>}
+          <ActionResult value={result} error={undefined} onDismiss={() => setResult(undefined)} />
+        </div>
+      </details>
     </section>
   );
 }
@@ -895,9 +934,10 @@ function ActionResult({ value, error, onDismiss }: { value: unknown; error: unkn
     <>
       {error && <ErrorNotice error={error} />}
       {value !== undefined && (
-        <div className="result-wrap mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-950/60">
+        <div className="result-wrap mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-950/60" role="status" aria-live="polite">
+          <p className="text-sm font-medium text-zinc-800 dark:text-zinc-100">Action completed. Details are shown below.</p>
           <Button type="button" variant="ghost" size="sm" onClick={onDismiss} aria-label="Dismiss result">Dismiss result</Button>
-          <pre className="result mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs text-zinc-700 dark:text-zinc-200">{JSON.stringify(value, null, 2)}</pre>
+          <pre className="result mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs text-zinc-700 dark:text-zinc-200" aria-label="Action result">{JSON.stringify(value, null, 2)}</pre>
         </div>
       )}
     </>
@@ -1003,10 +1043,10 @@ function ConnectionCredentialActions({ item, initialCredentialStatus, onSession 
       <Button type="button" variant="outline" disabled={busy} onClick={() => void invoke('status')}><RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />Refresh encrypted-store metadata</Button>
       {canManage && <div className="mt-5 space-y-5">
         <label className="field"><span>Current credential version</span><Input type="number" min="1" inputMode="numeric" value={form.credential_version} onChange={(event) => setForm({ ...form, credential_version: event.currentTarget.value })} /><small>Required when replacing or revoking an existing credential. Refresh metadata to fill it automatically.</small></label>
-        <fieldset className="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-700"><legend className="px-1 text-sm font-semibold">Import or replace API key</legend><p className="text-sm text-zinc-600 dark:text-zinc-300">Manual token import is supported only for API-key connections. Use the configured OAuth or device authorization controls below for OAuth credentials.</p><label className="field"><span>New API key</span><Input type="password" autoComplete="new-password" value={form.secret} onChange={(event) => setForm({ ...form, secret: event.currentTarget.value })} /></label><Button type="button" disabled={busy || !form.secret} onClick={() => void invoke('import', { kind: 'api_key', secret: form.secret })}>Import API key</Button><label className="field"><span>Replacement API key</span><Input type="password" autoComplete="new-password" value={form.rotation_secret} onChange={(event) => setForm({ ...form, rotation_secret: event.currentTarget.value })} /><small>Rotation is a version-checked import bound to this connection.</small></label><Button type="button" disabled={busy || !form.rotation_secret || !form.credential_version} onClick={() => void invoke('import', { kind: 'api_key', secret: form.rotation_secret })}>Rotate API key</Button></fieldset>
-        <fieldset className="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-700"><legend className="px-1 text-sm font-semibold">OAuth authorization</legend><Button type="button" variant="outline" disabled={busy} onClick={() => void invoke('oauth-start')}>Start OAuth</Button>{oauthAuthorizationURL && <p><a className="text-sm font-medium text-indigo-700 underline underline-offset-4 dark:text-indigo-300" href={oauthAuthorizationURL} target="_blank" rel="noreferrer">Continue authorization with provider</a></p>}<label className="field"><span>OAuth state</span><Input autoComplete="off" value={form.state} onChange={(event) => setForm({ ...form, state: event.currentTarget.value })} /></label><label className="field"><span>OAuth callback code</span><Input autoComplete="off" value={form.code} onChange={(event) => setForm({ ...form, code: event.currentTarget.value })} /></label><label className="field"><span>Registered redirect URI</span><Input type="url" value={form.redirect_uri} onChange={(event) => setForm({ ...form, redirect_uri: event.currentTarget.value })} /><small>Must exactly match the provider registration configured for this connection.</small></label><Button type="button" disabled={busy || !form.state || !form.code || !form.redirect_uri} onClick={() => void invoke('oauth-callback', { state: form.state, code: form.code, redirect_uri: form.redirect_uri })}>Complete OAuth callback</Button></fieldset>
-        <fieldset className="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-700"><legend className="px-1 text-sm font-semibold">Device authorization</legend><Button type="button" variant="outline" disabled={busy} onClick={() => void invoke('device-start')}>Start device flow</Button>{deviceUserCode && <p className="text-sm" role="status">Provider device code: <strong>{deviceUserCode}</strong></p>}{deviceAuthorizationURL && <p><a className="text-sm font-medium text-indigo-700 underline underline-offset-4 dark:text-indigo-300" href={deviceAuthorizationURL} target="_blank" rel="noreferrer">Open device verification</a></p>}<label className="field"><span>Device flow ID</span><Input value={form.flow_id} onChange={(event) => setForm({ ...form, flow_id: event.currentTarget.value })} /><small>Filled automatically when the provider starts a device flow.</small></label><Button type="button" disabled={busy || !form.flow_id} onClick={() => void invoke('device-poll', { flow_id: form.flow_id })}>Poll device flow</Button></fieldset>
-        <fieldset className="danger-zone space-y-3 rounded-lg border border-red-200 p-4 dark:border-red-950"><legend className="px-1 text-sm font-semibold">Destructive action</legend><p className="text-sm text-zinc-600 dark:text-zinc-300">Revocation is version checked and prevents new requests from leasing this credential.</p><Button type="button" variant="destructive" disabled={busy || credentialRevoked || !form.credential_version} onClick={revoke}>{credentialRevoked ? 'Credential revoked' : 'Revoke credential'}</Button></fieldset>
+        <details className="disclosure"><summary className="disclosure-summary"><span><strong>API-key credentials</strong><small>Import or rotate a secret for this connection.</small></span></summary><fieldset className="disclosure-body space-y-3"><p className="text-sm text-zinc-600 dark:text-zinc-300">Manual token import is supported only for API-key connections. Secrets are cleared after every attempt.</p><label className="field"><span>New API key</span><Input type="password" autoComplete="new-password" value={form.secret} onChange={(event) => setForm({ ...form, secret: event.currentTarget.value })} /></label><Button type="button" disabled={busy || !form.secret} onClick={() => void invoke('import', { kind: 'api_key', secret: form.secret })}>Import API key</Button><label className="field"><span>Replacement API key</span><Input type="password" autoComplete="new-password" value={form.rotation_secret} onChange={(event) => setForm({ ...form, rotation_secret: event.currentTarget.value })} /><small>Rotation is a version-checked import bound to this connection.</small></label><Button type="button" disabled={busy || !form.rotation_secret || !form.credential_version} onClick={() => void invoke('import', { kind: 'api_key', secret: form.rotation_secret })}>Rotate API key</Button></fieldset></details>
+        <details className="disclosure"><summary className="disclosure-summary"><span><strong>OAuth authorization</strong><small>Start or complete the provider authorization flow.</small></span></summary><fieldset className="disclosure-body space-y-3"><Button type="button" variant="outline" disabled={busy} onClick={() => void invoke('oauth-start')}>Start OAuth</Button>{oauthAuthorizationURL && <p><a className="text-sm font-medium text-indigo-700 underline underline-offset-4 dark:text-indigo-300" href={oauthAuthorizationURL} target="_blank" rel="noreferrer">Continue authorization with provider</a></p>}<label className="field"><span>OAuth state</span><Input autoComplete="off" value={form.state} onChange={(event) => setForm({ ...form, state: event.currentTarget.value })} /></label><label className="field"><span>OAuth callback code</span><Input autoComplete="off" value={form.code} onChange={(event) => setForm({ ...form, code: event.currentTarget.value })} /></label><label className="field"><span>Registered redirect URI</span><Input type="url" value={form.redirect_uri} onChange={(event) => setForm({ ...form, redirect_uri: event.currentTarget.value })} /><small>Must exactly match the provider registration configured for this connection.</small></label><Button type="button" disabled={busy || !form.state || !form.code || !form.redirect_uri} onClick={() => void invoke('oauth-callback', { state: form.state, code: form.code, redirect_uri: form.redirect_uri })}>Complete OAuth callback</Button></fieldset></details>
+        <details className="disclosure"><summary className="disclosure-summary"><span><strong>Device authorization</strong><small>Start a device flow and poll its status.</small></span></summary><fieldset className="disclosure-body space-y-3"><Button type="button" variant="outline" disabled={busy} onClick={() => void invoke('device-start')}>Start device flow</Button>{deviceUserCode && <p className="text-sm" role="status">Provider device code: <strong>{deviceUserCode}</strong></p>}{deviceAuthorizationURL && <p><a className="text-sm font-medium text-indigo-700 underline underline-offset-4 dark:text-indigo-300" href={deviceAuthorizationURL} target="_blank" rel="noreferrer">Open device verification</a></p>}<label className="field"><span>Device flow ID</span><Input value={form.flow_id} onChange={(event) => setForm({ ...form, flow_id: event.currentTarget.value })} /><small>Filled automatically when the provider starts a device flow.</small></label><Button type="button" disabled={busy || !form.flow_id} onClick={() => void invoke('device-poll', { flow_id: form.flow_id })}>Poll device flow</Button></fieldset></details>
+        <details className="disclosure danger-zone"><summary className="disclosure-summary"><span><strong>Revoke credential</strong><small>Version checked; new requests will fail until replacement.</small></span></summary><fieldset className="disclosure-body space-y-3"><p className="text-sm text-zinc-600 dark:text-zinc-300">Revocation prevents new requests from leasing this credential.</p><Button type="button" variant="destructive" disabled={busy || credentialRevoked || !form.credential_version} onClick={revoke}>{credentialRevoked ? 'Credential revoked' : 'Revoke credential'}</Button></fieldset></details>
       </div>}
       {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ActionResult value={result} error={error} onDismiss={() => setResult(undefined)} />}
     </aside>
@@ -1071,11 +1111,20 @@ function ActionPanel({ kind, item, onKeyChanged, onSession }: { kind: string; it
     }
   };
 
-  const invoke = async (path: string, data?: ActionBody) => {
+  const invoke = async (path: string, data?: ActionBody, refreshAfter = false) => {
     setBusy(true);
     setError(undefined);
     try {
-      setResult(await api.action(path, data, item.version));
+      const actionResult = await api.action(path, data, item.version);
+      setResult(actionResult);
+      if (refreshAfter) {
+        try {
+          const refreshed = await api.get(kind, item.id);
+          onKeyChanged({ id: item.id, resource: refreshed });
+        } catch (refreshFailure) {
+          setError(refreshFailure);
+        }
+      }
     } catch (failure) {
       setError(failure);
     } finally {
@@ -1128,7 +1177,7 @@ function ActionPanel({ kind, item, onKeyChanged, onSession }: { kind: string; it
         <div className="mt-4 flex flex-wrap gap-2">
           {hasPermission(api.session!, 'connection:test') && <Button variant="outline" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/test`)}>Test</Button>}
           {hasPermission(api.session!, 'connection:discover') && <Button variant="outline" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/discover`)}>Discover models</Button>}
-          {hasPermission(api.session!, 'connection:write') && <Button variant="destructive" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/disable`)}>Disable</Button>}
+          {hasPermission(api.session!, 'connection:write') && <Button variant="destructive" disabled={busy} onClick={() => void invoke(`/connections/${encodeURIComponent(item.id)}/disable`, undefined, true)}>Disable</Button>}
         </div>
         {actionResult}
       </aside>
@@ -1156,7 +1205,7 @@ function ActionPanel({ kind, item, onKeyChanged, onSession }: { kind: string; it
   if (kind === 'upstream_operations' && hasPermission(api.session!, 'job:write')) return (
     <aside className="actions rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
       <h2 className="text-lg font-semibold">Job actions</h2>
-      <Button className="mt-4" variant="destructive" disabled={busy} onClick={() => void invoke(`/upstream_operations/${encodeURIComponent(item.id)}/cancel`)}>Request cancellation</Button>
+      <Button className="mt-4" variant="destructive" disabled={busy} onClick={() => void invoke(`/upstream_operations/${encodeURIComponent(item.id)}/cancel`, undefined, true)}>Request cancellation</Button>
       {actionResult}
     </aside>
   );
@@ -1191,7 +1240,7 @@ function ActionPanel({ kind, item, onKeyChanged, onSession }: { kind: string; it
               Total: reconcile.total === '' ? null : Number(reconcile.total),
               Source: reconcile.source,
             },
-          })}
+          }, true)}
         >
           Reconcile
         </Button>
@@ -1205,15 +1254,25 @@ function ActionPanel({ kind, item, onKeyChanged, onSession }: { kind: string; it
 function ResourceRoute({ kind, onSession }: { kind: string; onSession?: (next: Session) => void }) {
   const [selected, setSelected] = useState<Resource>();
   const [keyChange, setKeyChange] = useState<KeyMetadataChange>();
+  const actionRef = useRef<HTMLDivElement>(null);
   const keyChanged = (change: KeyMetadataChange) => {
     setKeyChange(change);
     if (change.resource) setSelected(change.resource);
   };
+  const focusActions = () => {
+    const target = actionRef.current;
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    requestAnimationFrame(() => {
+      const first = target.querySelector<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+      (first ?? target).focus();
+    });
+  };
   return (
     <>
-      <ResourceView kind={kind} onSelected={setSelected} onSession={onSession} keyChange={keyChange} />
+      <ResourceView kind={kind} onSelected={setSelected} onSession={onSession} keyChange={keyChange} onViewActions={focusActions} />
       {selected && hasResourceActions(kind, api.session!) && (
-        <div id="resource-actions" className="mt-6 scroll-mt-24">
+        <div id="resource-actions" ref={actionRef} tabIndex={-1} aria-label="Resource actions" className="mt-6 scroll-mt-24">
           <ActionPanel key={kind === 'api_keys' ? selected.id : `${selected.id}:${selected.version}`} kind={kind} item={selected} onKeyChanged={keyChanged} onSession={onSession} />
         </div>
       )}
@@ -1223,7 +1282,9 @@ function ResourceRoute({ kind, onSession }: { kind: string; onSession?: (next: S
 
 function TenantSelector({ session, onChanged }: { session: Session; onChanged: (next: Session) => void }) {
   const tenants = (session.tenants ?? []).filter((tenant) => tenant.enabled);
-  const current = session.principal.TenantID;
+  const current = session.principal.TenantID ?? '';
+  const currentTenant = tenants.find((tenant) => tenant.tenant_id === current);
+  const canSwitch = tenants.length > 1;
   const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<unknown>();
   const [reloadingContext, setReloadingContext] = useState(false);
@@ -1252,15 +1313,20 @@ function TenantSelector({ session, onChanged }: { session: Session; onChanged: (
     void api.selectTenant(id).then(onChanged).catch(setError).finally(() => setSwitching(false));
   };
 
-  if (tenants.length < 2) return null;
   return (
-    <div className="space-y-2">
+    <div className="tenant-context space-y-2">
       <label className="tenant-selector grid gap-2">
-        <span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Tenant</span>
-        <NativeSelect value={current} disabled={switching} onChange={handleChange}>
-          {tenants.map((tenant) => <option key={tenant.tenant_id} value={tenant.tenant_id}>{tenant.name || tenant.tenant_id} ({tenant.role})</option>)}
-        </NativeSelect>
-        <small className="text-xs leading-5 text-zinc-500 dark:text-zinc-400">Active tenant; the role shown for each membership applies only to that tenant.</small>
+        <span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Active tenant</span>
+        {tenants.length ? (
+          <NativeSelect aria-label="Active tenant" value={current} disabled={switching || !canSwitch} onChange={handleChange}>
+            {tenants.map((tenant) => <option key={tenant.tenant_id} value={tenant.tenant_id}>{tenant.name || tenant.tenant_id}</option>)}
+          </NativeSelect>
+        ) : (
+          <span className="tenant-current font-mono text-sm text-zinc-700 dark:text-zinc-200">{current || 'Unavailable'}</span>
+        )}
+        <small className="text-xs leading-5 text-zinc-500 dark:text-zinc-400">
+          {currentTenant?.role ?? session.principal.Role} access{canSwitch ? ' · Changing tenant reloads this workspace.' : ''}
+        </small>
         {switching && <small className="text-xs text-zinc-400" role="status">Switching…</small>}
       </label>
       {isTenantContextChanged(error) ? <TenantContextNotice onReload={() => void reloadContext()} loading={reloadingContext} /> : <ErrorNotice error={error} onClose={() => setError(undefined)} />}
@@ -1269,30 +1335,34 @@ function TenantSelector({ session, onChanged }: { session: Session; onChanged: (
 }
 
 function Overview({ visible, canPlayground, session }: { visible: string[]; canPlayground: boolean; session: Session }) {
-  const groups = RESOURCE_GROUPS
-    .map((group) => ({ ...group, kinds: group.kinds.filter((kind) => visible.includes(kind)) }))
-    .filter((group) => group.kinds.length);
   const modelKind = visible.includes('models') ? 'models' : visible.includes('model_aliases') ? 'model_aliases' : undefined;
   const policyKind = visible.includes('route_policies') ? 'route_policies' : visible.includes('policy_limits') ? 'policy_limits' : undefined;
   const workflows = [
-    { key: 'connections', title: canWrite(session, 'connections') ? 'Connect a provider' : 'Review connections', detail: canWrite(session, 'connections') ? 'Register a connection before cataloging models.' : 'Inspect provider connections available to this tenant; creation requires connection write access.', href: '/admin/connections', available: visible.includes('connections') },
-    { key: 'catalog', title: modelKind && canWrite(session, modelKind) ? 'Add a model or alias' : 'Review models and aliases', detail: modelKind && canWrite(session, modelKind) ? 'Build the catalog that routes can target.' : 'Review the catalog available to this tenant; adding models or aliases requires catalog write access.', href: modelKind ? `/admin/${modelKind}` : '', available: Boolean(modelKind) },
-    { key: 'policy', title: policyKind && canWrite(session, policyKind) ? 'Set routing and limits' : 'Review routing and limits', detail: policyKind && canWrite(session, policyKind) ? 'Shape traffic with an alias route and tenant limits.' : 'Review routing and limits for this tenant; changes require route or budget write access.', href: policyKind ? `/admin/${policyKind}` : '', available: Boolean(policyKind) },
+    { key: 'connections', title: canWrite(session, 'connections') ? 'Connect a provider' : 'Review connections', detail: canWrite(session, 'connections') ? 'Register a connection before cataloging models.' : 'Inspect provider connections available to this tenant.', href: '/admin/connections', available: visible.includes('connections') },
+    { key: 'catalog', title: modelKind && canWrite(session, modelKind) ? 'Add a model or alias' : 'Review models and aliases', detail: modelKind && canWrite(session, modelKind) ? 'Build the catalog that routes can target.' : 'Review the catalog available to this tenant.', href: modelKind ? `/admin/${modelKind}` : '', available: Boolean(modelKind) },
+    { key: 'policy', title: policyKind === 'policy_limits' ? (canWrite(session, policyKind) ? 'Set limits' : 'Review limits') : policyKind && canWrite(session, policyKind) ? 'Set routing and limits' : 'Review routing and limits', detail: policyKind === 'policy_limits' ? RESOURCE_DESCRIPTIONS.policy_limits : policyKind && canWrite(session, policyKind) ? 'Shape traffic with an alias route and tenant limits.' : 'Review routing and limits for this tenant.', href: policyKind ? `/admin/${policyKind}` : '', available: Boolean(policyKind) },
     { key: 'playground', title: 'Run a request', detail: 'Exercise an allowed operation from the playground.', href: '/admin/playground', available: canPlayground },
   ].filter((workflow) => workflow.available);
+  if (!workflows.length && visible.length) {
+    const kind = visible[0];
+    workflows.push({
+      key: 'collection',
+      title: `Review ${LABELS[kind] ?? kind}`,
+      detail: RESOURCE_DESCRIPTIONS[kind] ?? 'Review resources available to this tenant.',
+      href: `/admin/${kind}`,
+      available: true,
+    });
+  }
 
   return (
     <section className="space-y-8">
       <div>
-        <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-indigo-100 px-3 py-1 text-xs font-medium text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-200"><LayoutDashboard className="h-3.5 w-3.5" aria-hidden="true" />Operations overview</div>
         <h1 className="text-3xl font-semibold tracking-tight text-zinc-950 dark:text-white sm:text-4xl">Operations overview</h1>
-        <p className="mt-3 max-w-2xl text-base leading-7 text-zinc-600 dark:text-zinc-300">Follow the path from provider connection to a named model, a controlled route, and an optional request. Collections below show only what this session can read.</p>
       </div>
       {workflows.length ? (
         <section aria-labelledby="workflow-heading" className="rounded-xl border border-indigo-200 bg-indigo-50/60 p-5 dark:border-indigo-900 dark:bg-indigo-950/30">
           <div className="mb-4">
             <h2 id="workflow-heading" className="text-lg font-semibold text-indigo-950 dark:text-indigo-100">Start with a workflow</h2>
-            <p className="mt-1 text-sm text-indigo-900/80 dark:text-indigo-200/80">Open a collection to review existing resources or create one when your role allows it.</p>
           </div>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {workflows.map((workflow) => (
@@ -1304,32 +1374,12 @@ function Overview({ visible, canPlayground, session }: { visible: string[]; canP
           </div>
         </section>
       ) : (
-        <div className="rounded-xl border border-dashed border-zinc-300 bg-white p-6 text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">No collections or tools are available for this session. Ask an administrator for the permissions needed to operate this tenant.</div>
+        <div className="rounded-xl border border-dashed border-zinc-300 bg-white p-6 text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">No collections or tools are available for this session. Ask an administrator for access to this tenant.</div>
       )}
-      {groups.length ? (
-        <section aria-labelledby="collections-heading" className="space-y-4">
-          <div>
-            <h2 id="collections-heading" className="text-xl font-semibold text-zinc-950 dark:text-white">Browse collections</h2>
-            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">Open a collection to inspect its server-owned, versioned records.</p>
-          </div>
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {groups.map((group) => {
-              const GroupIcon = group.icon;
-              return (
-                <div key={group.label} className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-                  <div className="mb-3 flex items-center gap-2"><GroupIcon className="h-4 w-4 text-indigo-600 dark:text-indigo-400" aria-hidden="true" /><h3 className="text-sm font-semibold uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">{group.label}</h3></div>
-                  <ul className="space-y-1">
-                    {group.kinds.map((kind) => <li key={kind}><Link to={`/admin/${kind}`} className="group flex items-center justify-between rounded-md px-2 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100 hover:text-zinc-950 dark:text-zinc-200 dark:hover:bg-zinc-800 dark:hover:text-white"><span>{LABELS[kind]}</span><ArrowRight className="h-4 w-4 text-zinc-400 transition group-hover:translate-x-1 group-hover:text-indigo-600 dark:group-hover:text-indigo-300" aria-hidden="true" /></Link></li>)}
-                  </ul>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      ) : null}
     </section>
   );
 }
+
 
 function AdminTokenPanel() {
   const [subject, setSubject] = useState('');
@@ -1374,31 +1424,125 @@ function AdminTokenPanel() {
     }
   };
 
-  return <section className="token-admin"><div className="mb-5"><h2 className="text-xl font-semibold">Scoped admin tokens</h2><p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">Owner-only. The issued secret is shown once and is held only in this page until dismissed.</p></div><ErrorNotice error={error} onClose={() => setError(undefined)} /><div className="grid gap-5 lg:grid-cols-2"><form className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800" onSubmit={issue}><h3 className="font-medium">Issue token</h3><label className="field"><span>Subject</span><Input required value={subject} onChange={(event) => setSubject(event.currentTarget.value)} /></label><label className="field"><span>Permissions (space or comma separated)</span><Input required value={permissions} onChange={(event) => setPermissions(event.currentTarget.value)} /></label><label className="field"><span>Expires at</span><Input required type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.currentTarget.value)} /></label><Button disabled={busy}>Issue scoped token</Button></form><form className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800" onSubmit={revoke}><h3 className="font-medium">Revoke token</h3><label className="field"><span>Token hash to revoke</span><Input required value={hash} onChange={(event) => setHash(event.currentTarget.value)} /></label><Button type="submit" variant="destructive" disabled={busy}>Revoke token</Button></form></div>{result !== undefined && <div className="result-wrap mt-5 rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-950/60"><Button type="button" variant="ghost" size="sm" onClick={() => setResult(undefined)} aria-label="Dismiss token result">Dismiss result</Button><pre className="result mt-2 whitespace-pre-wrap break-words text-xs">{JSON.stringify(result, null, 2)}</pre></div>}</section>;
+  return (
+    <section className="token-admin">
+      <details className="disclosure" open={Boolean(error || result)}>
+        <summary className="disclosure-summary">
+          <span>
+            <strong>Manage scoped admin tokens</strong>
+            <small>Owner-only; issued secrets are shown once.</small>
+          </span>
+        </summary>
+        <div className="disclosure-body">
+          <ErrorNotice error={error} onClose={() => setError(undefined)} />
+          <div className="grid gap-5 lg:grid-cols-2">
+            <form className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800" onSubmit={issue}>
+              <h3 className="font-medium">Issue token</h3>
+              <label className="field"><span>Subject</span><Input required value={subject} onChange={(event) => setSubject(event.currentTarget.value)} /></label>
+              <label className="field"><span>Permissions (space or comma separated)</span><Input required value={permissions} onChange={(event) => setPermissions(event.currentTarget.value)} /></label>
+              <label className="field"><span>Expires at</span><Input required type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.currentTarget.value)} /></label>
+              <Button disabled={busy}>Issue scoped token</Button>
+            </form>
+            <form className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800" onSubmit={revoke}>
+              <h3 className="font-medium">Revoke token</h3>
+              <label className="field"><span>Token hash to revoke</span><Input required value={hash} onChange={(event) => setHash(event.currentTarget.value)} /></label>
+              <Button type="submit" variant="destructive" disabled={busy}>Revoke token</Button>
+            </form>
+          </div>
+          {result !== undefined && <div className="result-wrap mt-5 rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-950/60" role="status" aria-live="polite"><p className="text-sm font-medium">Token action completed</p><Button type="button" variant="ghost" size="sm" onClick={() => setResult(undefined)} aria-label="Dismiss token result">Dismiss result</Button><pre className="result mt-2 whitespace-pre-wrap break-words text-xs">{JSON.stringify(result, null, 2)}</pre></div>}
+        </div>
+      </details>
+    </section>
+  );
 }
 
 function ConfigPage() {
   const [text, setText] = useState('{}');
-  const [revision, setRevision] = useState('0');
+  const [revision, setRevision] = useState('');
+  const [draftChanged, setDraftChanged] = useState(false);
   const [result, setResult] = useState<unknown>();
+  const [resultKind, setResultKind] = useState<'preview' | 'apply' | 'export'>();
   const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
-  const act = async (path: string) => {
+  const canWrite = hasPermission(api.session!, 'config:write');
+  const hasRevision = Number.isInteger(Number(revision)) && Number(revision) > 0;
+  const canMutate = canWrite && draftChanged && hasRevision;
+
+  const act = async (path: '/config/diff' | '/config/apply') => {
     setBusy(true);
     setError(undefined);
     try {
-      setResult(await api.action(path, { expected_revision: Number(revision), config: JSON.parse(text) }));
+      const next = await api.action(path, { expected_revision: Number(revision), config: JSON.parse(text) });
+      setResult(next);
+      setResultKind(path.endsWith('/apply') ? 'apply' : 'preview');
+      if (path.endsWith('/apply') && next && typeof next === 'object' && 'revision' in next) {
+        const nextRevision = Number(next.revision);
+        if (Number.isInteger(nextRevision) && nextRevision > 0) setRevision(String(nextRevision));
+        setDraftChanged(false);
+      }
     } catch (failure) {
       setError(failure);
     } finally {
       setBusy(false);
     }
   };
-  return <section className="space-y-6"><div><div className="mb-3 inline-flex items-center gap-2 rounded-full bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"><Settings2 className="h-3.5 w-3.5" aria-hidden="true" />Runtime controls</div><h1 className="text-3xl font-semibold tracking-tight text-zinc-950 dark:text-white">Configuration</h1><p className="mt-2 max-w-2xl text-sm text-zinc-600 dark:text-zinc-300">Preview changes before applying. Export contains references and redacted metadata only.</p></div><Card><CardContent className="space-y-4 p-5"><ErrorNotice error={error} /><label className="field"><span>Expected configuration revision</span><Input type="number" min="0" value={revision} onChange={(event) => setRevision(event.currentTarget.value)} /></label><label className="field"><span>Configuration JSON</span><Textarea className="config-editor min-h-56 font-mono text-xs" value={text} onChange={(event) => setText(event.currentTarget.value)} /></label><div className="form-actions flex flex-wrap gap-2"><Button type="button" disabled={busy} onClick={() => void act('/config/diff')}>Preview changes</Button><Button type="button" disabled={busy} onClick={() => void act('/config/apply')}>Apply</Button><Button type="button" variant="outline" disabled={busy} onClick={() => void api.request('/config/export').then(setResult).catch(setError)}>Export</Button></div>{result !== undefined && <div className="result-wrap rounded-lg bg-zinc-950 p-4"><pre className="result max-h-96 overflow-auto whitespace-pre-wrap break-words text-xs text-zinc-100">{JSON.stringify(result, null, 2)}</pre></div>}</CardContent></Card><AdminTokenPanel /></section>;
+
+  const exportConfig = async () => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      const snapshot = await api.request<Record<string, unknown>>('/config/export');
+      setResult(snapshot);
+      setResultKind('export');
+      const exportedRevision = Number(snapshot.revision ?? snapshot.Revision);
+      if (Number.isInteger(exportedRevision) && exportedRevision > 0) setRevision(String(exportedRevision));
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-semibold tracking-tight text-zinc-950 dark:text-white">Configuration</h1>
+        <p className="mt-2 max-w-2xl text-sm text-zinc-600 dark:text-zinc-300">Preview changes before applying. Export is a redacted, read-only runtime snapshot; it is not an apply-ready draft.</p>
+      </div>
+      <Card>
+        <CardContent className="space-y-4 p-5">
+          <ErrorNotice error={error} />
+          {!canWrite && <p className="notice rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100" role="status">Read-only access: preview and apply require config:write. Export remains available.</p>}
+          <label className="field" htmlFor="config-revision">
+            <span>Expected configuration revision</span>
+            <Input id="config-revision" type="number" min="1" value={revision} onChange={(event) => setRevision(event.currentTarget.value)} placeholder="Export the current snapshot to fill this" aria-describedby="config-revision-help" />
+          </label>
+          <small id="config-revision-help">Use the revision from a current export. A stale revision is rejected instead of overwriting newer changes.</small>
+          <div className="field">
+            <label htmlFor="config-json">Configuration JSON</label>
+            <Textarea id="config-json" className="config-editor min-h-56 font-mono text-xs" value={text} onChange={(event) => { setText(event.currentTarget.value); setDraftChanged(true); }} aria-describedby="config-json-help" />
+          </div>
+          <small id="config-json-help">Supported keys are connections, models, model_aliases, route_policies, policy_limits, account_pools, and prices. Each key maps resource IDs to data; <code>{'{"connections":{}}'}</code> is a safe no-op preview. Do not paste the exported runtime snapshot: it uses display-only fields and redacted references.</small>
+          <div className="form-actions flex flex-wrap gap-2">
+            <Button type="button" disabled={busy || !canMutate} onClick={() => void act('/config/diff')}>Preview changes</Button>
+            <Button type="button" disabled={busy || !canMutate} onClick={() => void act('/config/apply')}>Apply</Button>
+            <Button type="button" variant="outline" disabled={busy} onClick={() => void exportConfig()}>Export snapshot</Button>
+          </div>
+          {result !== undefined && (
+            <div className="result-wrap rounded-lg bg-zinc-950 p-4" role="status" aria-live="polite">
+              <p className="mb-2 text-sm font-medium text-zinc-100">{resultKind === 'export' ? 'Exported snapshot (read-only)' : resultKind === 'apply' ? 'Configuration applied' : 'Preview result'}</p>
+              <pre className="result max-h-96 overflow-auto whitespace-pre-wrap break-words text-xs text-zinc-100">{JSON.stringify(result, null, 2)}</pre>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      <AdminTokenPanel />
+    </section>
+  );
 }
 
 function NotFound() {
-  return <section className="grid min-h-[50vh] place-items-center"><Card className="max-w-lg"><CardHeader><CardTitle>Not found</CardTitle><CardDescription>The requested console route does not exist or is not enabled for this session.</CardDescription></CardHeader><CardFooter><Button asChild variant="outline"><Link to="/admin/"><LayoutDashboard className="mr-2 h-4 w-4" aria-hidden="true" />Return to overview</Link></Button></CardFooter></Card></section>;
+  return <section className="grid min-h-[50vh] place-items-center"><Card className="max-w-lg"><CardHeader><CardTitle as="h1">Not found</CardTitle><CardDescription>The requested console route does not exist or is not enabled for this session.</CardDescription></CardHeader><CardFooter><Button asChild variant="outline"><Link to="/admin/"><LayoutDashboard className="mr-2 h-4 w-4" aria-hidden="true" />Return to overview</Link></Button></CardFooter></Card></section>;
 }
 
 function Login({ onSession }: { onSession: (session: Session) => void }) {
@@ -1409,9 +1553,9 @@ function Login({ onSession }: { onSession: (session: Session) => void }) {
     event.preventDefault();
     setBusy(true);
     setError(undefined);
-    void api.bootstrap(code).then(() => api.loadSession()).then(onSession).catch(setError).finally(() => setBusy(false));
+    void api.bootstrap(code).then(() => api.loadSession()).then((next) => { setCode(''); onSession(next); }).catch(setError).finally(() => setBusy(false));
   };
-  return <main className="login grid min-h-screen place-items-center bg-zinc-50 px-4 py-10 dark:bg-zinc-950"><Card className="login-card w-full max-w-md shadow-xl"><CardHeader className="space-y-4"><div className="grid h-12 w-12 place-items-center rounded-xl bg-indigo-600 text-white"><Zap className="h-6 w-6" aria-hidden="true" /></div><div><CardTitle className="text-2xl">Hoorific operations</CardTitle><CardDescription className="mt-2 text-sm leading-6">Sign in with the configured identity provider, or redeem the one-time local bootstrap code.</CardDescription></div></CardHeader><CardContent className="space-y-5"><Button asChild className="w-full"><a href="/admin/api/v1/auth/login">Sign in with OIDC</a></Button><div className="relative"><Separator /><span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-white px-3 text-xs uppercase tracking-wide text-zinc-500 dark:bg-zinc-900">or bootstrap locally</span></div><form onSubmit={submit}><label className="field"><span>Bootstrap code</span><Input value={code} onChange={(event) => setCode(event.currentTarget.value)} autoComplete="one-time-code" required /></label><Button className="mt-2 w-full" disabled={busy}>{busy ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />Redeeming…</> : 'Redeem code'}</Button></form><ErrorNotice error={error} /></CardContent></Card></main>;
+  return <main className="login grid min-h-screen place-items-center bg-zinc-50 px-4 py-10 dark:bg-zinc-950"><Card className="login-card w-full max-w-md shadow-xl"><CardHeader className="space-y-4"><div className="grid h-12 w-12 place-items-center rounded-xl bg-indigo-600 text-white"><Zap className="h-6 w-6" aria-hidden="true" /></div><div><CardTitle as="h1" className="text-2xl">Hoorific operations</CardTitle><CardDescription className="mt-2 text-sm leading-6">Sign in with the configured identity provider, or redeem the one-time local bootstrap code.</CardDescription></div></CardHeader><CardContent className="space-y-5"><Button asChild className="w-full"><a href="/admin/api/v1/auth/login">Sign in with OIDC</a></Button><div className="relative"><Separator /><span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-white px-3 text-xs uppercase tracking-wide text-zinc-500 dark:bg-zinc-900">or bootstrap locally</span></div><form onSubmit={submit}><label className="field"><span>Bootstrap code</span><Input type="password" value={code} onChange={(event) => setCode(event.currentTarget.value)} autoComplete="one-time-code" required /></label><Button className="mt-2 w-full" disabled={busy}>{busy ? <><RefreshCw className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />Redeeming…</> : 'Redeem code'}</Button></form><ErrorNotice error={error} /></CardContent></Card></main>;
 }
 
 function Dashboard({ session, onChanged }: { session: Session; onChanged: (next: Session) => void }) {
@@ -1439,7 +1583,11 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
 
   useEffect(() => {
     const media = window.matchMedia('(max-width: 767px)');
-    const update = () => setIsMobile(media.matches);
+    const update = () => {
+      const next = media.matches;
+      setIsMobile(next);
+      if (!next) setMobileNavOpen(false);
+    };
     update();
     media.addEventListener?.('change', update);
     return () => media.removeEventListener?.('change', update);
@@ -1521,18 +1669,16 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
   return (
     <div className="layout min-h-screen overflow-x-hidden bg-zinc-50 text-zinc-950 dark:bg-zinc-950 dark:text-zinc-100 md:grid md:grid-cols-[17rem_minmax(0,1fr)]">
       <div className={cn('fixed inset-0 z-30 bg-zinc-950/40 backdrop-blur-sm transition-opacity md:hidden', mobileNavOpen ? 'opacity-100' : 'pointer-events-none opacity-0')} aria-hidden="true" onClick={closeMobileNav} />
-      <aside ref={sidebarRef} className={cn('sidebar fixed inset-y-0 left-0 z-40 flex w-[min(19rem,calc(100vw-2rem))] -translate-x-full flex-col border-r border-zinc-200 bg-white px-4 py-4 shadow-xl transition-transform dark:border-zinc-800 dark:bg-zinc-900 md:inset-auto md:sticky md:top-0 md:h-dvh md:z-auto md:w-auto md:translate-x-0 md:shadow-none', mobileNavOpen && 'translate-x-0')}>
+      <aside id="operations-sidebar" ref={sidebarRef} className={cn('sidebar fixed inset-y-0 left-0 z-40 flex w-[min(19rem,calc(100vw-2rem))] -translate-x-full flex-col border-r border-zinc-200 bg-white px-4 py-4 shadow-xl transition-transform dark:border-zinc-800 dark:bg-zinc-900 md:inset-auto md:sticky md:top-0 md:h-dvh md:z-auto md:w-auto md:translate-x-0 md:shadow-none', mobileNavOpen && 'translate-x-0')}>
         <div className="flex items-center justify-between gap-3">
           <Link to="/admin/" onClick={closeMobileNav} className="brand flex items-center gap-2 text-lg font-semibold tracking-tight"><span className="grid h-9 w-9 place-items-center rounded-lg bg-indigo-600 text-white"><Zap className="h-4 w-4" aria-hidden="true" /></span>Hoorific</Link>
           <button type="button" className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 md:hidden" onClick={closeMobileNav} aria-label="Close navigation"><X className="h-5 w-5" aria-hidden="true" /></button>
         </div>
         <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2.5 dark:border-zinc-800 dark:bg-zinc-950/50">
-          <div className="flex items-center justify-between gap-2"><span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Session</span><Badge variant="outline" className="capitalize">{role || 'unknown'} role</Badge></div>
+          <span className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">Signed in as</span>
           <p className="mt-1.5 truncate text-sm font-medium text-zinc-800 dark:text-zinc-100">{session.principal.SubjectID}</p>
-          <p className="mt-0.5 truncate text-xs text-zinc-500 dark:text-zinc-400">Active tenant: {tenantID}</p>
-          <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">Role applies only to this tenant.</p>
+          <div className="mt-3"><TenantSelector session={session} onChanged={onChanged} /></div>
         </div>
-        <div className="mt-3"><TenantSelector session={session} onChanged={onChanged} /></div>
         <Separator className="my-4" />
         <nav aria-label="Operations" className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
           <div className="space-y-0.5">{navLink('overview', 'Overview', LayoutDashboard)}{canPlayground && navLink('playground', 'Playground', Code2)}</div>
@@ -1550,8 +1696,8 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
         <header className="sticky top-0 z-20 -mx-4 mb-8 border-b border-zinc-200/80 bg-zinc-50/90 px-4 py-3 backdrop-blur-xl dark:border-zinc-800/80 dark:bg-zinc-950/90 sm:-mx-6 sm:px-6 lg:-mx-10 lg:px-10">
           <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
-              <button ref={toggleRef} type="button" className="rounded-lg border border-zinc-200 bg-white p-2 text-zinc-700 shadow-sm hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800 md:hidden" onClick={() => setMobileNavOpen((open) => !open)} aria-expanded={mobileNavOpen} aria-label={mobileNavOpen ? 'Close navigation' : 'Open navigation'}>{mobileNavOpen ? <PanelLeftClose className="h-5 w-5" aria-hidden="true" /> : <PanelLeftOpen className="h-5 w-5" aria-hidden="true" />}</button>
-              <div className="min-w-0"><p className="truncate text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">{routeLabel}</p><p className="truncate text-sm font-medium text-zinc-800 dark:text-zinc-100">Active tenant {tenantID} · {role || 'unknown'} role</p></div>
+              <button ref={toggleRef} type="button" className="rounded-lg border border-zinc-200 bg-white p-2 text-zinc-700 shadow-sm hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800 md:hidden" onClick={() => setMobileNavOpen((open) => !open)} aria-expanded={mobileNavOpen} aria-controls="operations-sidebar" aria-label={mobileNavOpen ? 'Close navigation' : 'Open navigation'}>{mobileNavOpen ? <PanelLeftClose className="h-5 w-5" aria-hidden="true" /> : <PanelLeftOpen className="h-5 w-5" aria-hidden="true" />}</button>
+              <div className="min-w-0"><p className="truncate text-xs font-medium uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-400">{routeLabel}</p><p className="context-mobile truncate text-xs font-medium text-zinc-600 dark:text-zinc-300 sm:hidden"><span className="sr-only">Active tenant: </span>{tenantID || 'unknown'} · {role || 'unknown'} role</p></div>
             </div>
             <div className="flex items-center gap-1">
               <button type="button" className="rounded-lg p-2 text-zinc-600 hover:bg-zinc-200/70 dark:text-zinc-300 dark:hover:bg-zinc-800" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>{theme === 'dark' ? <Sun className="h-5 w-5" aria-hidden="true" /> : <Moon className="h-5 w-5" aria-hidden="true" />}</button>

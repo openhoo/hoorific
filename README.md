@@ -12,9 +12,9 @@ Route compatible inference requests through explicit connections, credentials, p
 
 </div>
 
-![Hoorific administrative console](docs/assets/console.webp)
+![Hoorific Operations overview with the sidebar and workflow cards](docs/assets/console.webp)
 
-*Real console, synthetic local fixture data. The screenshot is not a live-provider or account-entitlement claim.*
+*Current console capture with synthetic local fixture data; it is not a live-provider or account-entitlement claim.*
 
 Hoorific is a Go gateway for teams that need a small, inspectable control plane in front of model providers and compatible endpoints. The inference listener and management listener are separate; the management API and same-origin React console configure the resources that the gateway is allowed to use.
 
@@ -23,11 +23,11 @@ Hoorific is a Go gateway for teams that need a small, inspectable control plane 
 ## What it provides
 
 - **Explicit routing and admission.** Tenants, connections, models, aliases, route policies, limits, API keys, admissions, usage, and audit records are durable resources rather than implicit process flags.
-- **Encrypted credential lifecycle.** Credential listings expose metadata only. Import, rotation, revocation, OAuth, and device flows are bound to a connection and use the encrypted store; generic credential CRUD is intentionally not an administrative contract.
+- **Encrypted credential lifecycle.** Credential listings expose metadata only. Import, rotation, revocation, OAuth, and device flows are bound to a connection and use the encrypted store; OAuth and device availability depends on connector support, and generic credential CRUD is intentionally not an administrative contract.
 - **Portable and native protocols.** Built-in codecs cover OpenAI chat, responses, and completions; Anthropic messages; Gemini content; Bedrock Converse; Cohere v2; Ollama; embeddings; and reranking where a registered operation supports them. Streaming is available only for operations whose exact codec advertises a stream.
 - **Provider adapters.** The built-in connector catalog includes OpenAI, Anthropic, Gemini, Cohere, Ollama, Hugging Face, Replicate, fal, Azure OpenAI, Vertex, Bedrock, and explicitly configured compatible endpoints. Optional subscription connectors are disabled unless enabled in configuration.
 - **Cost-safe accounting.** Provider prompt caching is distinct from opt-in response replay; cache controls are never turned into automatic explicit writes, and missing usage or rates remain unknown rather than guessed.
-- **Standalone or cluster storage.** Standalone mode uses SQLite. Cluster mode uses PostgreSQL and can use Redis for coordination. The two storage modes are mutually exclusive in configuration.
+- **Standalone or cluster storage.** Standalone mode uses SQLite. Cluster mode uses PostgreSQL and requires Redis for coordination. The two storage modes are mutually exclusive in configuration.
 - **A focused operator surface.** `/admin/` serves the embedded React console, built with shadcn/ui components and Tailwind CSS. Workflow-oriented navigation leads from connections and models to routing and operations. Resource pages open on the collection, with explicit create/edit workspaces, page-local filtering, and draft-discard confirmation when selecting another resource, starting a new one, or returning to the list. The playground shows request and response side by side on wide screens, with copy, clear, and cancellation controls. Forms adapt to their available width; light/dark themes and keyboard navigation work on desktop and mobile. `/admin/api/v1/` serves the authenticated management API; health and metrics remain on the management listener.
 - **A small runtime boundary.** The Dockerfile produces a `scratch` image that runs as UID/GID `10001` and supports a read-only root filesystem, with CA certificates, timezone data, `/tmp`, and the mounted data directory. There is deliberately no shell in the runtime image.
 
@@ -47,9 +47,9 @@ The embedded [console guide](docs/console.md) turns the post-bootstrap flow into
     </td>
     <td align="center">
       <a href="docs/console.md#playground">
-        <img src="docs/assets/console-playground.webp" alt="Hoorific console playground showing a completed deterministic request and response">
+        <img src="docs/assets/console-playground.webp" alt="Hoorific console playground showing the terminal portion of a completed deterministic Chat stream with O and K chunks, usage 11, and a DONE marker">
       </a><br>
-      <strong><a href="docs/console.md#playground">Playground</a></strong> — send a deterministic fixture request and inspect its response.
+      <strong><a href="docs/console.md#playground">Playground</a></strong> — send a deterministic fixture request and inspect its terminal stream output.
     </td>
   </tr>
 </table>
@@ -71,10 +71,10 @@ flowchart LR
     Admin --> Store[(SQLite or PostgreSQL)]
     Admission --> Store
     Store --> Credentials[Encrypted credential store]
-    Store -. optional coordination .-> Redis[(Redis)]
+    Store -. cluster coordination .-> Redis[(Redis)]
 ```
 
-The chart is a cluster-mode deployment shape around this same process. It expects externally managed PostgreSQL, encryption, and optional Redis/OIDC secrets; its default data volume is ephemeral. See [Deployment](docs/deployment.md) before adapting it to a persistent production environment.
+The chart is a cluster-mode deployment shape around this same process. It expects externally managed PostgreSQL, encryption, and Redis secrets; OIDC is optional and needs its own secret when enabled. Its default data volume is ephemeral. See [Deployment](docs/deployment.md) before adapting it to a persistent production environment.
 
 ## Quickstart (native loopback)
 
@@ -180,29 +180,32 @@ podman build --tag hoorific:local .
 The checked-in [Compose file](compose.yaml) runs the same binary as UID/GID
 `10001` with a read-only root filesystem, a named data volume, and explicit
 read-only config/master-key mounts. Use a container-specific configuration with
-`listeners.management` set to `:8081` and paths `/var/lib/hoorific` and
-`/run/secrets/hoorific-master-key`; the native config above binds management to
-`127.0.0.1:8081` and uses host paths, so it must not be mounted unchanged.
-Follow [Deployment](docs/deployment.md#standalone-compose) for secure key/file
-ownership and Compose startup.
+`listeners.inference` set to `:8080`, `listeners.management` set to `:8081`,
+and paths `/var/lib/hoorific` and `/run/secrets/hoorific-master-key`; the
+native config above binds both listeners to loopback and uses host paths, so it
+must not be mounted unchanged. Follow [Deployment](docs/deployment.md#standalone-compose)
+for secure key/file ownership and Compose startup.
 
 After creating those container paths with the secure procedure in
-[Deployment](docs/deployment.md#master-key-handling), start the local stack:
+[Deployment](docs/deployment.md#master-key-handling), start the local stack with
+an installed Compose provider (for example, `podman compose` or `docker compose`):
 
 ```sh
 export HOORIFIC_CONFIG="$PWD/.local/hoorific-container/config.json"
 export HOORIFIC_MASTER_KEY="$PWD/.local/hoorific-container/master.key"
 export HOORIFIC_IMAGE=hoorific:local
 podman compose up -d
-curl --fail http://127.0.0.1:8081/health/ready
+curl --fail --retry 30 --retry-connrefused --retry-delay 1 \
+  --retry-max-time 30 --max-time 2 http://127.0.0.1:8081/health/ready
 ```
 
-The container's ordinary published port is not a loopback peer inside the
-container network namespace. Consequently, host-browser or host-`curl`
-bootstrap requests through a bridge port fail the deliberate loopback check.
-Use the native quickstart for a local bootstrap flow, or configure OIDC and an
-intentional network/TLS design for a container deployment; do not weaken the
-bootstrap guard.
+With the default bridged Compose network, the container's ordinary published
+port is not a loopback peer inside the container network namespace. Consequently,
+host-browser or host-`curl` bootstrap requests through that bridge port fail the
+deliberate loopback check. A host-network or other intentional topology can
+change the peer address; do not weaken the guard. Use the native quickstart for
+a local bootstrap flow, or configure OIDC and an intentional network/TLS design
+for a container deployment.
 
 No container image is published by this repository. Build locally or provide
 an image from a registry you control before using the Helm chart.
@@ -215,6 +218,7 @@ Prerequisites:
 
 - Go **1.27** (the version declared by [go.mod](go.mod)).
 - Bun **1.3.14** (the version pinned by the [Dockerfile](Dockerfile)); `bun.lock` is authoritative for web dependencies.
+- Python 3 with its standard library (the native quickstart creates JSON configuration with `python3`).
 - An OCI-compatible builder such as Docker BuildKit or a modern Podman/Buildah for the container path.
 
 ```sh
@@ -245,9 +249,10 @@ Run ordinary Go tests after the source-build sequence:
 go test ./...
 ```
 
-For an end-to-end deterministic qualification against an owned loopback fixture:
+For the deterministic qualification suite, follow [Qualification](docs/qualification.md) for prerequisites and scenario selectors. The standalone `all` command includes owned fixture, SDK, and FAL checks; missing their Python, Podman, or cached-image prerequisites fails the run, while unavailable Helm/Kubernetes packaging is reported separately:
 
 ```sh
+HOORIFIC_VERIFY_PYTHON=.artifacts/sdk-venv/bin/python \
 go run ./tools/verify \
   --binary .artifacts/hoorific \
   --mode standalone \
@@ -276,7 +281,7 @@ For a repeatable traffic measurement against a provisioned gateway and determini
 ## Deployment boundaries
 
 - **Provider access is explicit.** Subscription connectors and default cloud credential chains require opt-in. The verifier does not discover ambient host or CLI credentials. Live qualification requires operator-supplied authenticated files and enforces a spend ceiling before dispatch.
-- **Kubernetes is a template, not a claim of deployment.** The Helm chart requires existing secrets and an image you build or publish. The default chart uses external PostgreSQL and ephemeral `emptyDir` data; choose persistence and network policy deliberately.
+- **Kubernetes is a template, not a claim of deployment.** The Helm chart requires an image you build or publish plus externally managed PostgreSQL, encryption, and Redis secrets; OIDC is optional. The default chart uses external PostgreSQL and ephemeral `emptyDir` data; choose persistence and network policy deliberately.
 - **No image or release is implied.** Until a release workflow and registry are intentionally configured, use locally built images or your own registry coordinates.
 - **Management exposure is deliberate.** Keep the management listener on a private network or loopback unless you have configured TLS, trusted origins, authentication, and network controls for your environment.
 

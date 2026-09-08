@@ -7,7 +7,7 @@ The Dockerfile produces one statically linked gateway image with two executable 
 - `hoorific migrate --config /etc/hoorific/config.json` applies pending database migrations and exits.
 - `hoorific serve --config /etc/hoorific/config.json` starts the inference and management listeners.
 
-The final image is based on `scratch`. It contains only the gateway, the CA trust bundle, full timezone data, minimal user/group records, and the required directories. It runs as UID/GID `10001`; there is no shell, package manager, or debugging utility. Writable state is confined to the mounted data directory and `/tmp`, so a read-only root filesystem still needs writable mounts for both.
+The final image is based on `scratch`. It contains only the gateway, the CA trust bundle, full timezone data, minimal user/group records, and the required directories. It runs as UID/GID `10001`; there is no shell, package manager, or debugging utility. For the paths used by the supplied Compose and chart examples, writable state is confined to the mounted data directory and `/tmp`; `data_dir`, the SQLite path, and secret paths are configuration inputs and must point to readable locations that are mounted into the container. A read-only root filesystem still needs writable mounts for the data directory and `/tmp`.
 
 All paths beginning with `.artifacts/` in this document are private operator-local output paths. They are not shipped proof files or public repository assets.
 Once the runtime is configured, use the [Console guide](console.md) for the embedded operator workflow, including model collection and editing, routing setup, and the playground. Its screenshots use isolated synthetic fixtures rather than live-provider data.
@@ -46,7 +46,7 @@ The application accepts one strict JSON object and rejects unknown keys. A minim
     "sqlite": {"path": ""},
     "postgres": {"dsn_file": "/etc/hoorific/secrets/postgres-dsn"}
   },
-  "coordination": {"redis": {"url_file": ""}},
+  "coordination": {"redis": {"url_file": "/etc/hoorific/secrets/redis-url"}},
   "encryption": {"key_file": "/etc/hoorific/secrets/encryption-master-key"},
   "oidc": {"issuer": "", "client_id": "", "client_secret_file": ""},
   "public_urls": {},
@@ -54,25 +54,37 @@ The application accepts one strict JSON object and rejects unknown keys. A minim
 }
 ```
 
-Redis is optional coordination for cluster mode. When enabled, set `coordination.redis.url_file` to a mounted URL file. OIDC issuer and client ID must be supplied together; keep the client secret in a separate mounted file. Provider OAuth registrations, when needed, are configured under the `oauth` object and also reference secret files rather than embedding secret values.
+Cluster mode requires Redis coordination at startup; it is not optional. `serve` requires a non-empty `coordination.redis.url_file`, reads it, and parses a Redis URL before it starts. Mount the file shown above and qualify Redis availability in the target environment; a missing, unreadable, or malformed file fails startup. `config validate` checks the JSON/schema contract but does not open the file or test the Redis service. OIDC issuer and client ID must be supplied together; when a client secret is required, keep it in a separate mounted file rather than embedding it. Provider OAuth registrations, when needed, are configured under the `oauth` object and reference secret files rather than embedding secret values. An OAuth credential import also requires a configured registration issuer and successful ID-token account evidence matching the configured connection account; there is no generic unverified-token import path.
+The `:8081` management address in these container/cluster examples binds all interfaces in that network namespace. A native host deployment should use a loopback or otherwise protected management address unless a deliberate TLS/proxy and origin design is in place.
 
 Validate a configuration without opening storage:
 
 ```sh
-./hoorific config validate --config /path/to/config.json
+.artifacts/hoorific config validate --config /path/to/config.json
 ```
 
 The ordinary startup sequence is migration followed by serving:
 
 ```sh
-./hoorific migrate --config /path/to/config.json
-./hoorific serve --config /path/to/config.json
+.artifacts/hoorific migrate --config /path/to/config.json
+.artifacts/hoorific serve --config /path/to/config.json
 ```
 `schema_version` in the configuration remains `1`; the durable database has
 its own version and is currently at version `3`. Run `migrate` before
 `serve` for an existing database as well as a new one. The version-3
 migration adds the encrypted idempotency-record table and its expiry index;
 it is additive and does not replace the database or the operator keyring.
+
+### Authentication and trust boundaries
+
+The inference and management listeners have different trust boundaries. Inference requests authenticate with Hoorific API keys (or a short-lived authenticated realtime ticket where that protocol supports it), not with management-console sessions. API-key secrets are returned only when issued or rotated; the server stores a verifier and re-resolves the active tenant, key revision, revocation state, role, and grants on request. Do not invent tenant, role, scope, or key claims in request headers; caller-supplied claims are rejected.
+
+The management API does not accept inference API keys. It uses the loopback-only, one-time bootstrap flow or OIDC browser sessions, and it can accept scoped bearer admin tokens. OIDC accepts HTTPS issuers (HTTP is permitted only for a loopback issuer), validates the provider metadata, ID-token signature, audience, and nonce, and resolves an already enrolled issuer/subject identity; it does not auto-provision an operator. Admin token issue and revoke are owner-only. Roles and explicit token scopes are intersected with the current server-side role and tenant membership on every request; a bearer token is tenant-confined, while a cookie session may select only another tenant for which that subject is a member.
+
+The gateway serves plain HTTP and does not terminate TLS. Put it behind a trusted TLS-terminating proxy on a protected network, or provide another private transport for the gateway hop, set `public_urls.management` to the exact externally trusted origin, and restrict management ingress. The gateway does not trust forwarded-proto headers; a proxy that terminates TLS and forwards plain HTTP must be qualified against the cookie, redirect, and origin checks rather than assumed compatible. `public_urls` configures origin/cookie behavior; it does not enable TLS.
+
+`/health/live`, `/health/ready`, and `/metrics` are unauthenticated management routes. Treat their status and metrics as information for a restricted network, not as public authorization or readiness proof.
+The loopback bootstrap guard is based on the peer address seen by the management process and does not trust forwarded headers. A host-published bridge port normally does not preserve a loopback peer; a proxy or sidecar that appears as loopback must be treated as part of the trusted boundary. Do not weaken the guard to make a port-forwarded bootstrap work.
 
 ## Cost, caching, and replay safety
 
@@ -169,14 +181,10 @@ is retained for 24 hours from completion, with a 32 MiB maximum captured
 response body. Captured response bytes are encrypted with a purpose-separated
 key derived from the operator's JSON AES-256-GCM keyring.
 
-Keep old key IDs available while encrypted idempotency records can still be
-replayed; rotate the JSON keyring through the same retained-key procedure as
-other encrypted records and never overwrite the key file in place. Pending,
-partial, failed, oversized, or otherwise unreplayable records return a
-conflict (normally `409` with `idempotency_in_progress`) and are durable
-negative state, not permission to dispatch again after expiry or restart.
+Keep old key IDs available while encrypted idempotency records can still be replayed. There is no general key-rotation command or API: rotation requires an operator-designed rewrap/migration covering every encrypted record and preserving the old IDs until all required reads and replays are complete. Never overwrite the key file in place. Pending, partial, failed, oversized, or otherwise unreplayable records return a conflict (normally `409` with `idempotency_in_progress`) and are durable negative state, not permission to dispatch again after expiry or restart.
 Fingerprint conflicts are also `409`. Hoorific never blindly forwards
 `Idempotency-Key` upstream to obtain provider-side HTTP retry behavior.
+An idempotency result is not an exactly-once guarantee for provider execution or billing: a stored terminal result replays without a second gateway dispatch, while pending or unreplayable records conflict and do not authorize a second dispatch.
 
 ### Provider-specific controls and cancellation
 
@@ -234,6 +242,7 @@ PY
 ```
 
 Keep key IDs and key material unchanged across restarts, upgrades, backups, and restores. The database and all retained key versions are one recovery unit; losing a key makes encrypted records unrecoverable. Do not overwrite the key file to perform rotation without a procedure that can decrypt existing data.
+The keyring also protects provider credential envelopes and provider OAuth/device-flow state, native continuation records, and idempotency responses. There is no blanket key-rotation procedure in this source tree; the available credential rewrap operation is connection-scoped and is not a complete migration of these record types. Design and qualify any rewrap/migration before changing the current key, retain decryptable old key IDs throughout, and never overwrite the mounted key file.
 
 ## Build the image
 
@@ -244,7 +253,7 @@ podman build --tag hoorific:local .
 # or: docker build --tag hoorific:local .
 ```
 
-The Dockerfile pins Go `1.27` and Bun `1.3.14`. Its build graph copies `go.mod` and `go.sum` before backend sources and uses shared Go module/build caches. The schema stage copies only `tools/schema`, `internal/admin`, and `internal/core`; changes elsewhere do not invalidate that stage. The frontend stage installs from `web/package.json` and `web/bun.lock`, creates `web/src/generated`, generates API types from the fresh schema, and builds the console. The Go stage embeds those compiled assets; generated API types and host-built console output are not taken from the checkout.
+The Dockerfile selects Go `1.27` and Bun `1.3.14` version tags. Those tags are not immutable supply-chain pins; production builders should pin and verify approved base-image digests. Its build graph copies `go.mod` and `go.sum` before backend sources and uses shared Go module/build caches. The schema stage copies only `tools/schema`, `internal/admin`, and `internal/core`; changes elsewhere do not invalidate that stage. The frontend stage installs from `web/package.json` and `web/bun.lock`, creates `web/src/generated`, generates API types from the fresh schema, and builds the console. The Go stage embeds those compiled assets; generated API types and host-built console output are not taken from the checkout.
 
 To isolate builder caches, set a distinct namespace:
 
@@ -254,9 +263,9 @@ podman build \
   --tag hoorific:local .
 ```
 
-Cache mounts use locked sharing within a namespace. Separate namespaces avoid contention at the cost of reuse; they do not reduce total builder-side storage. The runtime-files stage copies certificates and timezone data from the pinned Go image instead of running APT in the runtime stage. For debugging, use external tooling or a separate diagnostic container: `exec ... sh` is intentionally unavailable.
+Cache mounts use locked sharing within a namespace. Separate namespaces avoid contention at the cost of reuse; they do not reduce total builder-side storage. The runtime-files stage copies certificates and timezone data from the selected Go image instead of running APT in the runtime stage. For debugging, use external tooling or a separate diagnostic container: `exec ... sh` is intentionally unavailable.
 
-The equivalent fresh-checkout source sequence is:
+The following is a host-side fresh-checkout source sequence, not a guarantee of the Dockerfile's target OS/architecture or runtime-image provenance:
 
 ```sh
 mkdir -p .artifacts web/src/generated
@@ -289,10 +298,11 @@ export HOORIFIC_IMAGE=hoorific:local
 podman unshare chown 10001:10001 "$HOORIFIC_CONFIG" "$HOORIFIC_MASTER_KEY"
 
 podman compose up -d
-curl --fail http://127.0.0.1:8081/health/ready
+curl --fail --retry 30 --retry-connrefused --retry-delay 1 \
+  --retry-max-time 30 --max-time 2 http://127.0.0.1:8081/health/ready
 ```
 
-Use `docker compose` with the image built by the same Docker engine when using Docker. The Compose file mounts the explicit configuration at `/etc/hoorific/config.json`, the explicit key at `/run/secrets/hoorific-master-key`, and a named `data` volume at `/var/lib/hoorific`. The `migrate` service must complete before `gateway` starts. To inspect or repeat migration:
+Use `docker compose` with the image built by the same Docker engine when using Docker. The Compose file mounts the explicit configuration at `/etc/hoorific/config.json`, the explicit key at `/run/secrets/hoorific-master-key`, and a named `data` volume at `/var/lib/hoorific`. With the checked-in `name: hoorific`, that volume is normally named `hoorific_data`; a different Compose project name changes it. The `migrate` service must complete before `gateway` starts. To inspect or repeat migration:
 
 ```sh
 podman compose run --rm migrate
@@ -300,11 +310,7 @@ podman compose logs --no-log-prefix migrate
 podman compose up -d gateway
 ```
 
-The inference listener is published on `HOORIFIC_INFERENCE_PORT` (default
-`8080`). Management is bound to loopback on `HOORIFIC_MANAGEMENT_PORT`
-(default `8081`); override the inference bind address with
-`HOORIFIC_BIND_ADDRESS`. Do not expose management publicly without an
-intentional TLS, trusted-origin, authentication, and network-control design.
+Compose publishes the inference port on the host address in `HOORIFIC_BIND_ADDRESS` (default `127.0.0.1`) and port `HOORIFIC_INFERENCE_PORT` (default `8080`). That variable changes the host-side publish address, not the listener address inside the container. Management is published on host loopback at `HOORIFIC_MANAGEMENT_PORT` (default `8081`), but the example listener `:8081` binds management on all container interfaces; peers sharing the container network may still reach it. Do not expose management publicly without an intentional TLS, trusted-origin, authentication, and network-control design.
 
 The local bootstrap endpoint deliberately accepts only a loopback peer. A
 request from a host browser or host `curl` through a normal Docker/Podman
@@ -318,51 +324,66 @@ podman compose run --rm --no-deps gateway \
   admin bootstrap --config /etc/hoorific/config.json
 ```
 
-For a local authenticated console, use the native loopback flow in the
-README. For a container deployment, configure OIDC or provide an intentional
-same-namespace/TLS path that preserves the loopback and trusted-origin
-contract. Do not weaken the bootstrap guard merely to make a published port
-work.
+For a local authenticated console, use the native loopback flow in the README. For a container deployment, configure OIDC or deliberately use a shared network namespace with a loopback connection, such as a sidecar, and separately secure its TLS and trusted-origin boundary. Merely sharing a Kubernetes namespace does not satisfy the loopback check. The binary does not terminate TLS. Do not weaken the bootstrap guard merely to make a published port work.
 
 ## Kubernetes / Helm
 
-The chart is a cluster-mode template around external PostgreSQL. It expects externally created Secrets and does not generate or own the PostgreSQL DSN, Redis URL, OIDC client secret, or master key. Provision the referenced Secret names and keys first, then supply cluster configuration through values. The migration Job runs as a Helm pre-install/pre-upgrade hook; the serve Deployment is separate. The chart also creates separate inference and management Services, probes, a PodDisruptionBudget, anti-affinity, and configurable NetworkPolicies.
+The chart is a cluster-mode template around external PostgreSQL and mandatory external Redis coordination. It expects externally created Secrets and does not generate or own the PostgreSQL DSN, Redis URL, OIDC client secret, or master key. Provision the referenced Secret names and keys first, then supply cluster configuration through values. The migration Job runs as a Helm pre-install/pre-upgrade hook; the serve Deployment is separate. The chart also creates separate inference and management Services, probes, a PodDisruptionBudget, anti-affinity, and configurable NetworkPolicies.
 
 The checked-in `values.yaml` image (`ghcr.io/example/hoorific:0.1.0`) is deliberately a placeholder, not a published image. Build and publish an image you control, then override the repository and pin a tag or digest:
 
 ```sh
 helm upgrade --install hoorific ./charts/hoorific \
   --namespace hoorific --create-namespace \
+  --values deploy/hoorific-values.yaml \
   --set image.repository=registry.example/your-team/hoorific \
   --set image.tag=operator-chosen-tag \
-  --values deploy/hoorific-values.yaml
+  --set config.coordination.redis.enabled=true \
+  --set existingSecrets.redis.secretName=hoorific-redis \
+  --set existingSecrets.redis.key=url
 helm status hoorific --namespace hoorific
 kubectl get jobs --namespace hoorific
 ```
 
-For a digest-pinned deployment, set `image.digest=sha256:...`; the chart renders `repository@digest` when a digest is present. `deploy/hoorific-values.yaml` is an operator-provided file, not a repository path supplied by this source tree.
+For a digest-pinned deployment, set `image.digest=sha256:...`; the chart renders `repository@digest` when a digest is present. `deploy/hoorific-values.yaml` is an operator-provided file, not a repository path supplied by this source tree. The pre-created `hoorific-redis` Secret in this example must contain the Redis URL under `url`; PostgreSQL and encryption Secrets are also required.
 
-The default chart uses two stateless replicas, external PostgreSQL, and ephemeral `emptyDir` mounts for `/var/lib/hoorific` and `/tmp`. It is not a standalone SQLite deployment and its data mount is not a persistence claim. Redis and OIDC remain optional, but their URL/client-secret files and configuration must be supplied together when enabled. The read-only root filesystem needs writable `/tmp` and data mounts. No Kubernetes installation or production qualification is claimed by the local deterministic verifier.
+The checked-in chart defaults to two stateless replicas, external PostgreSQL, and ephemeral `emptyDir` mounts for `/var/lib/hoorific` and `/tmp`. It is not a standalone SQLite deployment and its data mount is not a persistence claim. Although the checked-in values file leaves `config.coordination.redis.enabled` false, cluster `serve` still requires a non-empty Redis URL file; a default install therefore is not a runnable cluster until Redis is enabled and its Secret/configuration are supplied. OIDC remains optional, but its issuer, client ID, client-secret file, and referenced Secret must be supplied together when enabled. With `networkPolicy.enabled` (the default), empty ingress is deny-all and egress permits DNS only: explicitly allow the management/inference clients and external PostgreSQL, Redis, OIDC, and provider destinations required by the deployment. NetworkPolicy permits traffic but does not make PostgreSQL, Redis, OIDC, or provider transport confidential; configure TLS/authentication in those external services and their DSNs/URLs as required. The readiness probe checks the database readiness and whether the gateway is draining; it is not a provider, Redis, network-policy, or production-qualification check. Migration pods share the chart's base selector labels, so inspect Service EndpointSlices during hooks and do not treat them as serving replicas until migration has completed. The read-only root filesystem needs writable `/tmp` and data mounts. No Kubernetes installation or production qualification is claimed by the local deterministic verifier.
 
 ## Backups
 
 ### Standalone SQLite
 
-Stop the writer before copying the database. Preserve the master key with the same backup identifier and a restrictive umask:
+Stop the writer before copying the database. The store uses SQLite WAL mode, so do not copy only `hoorific.sqlite` while `hoorific.sqlite-wal` or `hoorific.sqlite-shm` may contain committed state. The following uses a host-native `sqlite3` CLI and absolute source paths. For the Compose named volume, exposing the file to the host requires qualified, ownership-aware tooling; the scratch gateway image has no `sqlite3`, and a host user cannot necessarily read files owned by container UID `10001`. Do not substitute a generic copy helper.
+
+For the checked-in Compose deployment, stop the writer with
+`podman compose stop gateway`; stop a native writer with its own supervisor.
+Run the following only once every writer is stopped.
 
 ```sh
+set -eu
 umask 077
-podman compose stop gateway
-install -d -m 0700 backups/2026-01-01
-# Replace the volume path and helper image with the tooling approved by your
-# backup environment; do not copy a live SQLite file while it is being written.
-podman run --rm -v hoorific_data:/data \
-  -v "$PWD/backups/2026-01-01:/backup" \
-  busybox cp /data/hoorific.sqlite /backup/hoorific.sqlite
-install -m 0400 "$HOORIFIC_MASTER_KEY" backups/2026-01-01/master.key
-sha256sum backups/2026-01-01/hoorific.sqlite backups/2026-01-01/master.key \
-  > backups/2026-01-01/SHA256SUMS
+export HOORIFIC_SQLITE_SOURCE="${HOORIFIC_SQLITE_SOURCE:?Set an absolute path to the stopped SQLite file}"
+export HOORIFIC_MASTER_KEY="${HOORIFIC_MASTER_KEY:?Set an absolute path to the master key}"
+install -d -m 0700 backups
+BACKUP_DIR="$(mktemp -d "$PWD/backups/2026-01-01.XXXXXX")"
+chmod 0700 "$BACKUP_DIR"
+(
+  cd "$BACKUP_DIR"
+  sqlite3 -readonly "$HOORIFIC_SQLITE_SOURCE" \
+    ".backup 'hoorific.sqlite'"
+  install -m 0400 "$HOORIFIC_MASTER_KEY" master.key
+  sha256sum hoorific.sqlite master.key > SHA256SUMS
+)
+printf 'backup: %s\n' "$BACKUP_DIR"
 ```
+
+The SQLite `.backup` operation reads the main file and WAL into a consistent
+new snapshot. If an SQLite-aware backup is unavailable, preserve the main
+file and both WAL sidecars as one stopped, consistent set and include every
+copied file in the checksum set; do not assume `busybox cp` of the main file
+is sufficient. Keep the key in a separate protected, operator-readable path;
+rootless Podman ownership mapping can make a container-readable key unreadable
+to the host backup user.
 
 If filesystem snapshots are used instead, take an application-consistent snapshot and retain the key in the same protected backup set.
 
@@ -371,44 +392,78 @@ If filesystem snapshots are used instead, take an application-consistent snapsho
 Do not place a DSN or password in a command-line argument. Configure libpq through a protected service file and password file, then pass only the service name to PostgreSQL tooling:
 
 ```sh
+set -eu
 umask 077
-install -d -m 0700 backups/2026-01-01
+export HOORIFIC_MASTER_KEY="${HOORIFIC_MASTER_KEY:?Set an absolute path to the master key}"
+install -d -m 0700 backups
+BACKUP_DIR="$(mktemp -d "$PWD/backups/2026-01-01.XXXXXX")"
 export PGSERVICEFILE=/path/to/protected/pg_service.conf
 export PGPASSFILE=/path/to/protected/pgpass
 export PGSERVICE=hoorific-backup   # operator-provided service name
 pg_dump --format=custom \
-  --file=backups/2026-01-01/hoorific.dump \
+  --file="$BACKUP_DIR/hoorific.dump" \
   --dbname="service=${PGSERVICE:?Set PGSERVICE to the protected service name}"
-install -m 0400 "$HOORIFIC_MASTER_KEY" backups/2026-01-01/master.key
-sha256sum backups/2026-01-01/hoorific.dump backups/2026-01-01/master.key \
-  > backups/2026-01-01/SHA256SUMS
+install -m 0400 "$HOORIFIC_MASTER_KEY" "$BACKUP_DIR/master.key"
+(cd "$BACKUP_DIR" && sha256sum hoorific.dump master.key > SHA256SUMS)
+printf 'backup: %s\n' "$BACKUP_DIR"
 ```
 
-Back up Redis separately if it is configured. Redis is coordination/cache state and does not replace the database or master-key backup.
+Cluster mode requires Redis at startup. Redis holds disposable coordination/cache hints rather than the authoritative database; back it up or restore it only according to the Redis service's own policy, and never treat it as a substitute for the PostgreSQL dump or master-key backup.
 
 ## Restore and master-key recovery
 
-Verify checksums, provision an empty target database or volume, and restore the database before starting the server:
+Verify checksums from the backup directory, provision a fresh target, and never restore over a live database or old key path. Standalone restoration below is host-native; exposing a container volume to this CLI still requires qualified ownership-aware tooling.
 
 ```sh
+set -eu
 umask 077
-sha256sum --check backups/2026-01-01/SHA256SUMS
-# Standalone: restore hoorific.sqlite into the mounted data volume while stopped.
-# Cluster: configure the same protected PGSERVICEFILE/PGPASSFILE/PGSERVICE
-# values used for the target, then restore without putting a DSN on argv.
-export PGSERVICEFILE=/path/to/protected/pg_service.conf
-export PGPASSFILE=/path/to/protected/pgpass
-export PGSERVICE=hoorific-restore
-pg_restore --clean --if-exists \
-  --dbname="service=${PGSERVICE:?Set PGSERVICE to the protected service name}" \
-  backups/2026-01-01/hoorific.dump
-install -m 0400 backups/2026-01-01/master.key .local/hoorific-container/master.key
-export HOORIFIC_MASTER_KEY="$PWD/.local/hoorific-container/master.key"
-podman compose run --rm migrate
-podman compose up -d gateway
+export BACKUP_DIR="${BACKUP_DIR:?Set the absolute backup directory}"
+(cd "$BACKUP_DIR" && sha256sum --check SHA256SUMS)
+case "${HOORIFIC_MODE:?Set HOORIFIC_MODE=standalone or cluster}" in
+standalone)
+  export RESTORE_DIR="${RESTORE_DIR:?Set a new absolute restore directory}"
+  mkdir -m 0700 -- "$RESTORE_DIR"       # fails atomically if the target exists
+  install -m 0600 "$BACKUP_DIR/hoorific.sqlite" "$RESTORE_DIR/hoorific.sqlite"
+  install -m 0400 "$BACKUP_DIR/master.key" "$RESTORE_DIR/master.key"
+  ;;
+cluster)
+  export PGSERVICEFILE=/path/to/protected/pg_service.conf
+  export PGPASSFILE=/path/to/protected/pgpass
+  export PGSERVICE=hoorific-restore-empty  # a new, empty target service
+  pg_restore --exit-on-error --single-transaction \
+    --dbname="service=${PGSERVICE:?Set PGSERVICE to the protected service name}" \
+    "$BACKUP_DIR/hoorific.dump"
+  # Recreate the external encryption Secret from exactly
+  # "$BACKUP_DIR/master.key" in a fresh target without overwriting a
+  # differing Secret, then run the separately configured Helm migration.
+  ;;
+*)
+  echo "HOORIFIC_MODE must be standalone or cluster" >&2
+  exit 2
+  ;;
+esac
 ```
 
-For Kubernetes, restore the database, recreate the externally managed master-key Secret from the exact backed-up bytes, then run the Helm upgrade so the migration hook executes before the Deployment rolls forward. Never create a new key to replace a lost key, and never rotate the key by overwriting this file; use a separately designed key-rotation procedure that can decrypt existing data.
+For standalone, create and review a new configuration before starting anything.
+Its `data_dir`, `storage.sqlite.path`, and `encryption.key_file` must point to the
+restored directory, database, and key—not the old deployment. Then, as a separate
+step using the source-built binary:
+
+```sh
+set -eu
+: "${HOORIFIC_RESTORED_CONFIG:?Set the new reviewed standalone config path}"
+.artifacts/hoorific config validate --config "$HOORIFIC_RESTORED_CONFIG"
+.artifacts/hoorific migrate --config "$HOORIFIC_RESTORED_CONFIG"
+.artifacts/hoorific serve --config "$HOORIFIC_RESTORED_CONFIG"
+```
+
+For Kubernetes, restore PostgreSQL into the new empty target service above,
+recreate the externally managed master-key Secret from the exact backed-up
+bytes without overwriting a differing Secret, and run the Helm upgrade so the
+migration hook executes before the Deployment rolls forward. Do not start an
+old Compose configuration after a restore. Never create a new key to replace a
+lost key, and never rotate the key by overwriting this file; use a separately
+designed key-rotation procedure that can decrypt existing data.
 
 ## Limits of these instructions
 

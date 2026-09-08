@@ -20,7 +20,7 @@ existingSecrets:
   encryption:
     secretName: ""
     key: master-key
-  # Optional Redis secret; its configured key contains a Redis URL.
+  # Required for cluster startup; its configured key contains a Redis URL.
   redis:
     secretName: ""
     key: url
@@ -44,6 +44,7 @@ config:
     keyFile: /etc/hoorific/secrets/encryption-master-key
   coordination:
     redis:
+      # Enable for cluster startup after supplying existingSecrets.redis.
       enabled: false
       urlFile: /etc/hoorific/secrets/redis-url
   oidc:

@@ -613,10 +613,8 @@ class BrowserCases:
 
     def add_list(self, editor: Any, label: str, values: list[str]) -> None:
         for index, value in enumerate(values, 1):
-            editor.get_by_role(
-                "button",
-                name=f"Add {label.lower()} entry",
-                exact=True,
+            editor.get_by_role("group", name=label, exact=True).get_by_role(
+                "button", name=re.compile(r"^Add ")
             ).click()
             editor.get_by_label(f"{label} {index}", exact=True).fill(value)
 
@@ -872,9 +870,8 @@ class BrowserCases:
         )
         if disabled["status"] != 200:
             raise RuntimeError(f"connection disable returned {disabled['status']}")
-        # Disable refreshes the resource version; reload and select it before delete.
-        self.ui.resource("connections")
-        self.ui.select_resource(resource_id)
+        from playwright.sync_api import expect
+        expect(editor.get_by_label("Enabled", exact=True)).not_to_be_checked()
         self.delete_selected("connections", resource_id)
         return {
             "created": True,
@@ -885,24 +882,41 @@ class BrowserCases:
 
     def account_pool_lifecycle(self) -> dict[str, Any]:
         resource_id = self.uid("account-pool")
+        base = self.fixture_connection()
+        connection_id = self.uid("pool-connection")
+        account_id = connection_id + "-account"
+        self.create(
+            "connections", connection_id,
+            lambda form: (
+                form.get_by_label("Connector", exact=True).fill("anthropic"),
+                form.get_by_label("Account ID", exact=True).fill(account_id),
+                form.get_by_label("Base URL", exact=True).fill(base),
+            ),
+        )
         editor = self.create(
             "account_pools",
             resource_id,
-            lambda form: form.get_by_label("Provider", exact=True).fill("anthropic"),
+            lambda form: (
+                form.get_by_label("Provider", exact=True).fill("anthropic"),
+                self.add_list(form, "Account IDs", ["fixture-account"]),
+            ),
         )
         self.selected_id = resource_id
-        self.add_list(editor, "Account IDs", ["fixture-account"])
+        editor.get_by_label("Account IDs 1", exact=True).fill(account_id)
         self.save("account_pools", editor)
         self.delete_selected("account_pools", resource_id)
+        self.ui.resource("connections")
+        self.ui.select_resource(connection_id)
+        self.delete_selected("connections", connection_id)
         return {"created": True, "updated": True, "deleted": True}
 
     def model_lifecycle(self) -> dict[str, Any]:
         resource_id = self.uid("model")
         cache_rates = {
-            "Cache-read nanodollars per million tokens": "500000000",
-            "Cache-write nanodollars per million tokens": "3000000000",
-            "5-minute cache-write nanodollars per million tokens": "4000000000",
-            "1-hour cache-write nanodollars per million tokens": "5000000000",
+            "Cache-read per million tokens": "500000000",
+            "Cache-write per million tokens": "3000000000",
+            "5-minute cache-write per million tokens": "4000000000",
+            "1-hour cache-write per million tokens": "5000000000",
         }
 
         def fill_model(form: Any) -> None:
@@ -920,13 +934,13 @@ class BrowserCases:
             form.get_by_label("Provide price schedule", exact=True).check()
             form.get_by_label("Price version", exact=True).fill("browser-price-v1")
             form.get_by_label(
-                "Input nanodollars per million tokens", exact=True
+                "Input per million tokens", exact=True
             ).fill("1000000000")
             form.get_by_label(
-                "Output nanodollars per million tokens", exact=True
+                "Output per million tokens", exact=True
             ).fill("2000000000")
             form.get_by_label(
-                "Maximum nanodollars per operation unit", exact=True
+                "Maximum cost per operation unit", exact=True
             ).fill("1000000000000")
             for label, value in cache_rates.items():
                 form.get_by_label(label, exact=True).fill(value)
@@ -1408,6 +1422,7 @@ class BrowserCases:
             self.ui.select_resource("fixture-connection")
             panel = self.ui.page.locator("aside.credential-actions").first
             panel.wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
+            panel.locator("summary").filter(has_text="API-key credentials").click()
             status = self.ui.expect_response(
                 "POST",
                 "/connections/fixture-connection/status",
@@ -1470,6 +1485,7 @@ class BrowserCases:
             if not isinstance(rotated_version, int) or rotated_version <= imported_version:
                 raise RuntimeError("credential rotation did not advance metadata version")
 
+            panel.locator("summary").filter(has_text="Revoke credential").click()
             self.ui.page.once("dialog", lambda dialog: dialog.accept())
             revoked = self.ui.expect_response(
                 "POST",
@@ -1515,6 +1531,7 @@ class BrowserCases:
 
             # OAuth/device controls are intentionally unavailable in the default
             # fixture.  Their failure is still a real, observable error contract.
+            panel.locator("summary").filter(has_text="OAuth authorization").click()
             oauth = self.ui.expect_response(
                 "POST",
                 "/connections/fixture-connection/oauth-start",
@@ -1524,6 +1541,7 @@ class BrowserCases:
             )
             if oauth["status"] < 400:
                 raise RuntimeError("unconfigured OAuth unexpectedly succeeded")
+            panel.locator("summary").filter(has_text="Device authorization").click()
             device = self.ui.expect_response(
                 "POST",
                 "/connections/fixture-connection/device-start",
@@ -1559,6 +1577,7 @@ class BrowserCases:
     def api_key_lifecycle(self) -> dict[str, Any]:
         resource_id = self.uid("key")
         self.ui.resource("api_keys")
+        self.ui.page.locator("summary").filter(has_text="Issue an API key").click()
         issue_panel = self.ui.page.locator("section.key-issue").first
         issue_panel.wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
         issue_panel.get_by_label("Key ID", exact=True).fill(resource_id)
@@ -1699,7 +1718,6 @@ class BrowserCases:
             "responses": "/playground/v1/responses",
             "image": "/playground/v1/images/generations",
             "audio": "/playground/v1/audio/speech",
-            "video": "/playground/v1/videos",
         }
         for option, expected_path in mappings.items():
             operation.select_option(option)
@@ -1744,7 +1762,9 @@ class BrowserCases:
         self.ui.page.locator(".stream-output pre").first.wait_for(
             state="visible", timeout=ROUTE_TIMEOUT_MS
         )
-        reset_output = self.ui.page.locator(".stream-output pre").first.inner_text()
+        reset_output = self.ui.page.get_by_role("button", name="Clear output", exact=True).is_disabled()
+        if not reset_output:
+            raise RuntimeError("playground retained response output after reload")
         return {
             "response_status": response["status"],
             "semantic_text": expected_text if expected_text == "OK" else "[redacted]",
@@ -1755,7 +1775,7 @@ class BrowserCases:
             "usage_total": stream["usage_total"],
             "sse_bytes_observed": len(raw),
             "operation_paths_verified": mappings,
-            "reload_reset_output": reset_output == "No output yet.",
+            "reload_reset_output": reset_output,
         }
 
     def admissions_reconciliation(self) -> dict[str, Any]:
@@ -1979,6 +1999,7 @@ class BrowserCases:
         ).wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
 
         self.ui.resource("api_keys")
+        self.ui.page.locator("summary").filter(has_text="Issue an API key").click()
         issue_panel = self.ui.page.locator("section.key-issue").first
         issue_button = issue_panel.get_by_role(
             "button", name="Issue API key", exact=True
@@ -2055,7 +2076,7 @@ class BrowserCases:
             "GET",
             "/config/export",
             lambda: self.ui.page.get_by_role(
-                "button", name="Export", exact=True
+                "button", name="Export snapshot", exact=True
             ).click(),
         )
         if export["status"] != 200:
@@ -2063,30 +2084,26 @@ class BrowserCases:
         self.ui.page.locator("pre.result").first.wait_for(
             state="visible", timeout=ROUTE_TIMEOUT_MS
         )
-        preview = self.ui.expect_response(
-            "POST",
-            "/config/diff",
-            lambda: self.ui.page.get_by_role(
-                "button", name="Preview changes", exact=True
-            ).click(),
-        )
-        if preview["status"] != 400:
-            raise RuntimeError(
-                f"configuration revision guard returned {preview['status']}, expected 400"
-            )
-        self.ui.page.get_by_role("alert").wait_for(
-            state="visible", timeout=ROUTE_TIMEOUT_MS
-        )
+        revision = self.ui.page.get_by_label("Expected configuration revision", exact=True)
+        if not revision.input_value() or int(revision.input_value()) < 1:
+            raise RuntimeError("export did not populate the current configuration revision")
+        preview = self.ui.page.get_by_role("button", name="Preview changes", exact=True)
+        apply = self.ui.page.get_by_role("button", name="Apply", exact=True)
+        if preview.is_enabled() or apply.is_enabled():
+            raise RuntimeError("configuration mutation enabled before a draft was edited")
+        self.ui.page.get_by_label("Configuration JSON", exact=True).fill("{} ")
+        revision.fill("0")
+        if preview.is_enabled() or apply.is_enabled():
+            raise RuntimeError("configuration mutation enabled without a valid revision")
+        self.ui.page.locator("summary").filter(has_text="Manage scoped admin tokens").click()
+        self.ui.page.get_by_role("button", name="Issue scoped token", exact=True).wait_for(state="visible")
         self.ui.goto("/admin/config", "Configuration")
         return {
             "export_status": export["status"],
             "export_result_visible": True,
-            "missing_revision_status": preview["status"],
-            "missing_revision_error_visible": True,
-            "owner_scoped_token_panel_visible": self.ui.page.get_by_role(
-                "heading", name="Scoped admin tokens", exact=True
-            ).count()
-            > 0,
+            "export_populated_revision": True,
+            "unedited_draft_and_missing_revision_blocked": True,
+            "owner_scoped_token_panel_accessible": True,
         }
 
     def mobile_keyboard(self) -> dict[str, Any]:

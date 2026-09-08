@@ -1,47 +1,162 @@
 # Gateway performance benchmark
 
-The benchmark is an external traffic runner, not a server launcher or a synthetic simulator. It sends requests to the supplied gateway URL and to a deterministic loopback upstream. It never claims a comparison unless both targets complete the same measured cases.
+The benchmark has two modes. The default suite provisions invocation-owned
+gateways, databases, Redis coordination, and loopback fixtures; `--suite=false`
+is a manual mode for an already-running gateway. Neither mode builds or
+reconfigures an operator service. Every measured comparison uses the same
+deterministic fixture contract for a direct target and a gateway target.
 
 Reports and paths beginning with `.artifacts/` are private operator-local
 outputs. They are not hosted proof and are not shipped with the repository.
 
-## Prerequisites
+## Complete benchmark suite (default)
 
-Build the gateway separately, then run:
+First complete the [source-build sequence](../README.md#build-from-source), including
+the generated console assets. Then build the benchmark runner, cache the suite
+images, and run the complete suite:
 
 ```sh
-go run ./tools/bench \
+mkdir -p .artifacts
+go build -trimpath -ldflags='-s -w' -o .artifacts/hoorific ./cmd/hoorific
+go build -trimpath -ldflags='-s -w' -o .artifacts/bench-runner ./tools/bench
+
+podman pull docker.io/library/postgres:17
+podman pull docker.io/library/redis:7
+
+.artifacts/bench-runner \
+  --suite \
+  --upstream-transport http \
   --binary .artifacts/hoorific \
-  --output .artifacts/bench \
-  --url-file /run/user/$UID/hoorific-bench-url \
-  --key-file /run/user/$UID/hoorific-bench-key \
-  --deployment standalone \
-  --route native \
-  --gateway-pid 12345
+  --output .artifacts/bench
 ```
 
-The URL file contains the complete HTTP(S) chat-completions endpoint, for example `http://127.0.0.1:8080/v1/chat/completions`. The key file contains only the API key and must not be group/world-readable. `BENCH_GATEWAY_URL` and `BENCH_GATEWAY_KEY` are equivalent environment inputs. Credentials are never written to artifacts or printed. Redirects are rejected so an authorization header cannot be forwarded unexpectedly.
+The suite is Linux-only and requires `/proc`, util-linux `taskset`, local
+rootless Podman (the suite does not fall back to Docker), and permission to use
+logical CPU IDs `0,2,4,6`. The PostgreSQL 17 and Redis 7 images must already be
+available locally; the suite never pulls them. A fresh `suite-<profile>-*`
+directory is created under the output path, with a `suite.json` manifest and
+one child directory per deployment/route pair: standalone/native,
+standalone/translated, cluster/native, and cluster/translated.
 
-The binary path must exist; the runner does not build, start, migrate, or reconfigure it. `--gateway-pid` is optional. Without it, gateway RSS is explicitly unavailable. If supplied, it must be the process whose `/proc/PID/status` is sampled; a supervisor PID is not a gateway measurement.
+Each child runs the complete nine-workload matrix against both direct fixture
+and gateway targets, with three measured runs and a separate warmup for every
+case. A child therefore emits 54 measured records; the four-entry suite emits
+the corresponding matrix independently for each deployment/route pair. The
+suite's fixed measurement window is 30 seconds, warmup is 5 seconds, per-request
+timeout is 15 seconds, and the suite child uses an 85-minute whole-session
+deadline (the manual-mode default is 2 hours). Use a separate output directory
+when collecting the `tls` profile:
 
-The runner starts a fixture on `127.0.0.1:18089` by default. Configure the gateway's model/connection route before starting the runner so the requested model alias reaches that fixture. The fixture route must preserve the benchmark request and return the fixture's deterministic response. The runner performs unary and SSE identity preflight against both direct fixture and gateway URL; a missing or incorrect route is a prerequisite failure, not a successful benchmark. Use `--fixture-listen` only for another loopback address; non-loopback listeners are rejected.
+```sh
+.artifacts/bench-runner \
+  --suite \
+  --upstream-transport tls \
+  --binary .artifacts/hoorific \
+  --output .artifacts/bench-tls
+```
 
-The gateway's runtime entry points remain explicit: `serve --config PATH` starts the gateway and `migrate --config PATH` applies schema migrations. Use the same JSON configuration for the selected deployment, with `schema_version: 1`, explicit `data_dir`, `listeners`, encryption key file, and either SQLite only (`mode: standalone`) or PostgreSQL DSN file only (`mode: cluster`). Do not put a PostgreSQL DSN in a standalone config or SQLite path in a cluster config. Run migration before serving when the deployment requires it, and keep the API key outside the config.
+## Manual provisioned-gateway mode
+
+Use manual mode only with a running gateway that is already configured to route
+the `bench-fixture` alias to the runner's loopback fixture at
+`http://127.0.0.1:18089/v1`. The runner starts that fixture, performs unary and
+SSE identity preflight against the direct fixture and gateway endpoint, and
+then measures all nine workloads. It never starts, migrates, or reconfigures
+the gateway binary.
+
+The manual mode requires `--suite=false` and a private transport-proof JSON in
+addition to the URL and key files:
+
+```sh
+.artifacts/bench-runner \
+  --suite=false \
+  --upstream-transport http \
+  --binary .artifacts/hoorific \
+  --output .artifacts/bench-manual-run \
+  --url-file /run/user/$UID/hoorific-bench-url \
+  --key-file /run/user/$UID/hoorific-bench-key \
+  --transport-proof-file /run/user/$UID/hoorific-bench-transport-proof.json \
+  --fixture-listen 127.0.0.1:18089 \
+  --deployment standalone \
+  --route native
+```
+
+The URL file contains the complete absolute loopback HTTP
+`/v1/chat/completions` endpoint with no userinfo, query, or fragment. The key
+file contains only the raw API key (not a `Bearer` prefix); it must be a
+regular file no larger than 64 KiB with no group/other permission bits and no
+embedded CR/LF. Both files should remain private. Use a fresh output directory:
+the runner writes a permanent profile marker and refuses to reuse a directory
+containing benchmark artifacts.
+
+The proof file must be a regular private JSON object with exactly these nine
+fields, and every endpoint must match the running gateway and the
+`--fixture-listen` address:
+
+```json
+{
+  "profile": "http",
+  "direct_endpoint": "http://127.0.0.1:<fixture-port>/v1/chat/completions",
+  "gateway_endpoint": "http://127.0.0.1:<gateway-port>/v1/chat/completions",
+  "gateway_upstream": "http://127.0.0.1:<fixture-port>/v1",
+  "fixture_origin": "http://127.0.0.1:<fixture-port>",
+  "ca_file": "",
+  "ca_sha256": "",
+  "bridge_present": false,
+  "source": "manual configuration assertion"
+}
+```
+
+For `tls`, use a matching HTTPS direct endpoint, private CA file and digest,
+and `bridge_present: true`; do not reuse an HTTP proof. A proof generated by a
+suite-owned entry is acceptable only while its endpoints and profile still
+describe the current run. Missing, extra, null, or mismatched proof fields are
+setup failures.
+The client-to-gateway endpoint remains HTTP even in the `tls` profile; that
+profile qualifies the direct/upstream TLS path, not end-to-end gateway TLS.
+
+`--gateway-pid` is optional; when supplied it must be the actual gateway
+process whose `/proc/PID/status` is sampled, not a supervisor. A bounded manual
+measurement may set `--duration`, `--warmup`, and `--request-timeout` to `1s`
+(the minimum accepted value), but it still runs every workload, target, and
+measured repetition; do not present a shortened run as the complete suite.
 
 ## Deployment and protocol prerequisites
 
-`--deployment standalone|cluster` and `--route native|translated` are required annotations. They are recorded as environment metadata; the runner does not infer topology or protocol translation. Standalone and cluster runs must be collected separately. A native route means the gateway's native request/stream codec is exercised. A translated route means the configured adapter is deliberately exercised. Results from these modes must not be merged or presented as a universal protocol comparison.
+`--deployment standalone|cluster` and `--route native|translated` are required
+annotations in manual mode and are recorded as metadata; the runner does not
+infer topology or protocol translation. Standalone and cluster runs, and native
+and translated routes, must be collected separately. A native route exercises
+the gateway's native request/stream codec. A translated route deliberately
+exercises the configured adapter. Do not merge these modes or present them as
+universal protocol comparisons.
 
 ## Fixed workload matrix
 
-Every case has three independent measured runs and a separate warmup. Warmup observations are retained but never included in measured percentiles. The runner uses bounded request deadlines and a whole-session deadline; interruption or timeout leaves an incomplete artifact.
+Every case has three independent measured runs and a separate warmup. Warmup
+observations are retained but never included in measured percentiles. The runner
+uses bounded request deadlines and a whole-session deadline; interruption or
+timeout leaves an incomplete artifact.
 
-* Unary: 1 KiB and 64 KiB input, 1 KiB output, offered 1000 requests/s, concurrency 64.
-* SSE: 1 KiB and 64 KiB input, 128 non-empty events, 1 ms event spacing, offered 1000 requests/s, concurrency 256.
-* Closed-loop SSE: 1 KiB input, 128 events, concurrency 1 and 64. A new request is admitted only after the previous stream in that slot completes.
-* Slow-reader SSE: 1000 simultaneous streams using 1 KiB input, with the response consumed deliberately slowly. This case is intentionally bounded and is not replaced by a smaller load when resources are insufficient.
+* Unary (`unary_1k_1000rps_c64`, `unary_64k_1000rps_c64`): 1 KiB or 64 KiB
+  input, 1 KiB output, offered 1000 requests/s, concurrency 64.
+* Offered SSE (`sse_1k_1000rps_c256`, `sse_64k_1000rps_c256`): 1 KiB or 64 KiB
+  input, 128 non-empty events, 1 ms event spacing, offered 1000 requests/s,
+  concurrency 256.
+* Closed-loop SSE (`closed_loop_sse_1k_c1`, `closed_loop_sse_1k_c64`,
+  `closed_loop_sse_64k_c1`, `closed_loop_sse_64k_c64`): 1 KiB or 64 KiB
+  input, 128 events, concurrency 1 or 64. A new request is admitted only
+  after the previous stream in that slot completes.
+* Slow-reader SSE (`slow_sse_1000`): 1000 simultaneous streams using 1 KiB
+  input. The runner reads the first event, deliberately leaves response bodies
+  unread during the bounded hold, and then cancels all streams. This case is
+  not replaced by a smaller load when resources are insufficient.
 
-Input contains a per-session challenge nonce. Successful output must retain that nonce and the exact fixture shape. An incomplete stream, malformed SSE, HTTP rejection, timeout, or content mismatch is an error. Offered arrivals rejected because all configured concurrency slots are occupied are counted as dropped arrivals; the runner never lowers the rate to make a case pass.
+Input contains a benchmark-invocation challenge nonce. Successful output must
+retain that nonce and the exact fixture shape. An incomplete stream, malformed
+SSE, HTTP rejection, timeout, or content mismatch is an error. Offered arrivals
+rejected because all configured concurrency slots are occupied are counted as
+dropped arrivals; the runner never lowers the rate to make a case pass.
 
 ## Metrics and artifacts
 
@@ -102,7 +217,12 @@ runtime has no shell.
 ### Historical local reference measurement
 
 The table below records one Linux/amd64 comparison made with Podman 6.1.0 and
-the same pinned Go/Bun base images. Medians are from two serial runs on one
+the same pinned Go/Bun base images. It is the snapshot summarized in the private
+`.artifacts/image-review-proof.json` and final report
+`.artifacts/image-build-comparison-final.json` (run
+`20260907t193707z-1478adb3e7`, started
+`2026-09-07T19:37:07.869337Z`, finished
+`2026-09-07T19:41:37.881519Z`). Medians are from two serial runs on one
 machine. They are workload-specific observations, not CI timing guarantees,
 capacity commitments, or a promise about another builder.
 
