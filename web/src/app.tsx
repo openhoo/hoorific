@@ -23,6 +23,14 @@ import {
   ArrowRight,
   BookOpen,
   Boxes,
+  Building2,
+  Cpu,
+  Fingerprint,
+  Gauge,
+  Layers3,
+  ListChecks,
+  LockKeyhole,
+  Tags,
   Check,
   ChevronRight,
   CircleHelp,
@@ -180,6 +188,26 @@ const RESOURCE_GROUPS: Array<{
   { label: 'Operations', icon: Activity, kinds: ['usage_ledger', 'audit_events', 'upstream_operations', 'admissions', 'reconciliations'] },
   { label: 'Access & identity', icon: KeyRound, kinds: ['api_keys', 'tenants', 'operators', 'role_bindings'] },
 ];
+
+const RESOURCE_ICONS: Record<ResourceKind, typeof Users> = {
+  connections: Network,
+  credentials: LockKeyhole,
+  oauth_sessions: Fingerprint,
+  account_pools: Layers3,
+  models: Cpu,
+  model_aliases: Tags,
+  route_policies: RouteIcon,
+  policy_limits: Gauge,
+  usage_ledger: Activity,
+  audit_events: FileClock,
+  upstream_operations: CloudCog,
+  admissions: ListChecks,
+  reconciliations: ClipboardCheck,
+  api_keys: KeyRound,
+  tenants: Building2,
+  operators: Users,
+  role_bindings: ShieldCheck,
+};
 
 const TENANCY_KINDS = ['tenants', 'operators', 'role_bindings'] as const;
 
@@ -1663,7 +1691,7 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
 
   const navLink = (kind: string, label: string, icon: typeof LayoutDashboard) => {
     const Icon = icon;
-    return <NavLink key={kind} to={kind === 'overview' ? '/admin/' : `/admin/${kind}`} end={kind === 'overview'} onClick={closeMobileNav} className={({ isActive }) => cn('group flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition', isActive ? 'bg-indigo-600 text-white shadow-sm' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-white')}><Icon className="h-4 w-4 shrink-0" aria-hidden="true" /><span className="truncate">{label}</span></NavLink>;
+    return <NavLink key={kind} to={kind === 'overview' ? '/admin/' : `/admin/${kind}`} end={kind === 'overview'} onClick={closeMobileNav} className={({ isActive }) => cn('group flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition', isActive ? 'bg-indigo-600 text-white shadow-sm' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-white')}><Icon className="h-[18px] w-[18px] shrink-0" strokeWidth={1.75} aria-hidden="true" /><span className="truncate">{label}</span></NavLink>;
   };
 
   return (
@@ -1686,7 +1714,7 @@ function Dashboard({ session, onChanged }: { session: Session; onChanged: (next:
             const GroupIcon = group.icon;
             const kinds = group.kinds.filter((kind) => visible.includes(kind));
             if (!kinds.length) return null;
-            return <div key={group.label}><div className="mb-1.5 flex items-center gap-2 px-3 text-[0.68rem] font-semibold uppercase tracking-[0.16em] text-zinc-400"><GroupIcon className="h-3.5 w-3.5" aria-hidden="true" />{group.label}</div><div className="space-y-0.5">{kinds.map((kind) => navLink(kind, LABELS[kind], group.icon))}</div></div>;
+            return <div key={group.label}><div className="mb-1.5 flex items-center gap-2 px-3 text-[0.68rem] font-semibold uppercase tracking-[0.16em] text-zinc-400"><GroupIcon className="h-3.5 w-3.5" aria-hidden="true" />{group.label}</div><div className="space-y-0.5">{kinds.map((kind) => navLink(kind, LABELS[kind], RESOURCE_ICONS[kind]))}</div></div>;
           })}
           {canConfig && <div>{navLink('config', 'Configuration', Settings2)}</div>}
         </nav>
