@@ -46,7 +46,7 @@ type report struct {
 func main() {
 	binary := flag.String("binary", "", "built gateway executable (required)")
 	mode := flag.String("mode", "standalone", "standalone or cluster")
-	scenario := flag.String("scenario", "all", "all, smoke, protocol, sdk, browser, security, streaming, resources, governance, cluster/governance, credentials, credential-lifecycle, realtime, realtime/bedrock, operations, operations/fal, cost-safety, deep-admin, deep-protocol, packaging, live")
+	scenario := flag.String("scenario", "all", "all, smoke, protocol, docs-capture, sdk, browser, security, streaming, resources, governance, cluster/governance, credentials, credential-lifecycle, realtime, realtime/bedrock, operations, operations/fal, cost-safety, deep-admin, deep-protocol, packaging, live")
 	allowPaid := flag.Bool("allow-paid", false, "permit explicitly requested live qualification (still requires credentials)")
 	connections := flag.String("connections", "", "comma-separated configured connection IDs for live qualification")
 	keyFile := flag.String("gateway-key-file", "", "optional gateway key file for routed scenarios")
@@ -100,7 +100,7 @@ func main() {
 		finish(rep, *out)
 		os.Exit(2)
 	}
-	valid := map[string]bool{"all": true, "smoke": true, "protocol": true, "sdk": true, "security": true, "streaming": true, "resources": true, "governance": true, "cluster/governance": true, "credentials": true, "credential-lifecycle": true, "realtime": true, "realtime/bedrock": true, "operations": true, "operations/fal": true, "cost-safety": true, "packaging": true}
+	valid := map[string]bool{"all": true, "smoke": true, "protocol": true, "docs-capture": true, "sdk": true, "browser": true, "security": true, "streaming": true, "resources": true, "governance": true, "cluster/governance": true, "credentials": true, "credential-lifecycle": true, "realtime": true, "realtime/bedrock": true, "operations": true, "operations/fal": true, "cost-safety": true, "packaging": true}
 	valid["deep-admin"], valid["deep-protocol"] = true, true
 	valid["browser"] = true
 	if !valid[*scenario] {
@@ -120,6 +120,11 @@ func main() {
 	}
 	if *scenario == "cluster/governance" && *mode != "cluster" {
 		add(result{"setup", "failed", "cluster/governance requires --mode cluster", 0, nil})
+		finish(rep, *out)
+		os.Exit(2)
+	}
+	if *scenario == "docs-capture" && *keepAlive <= 0 {
+		add(result{"setup", "failed", "docs-capture requires a positive --keep-alive duration", 0, nil})
 		finish(rep, *out)
 		os.Exit(2)
 	}

@@ -128,6 +128,55 @@ jobs:
             --mode standalone \
             --scenario browser \
             --output .artifacts/verify-browser-e2e.json
+      - name: Capture public console screenshots
+        run: |
+          set -euo pipefail
+          rm -rf .artifacts/docs-assets
+          mkdir -p .artifacts/docs-assets
+          python tools/verify/sdk/capture_docs.py \
+            --binary .artifacts/hoorific \
+            --verifier .artifacts/hoorific-verify \
+            --output-dir .artifacts/docs-assets
+
+      - name: Validate public console screenshot set
+        env:
+          SCREENSHOT_DIR: .artifacts/docs-assets
+        run: |
+          set -euo pipefail
+          expected=(
+            console.webp
+            console-login.webp
+            console-models.webp
+            console-model-editor.webp
+            console-playground.webp
+            console-mobile.webp
+          )
+          test -d "$SCREENSHOT_DIR"
+          test ! -L "$SCREENSHOT_DIR"
+          test -z "$(find "$SCREENSHOT_DIR" -mindepth 2 -print -quit)"
+          mapfile -t actual < <(find "$SCREENSHOT_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${#actual[@]}" -eq "${#expected_sorted[@]}"
+          for index in "${!expected_sorted[@]}"; do
+            test "${actual[$index]}" = "${expected_sorted[$index]}"
+            test -f "$SCREENSHOT_DIR/${actual[$index]}"
+            test ! -L "$SCREENSHOT_DIR/${actual[$index]}"
+          done
+
+      - name: Upload public console screenshots
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hoorific-console-screenshots-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            .artifacts/docs-assets/console.webp
+            .artifacts/docs-assets/console-login.webp
+            .artifacts/docs-assets/console-models.webp
+            .artifacts/docs-assets/console-model-editor.webp
+            .artifacts/docs-assets/console-playground.webp
+            .artifacts/docs-assets/console-mobile.webp
+
 
       - name: Run isolated PostgreSQL and Redis qualification
         env:
@@ -164,3 +213,157 @@ jobs:
             .artifacts/verify-standalone.json
             .artifacts/verify-browser-e2e.json
             .artifacts/verify-cluster-governance.json
+
+  publish-console-screenshots:
+    name: Publish console screenshots
+    needs: verify
+    if: >-
+      ${{
+        needs.verify.result == 'success' &&
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/main' &&
+        github.repository == 'openhoo/hoorific'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-console-screenshots-main
+      cancel-in-progress: false
+    steps:
+      - name: Check out originating commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download public console screenshots
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hoorific-console-screenshots-${{ github.sha }}
+          path: .artifacts/public-console-screenshots
+
+      - name: Validate downloaded screenshots
+        env:
+          SCREENSHOT_DIR: .artifacts/public-console-screenshots
+        run: |
+          set -euo pipefail
+          expected=(
+            console.webp
+            console-login.webp
+            console-models.webp
+            console-model-editor.webp
+            console-playground.webp
+            console-mobile.webp
+          )
+          test -d "$SCREENSHOT_DIR"
+          test ! -L "$SCREENSHOT_DIR"
+          while IFS= read -r -d '' path; do
+            test ! -L "$path"
+            test -f "$path"
+          done < <(find "$SCREENSHOT_DIR" -mindepth 1 -print0)
+          test -z "$(find "$SCREENSHOT_DIR" -mindepth 2 -print -quit)"
+          mapfile -t actual < <(find "$SCREENSHOT_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${#actual[@]}" -eq "${#expected_sorted[@]}"
+          for index in "${!expected_sorted[@]}"; do
+            test "${actual[$index]}" = "${expected_sorted[$index]}"
+          done
+          for name in "${expected[@]}"; do
+            path="$SCREENSHOT_DIR/$name"
+            test -f "$path"
+            test ! -L "$path"
+            test ! -x "$path"
+            mode="$(stat -c '%a' -- "$path")"
+            case "$mode" in
+              *[1357]*)
+                echo "refusing executable downloaded content: $path" >&2
+                exit 1
+                ;;
+            esac
+            header="$(od -An -tx1 -N 12 -- "$path" | tr -d '[:space:]')"
+            test "${header:0:8}" = "52494646"
+            test "${header:16:8}" = "57454250"
+          done
+
+      - name: Check originating main revision
+        id: freshness
+        env:
+          ORIGIN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ORIGIN_SHA"
+          git fetch --no-tags origin main
+          current="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$current" = "$ORIGIN_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main advanced beyond $ORIGIN_SHA; skipping screenshot publication"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy validated screenshots
+        if: steps.freshness.outputs.current == 'true'
+        env:
+          SCREENSHOT_DIR: .artifacts/public-console-screenshots
+        run: |
+          set -euo pipefail
+          test -d docs/assets
+          test ! -L docs/assets
+          for name in \
+            console.webp \
+            console-login.webp \
+            console-models.webp \
+            console-model-editor.webp \
+            console-playground.webp \
+            console-mobile.webp
+          do
+            destination="docs/assets/$name"
+            test ! -L "$destination"
+            test ! -d "$destination"
+            install -m 0644 -- "$SCREENSHOT_DIR/$name" "$destination"
+          done
+
+      - name: Commit and push changed screenshots
+        if: steps.freshness.outputs.current == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          paths=(
+            docs/assets/console.webp
+            docs/assets/console-login.webp
+            docs/assets/console-models.webp
+            docs/assets/console-model-editor.webp
+            docs/assets/console-playground.webp
+            docs/assets/console-mobile.webp
+          )
+          git add -- "${paths[@]}"
+          if git diff --cached --quiet -- "${paths[@]}"; then
+            echo "public console screenshots are unchanged; nothing to publish"
+            exit 0
+          fi
+          staged="$(git diff --cached --name-only)"
+          while IFS= read -r path; do
+            case "$path" in
+              docs/assets/console.webp|\
+              docs/assets/console-login.webp|\
+              docs/assets/console-models.webp|\
+              docs/assets/console-model-editor.webp|\
+              docs/assets/console-playground.webp|\
+              docs/assets/console-mobile.webp)
+                ;;
+              *)
+                echo "unexpected staged path: $path" >&2
+                exit 1
+                ;;
+            esac
+          done <<< "$staged"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs: refresh console screenshots"
+          auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 --wrap=0)"
+          git -c "http.extraheader=AUTHORIZATION: basic $auth" \
+            push origin HEAD:refs/heads/main

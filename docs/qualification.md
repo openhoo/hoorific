@@ -25,8 +25,9 @@ CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
   -o .artifacts/hoorific ./cmd/hoorific
 CGO_ENABLED=0 go build -trimpath -tags qualification -ldflags='-s -w' \
   -o .artifacts/hoorific-qualification ./cmd/hoorific
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+  -o .artifacts/hoorific-verify ./tools/verify
 ```
-
 The verifier's SDK runner uses Python 3.13. Use one project-local environment
 for every verifier invocation. Choose either the `uv` setup or the standard
 library fallback; do not install into a different system interpreter:
@@ -300,6 +301,46 @@ and the deterministic gateway/fixture; it does not contact a paid provider.
 Wait for `browser-results.json` and screenshots to be written, then interrupt
 the first command. Do not combine this manual flow with the automated browser
 scenario or treat the keep-alive report row as an assertion of UI behavior.
+
+## Public console screenshot capture
+
+The public documentation images are not browser-evidence screenshots. After
+building the release and verifier binaries and installing the pinned Chromium
+dependencies, regenerate all six images with the same deterministic fixture
+and real server used by the repository:
+
+```sh
+.artifacts/sdk-venv/bin/python tools/verify/sdk/capture_docs.py \
+  --binary .artifacts/hoorific \
+  --verifier .artifacts/hoorific-verify \
+  --output-dir docs/assets
+```
+
+The command owns its isolated process, synthetic data, browser, and cleanup; it
+exits nonzero when any capture is incomplete and writes exactly:
+
+- `docs/assets/console.webp`
+- `docs/assets/console-login.webp`
+- `docs/assets/console-models.webp`
+- `docs/assets/console-model-editor.webp`
+- `docs/assets/console-playground.webp`
+- `docs/assets/console-mobile.webp`
+
+Read each WebP back from disk before staging. The automated `--scenario browser`
+procedure above writes private screenshots and browser state below
+`.artifacts/verify-browser-e2e.json.browser`; those files and the qualification
+reports are evidence, not public documentation assets, and must stay excluded.
+
+CI runs this capture on pull requests and `main` pushes and uploads only the
+six listed files as `hoorific-console-screenshots-<commit-sha>`. Publication
+is a separate job with `contents: write` and runs only after the verification
+job succeeds for a trusted `main` push; verification retains `contents: read`
+and PR runs have no write permission. The publisher checks out the exact
+originating SHA with credentials disabled, validates the staged files as
+regular non-executable WebPs, rejects stale `main` revisions, and performs a
+normal non-force `GITHUB_TOKEN` bot push only when the images changed. Private
+qualification evidence is never uploaded as this artifact.
+
 
 ## Evidence interpretation
 

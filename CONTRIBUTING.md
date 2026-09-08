@@ -156,21 +156,45 @@ artifacts.
 ## Maintaining console screenshots
 
 Use the real console against a fresh, isolated verifier fixture/runtime; do not
-mock the page or use production data.
+mock the page or use production data. After the fresh-checkout build and browser
+dependency setup, regenerate the public images with the reproducible command:
 
-1. Follow the [fresh-checkout build order](#fresh-checkout-build-order) before
-   starting the binary so screenshots include the current source console. For
-   an interactive window, use the existing [browser console
-   proof](docs/qualification.md#browser-console-proof-manual-keep-alive) and its verifier
-   `--keep-alive` option.
-2. Capture only synthetic fixture data. Save WebP images framed to remain
-   readable on desktop and mobile, and include descriptive alt text plus a
-   short caption that names the workflow.
-3. Verify that each saved file exists and opens from its committed path by
-   reading it back from disk; a tool or browser preview alone is not proof that
-   an asset was saved. Commit only intended WebP files under `docs/assets/`,
-   never `.artifacts/`, browser storage, credentials, unredacted real-provider
-   responses, or other secrets.
+```sh
+.artifacts/sdk-venv/bin/python tools/verify/sdk/capture_docs.py \
+  --binary .artifacts/hoorific \
+  --verifier .artifacts/hoorific-verify \
+  --output-dir docs/assets
+```
+
+The capture command owns a fresh real-server deterministic fixture and cleanup,
+uses only synthetic data, and exits nonzero on an incomplete capture. It writes
+exactly these six public WebP assets:
+
+- `docs/assets/console.webp`
+- `docs/assets/console-login.webp`
+- `docs/assets/console-models.webp`
+- `docs/assets/console-model-editor.webp`
+- `docs/assets/console-playground.webp`
+- `docs/assets/console-mobile.webp`
+
+The automated `--scenario browser` run is separate: its screenshots, browser
+storage state, temporary keys, databases, and diagnostics remain private under
+`.artifacts/` and must not be copied into these paths. Read each generated file
+back from its committed path before staging; a browser preview alone is not
+proof that an asset was saved. Never commit `.artifacts/`, credentials,
+unredacted provider responses, or other private evidence.
+
+On pull requests and pushes to `main`, CI runs this capture after the browser
+qualification and uploads an artifact named
+`hoorific-console-screenshots-<commit-sha>` containing only these six files.
+The verification job has `contents: read`; the separate publication job has
+`contents: write` only and runs only after a successful trusted `main` push.
+It checks out the originating SHA with checkout credentials disabled, validates
+regular non-executable files and WebP signatures in a staging directory, and
+copies only changed assets. A normal non-force `GITHUB_TOKEN` push by
+`github-actions[bot]` avoids CI recursion. Pull requests cannot publish, and
+unchanged or stale source revisions do not mutate `main`.
+
 
 ## Container image
 
