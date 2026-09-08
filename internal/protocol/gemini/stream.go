@@ -17,6 +17,7 @@ type streamDecoder struct {
 	started, finished, terminal bool
 	toolSeen                    bool
 	id, model                   string
+	usage                       *core.Usage
 	active                      map[core.Index]string
 	textIndex                   core.Index
 	textOpen                    bool
@@ -82,7 +83,7 @@ func (s *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 		return s.Next(ctx)
 	}
 	var v response
-	if e = decode([]byte(f.Data), &v); e != nil {
+	if e = decodeResponseData([]byte(f.Data), &v); e != nil {
 		return nil, e
 	}
 	if v.ID != "" {
@@ -96,10 +97,14 @@ func (s *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 		s.pending = append(s.pending, core.Start{ID: s.id, Model: s.model})
 	}
 	if v.Usage != nil {
-		if e := validUsage(v.Usage); e != nil {
+		u, e := usageCore(v.Usage)
+		if e != nil {
 			return nil, e
 		}
-		s.pending = append(s.pending, core.Usage{Input: v.Usage.Input, Output: v.Usage.Output, Total: v.Usage.Total, Source: "provider"})
+		if s.usage != nil && !sameUsage(s.usage, u) {
+			return nil, invalid("duplicate usageMetadata")
+		}
+		s.usage = u
 	}
 	if len(v.Candidates) > 1 {
 		return nil, unsupported("multiple candidates")
@@ -173,20 +178,65 @@ func (s *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			if err != nil {
 				return nil, err
 			}
-			for ix := range s.active {
-				s.pending = append(s.pending, core.BlockEnd{Index: ix})
-				delete(s.active, ix)
-			}
-			s.textOpen = false
-			s.pending = append(s.pending, fin)
-			s.finished = true
+			return s.finishStream(fin)
 		}
+		if blocked(c.SafetyRatings) {
+			return s.finishStream(core.Finish{Reason: "content_filter", Status: "content_filter"})
+		}
+	} else if v.PromptFeedback != nil {
+		fin, err := promptFinish(v.PromptFeedback)
+		if err != nil {
+			return nil, err
+		}
+		return s.finishStream(fin)
 	}
 	if e, ok := s.pendingEvent(); ok {
 		return e, nil
 	}
 	return s.Next(ctx)
 }
+func sameCount(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func sameUsage(a, b *core.Usage) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return sameCount(a.Input, b.Input) &&
+		sameCount(a.Output, b.Output) &&
+		sameCount(a.Total, b.Total) &&
+		sameCount(a.CachedInput, b.CachedInput) &&
+		sameCount(a.ReasoningOutput, b.ReasoningOutput) &&
+		sameCount(a.ToolInput, b.ToolInput) &&
+		sameCount(a.CacheWriteInput, b.CacheWriteInput) &&
+		sameCount(a.CacheWrite5mInput, b.CacheWrite5mInput) &&
+		sameCount(a.CacheWrite1hInput, b.CacheWrite1hInput) &&
+		a.Source == b.Source
+}
+
+func (s *streamDecoder) finishStream(fin core.Finish) (core.Event, error) {
+	for ix := range s.active {
+		s.pending = append(s.pending, core.BlockEnd{Index: ix})
+		delete(s.active, ix)
+	}
+	s.textOpen = false
+	if s.usage != nil {
+		s.pending = append(s.pending, *s.usage)
+		s.usage = nil
+	}
+	s.pending = append(s.pending, fin)
+	s.finished = true
+	e, ok := s.pendingEvent()
+	if !ok {
+		return nil, invalid("stream finish")
+	}
+	return e, nil
+}
+
 func (s *streamDecoder) pendingEvent() (core.Event, bool) {
 	if len(s.pending) == 0 {
 		return nil, false
@@ -343,8 +393,8 @@ func (s *streamEncoder) Write(ctx context.Context, ev core.Event) error {
 		if !s.started {
 			return invalid("usage before start")
 		}
-		u := &usage{Input: v.Input, Output: v.Output, Total: v.Total}
-		if e := validUsage(u); e != nil {
+		u, e := usageWire(&v)
+		if e != nil {
 			return e
 		}
 		return s.emit(ctx, response{ID: s.id, Model: s.model, Usage: u})

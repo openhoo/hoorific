@@ -69,7 +69,9 @@ func New(opts ...endpoint.Option) *Connector {
 
 func (c *Connector) EndpointsFor(conn core.Connection) ([]core.NativeEndpoint, error) {
 	task := conn.Settings["hf.task"]
-	if task == "" { return nil, invalid("hf.task must explicitly select the inference task") }
+	if task == "" {
+		return nil, invalid("hf.task must explicitly select the inference task")
+	}
 	for _, route := range c.routes {
 		if route.Action == "inference."+task {
 			return []core.NativeEndpoint{route.NativeEndpoint}, nil
@@ -80,10 +82,14 @@ func (c *Connector) EndpointsFor(conn core.Connection) ([]core.NativeEndpoint, e
 
 func (c *Connector) DescriptorFor(conn core.Connection) (core.ConnectorDescriptor, error) {
 	endpoints, err := c.EndpointsFor(conn)
-	if err != nil { return core.ConnectorDescriptor{}, err }
+	if err != nil {
+		return core.ConnectorDescriptor{}, err
+	}
 	route, err := c.selected(conn, endpoints[0].Operation)
-	if err != nil { return core.ConnectorDescriptor{}, err }
-	return core.ConnectorDescriptor{ID:"huggingface", Protocols:[]core.Protocol{route.Protocol}, Operations:[]core.Operation{route.Operation}}, nil
+	if err != nil {
+		return core.ConnectorDescriptor{}, err
+	}
+	return core.ConnectorDescriptor{ID: "huggingface", Protocols: []core.Protocol{route.Protocol}, Operations: []core.Operation{route.Operation}}, nil
 }
 
 func invalid(message string) error {

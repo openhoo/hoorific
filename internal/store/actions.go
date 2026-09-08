@@ -5,9 +5,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hoorific/internal/admin"
 	"hoorific/internal/core"
+	"hoorific/internal/policy"
 	"strings"
 	"time"
 )
@@ -135,19 +137,11 @@ func (s *Store) Reconcile(ctx context.Context, p core.Principal, admission strin
 			return storeError("reconciliation_evidence_required", 400)
 		}
 		if r.Usage != nil {
-			for _, n := range []*int64{r.Usage.Input, r.Usage.Output, r.Usage.Total} {
-				if n != nil && *n < 0 {
-					return storeError("invalid_reconciliation_usage", 400)
-				}
+			normalized, valid, totalKnown := normalizeUsage(r.Usage)
+			if !valid || normalized == nil || normalized.Input != nil && normalized.Output != nil && !totalKnown {
+				return storeError("invalid_reconciliation_usage", 400)
 			}
-			if r.Usage.Input != nil && r.Usage.Output != nil {
-				if *r.Usage.Input > int64(^uint64(0)>>1)-*r.Usage.Output {
-					return storeError("invalid_reconciliation_usage", 400)
-				}
-				if r.Usage.Total != nil && *r.Usage.Total != *r.Usage.Input+*r.Usage.Output {
-					return storeError("invalid_reconciliation_usage", 400)
-				}
-			}
+			r.Usage = normalized
 		}
 		env, state, attemptVersion, e := s.loadAttempt(ctx, tx, p.TenantID, admission)
 		if e == sql.ErrNoRows {
@@ -166,8 +160,21 @@ func (s *Store) Reconcile(ctx context.Context, p core.Principal, admission strin
 			return storeError("attempt_not_reconcilable", 409)
 		}
 		charge := env.ChargedCost
-		if r.Mode == "provider_evidence" && r.Cost != nil {
-			charge = *r.Cost
+		chargeKnown := env.ChargedCostKnown || env.ChargedCost != 0
+		if r.Mode == "provider_evidence" {
+			if r.Cost != nil {
+				charge = *r.Cost
+				chargeKnown = true
+			} else if r.Usage != nil {
+				if estimated, estimateErr := policy.EstimateUsageCost(r.Usage, env.Price); estimateErr == nil {
+					charge = estimated
+					chargeKnown = true
+				} else if !errors.Is(estimateErr, policy.ErrUnknownCost) {
+					// Preserve the evidence for later correction, but do
+					// not invent a charge from an invalid/overflowed value.
+					chargeKnown = false
+				}
+			}
 		} else if r.Mode == "charge_reserved_maximum" {
 			if env.Plan.MaximumCost != nil {
 				charge = *env.Plan.MaximumCost
@@ -186,58 +193,70 @@ func (s *Store) Reconcile(ctx context.Context, p core.Principal, admission strin
 					return storeError("reconciliation_maximum_unavailable", 409)
 				}
 			}
+			chargeKnown = true
 		}
-		if charge < 0 {
+		if chargeKnown && charge < 0 {
 			return storeError("reconciliation_maximum_unavailable", 409)
 		}
 		var tokens *int64
 		if r.Mode == "provider_evidence" && r.Usage != nil {
 			tokens = r.Usage.Total
-			if tokens == nil && r.Usage.Input != nil && r.Usage.Output != nil {
-				total := *r.Usage.Input + *r.Usage.Output
-				tokens = &total
-			}
 		}
 		for i, a := range env.Plan.Allowances {
+			var target *int64
 			switch a.Kind {
 			case "cost":
-				if e = s.adjustHold(ctx, tx, &env, i, charge); e != nil {
-					return e
+				if chargeKnown {
+					target = &charge
 				}
 			case "tokens":
-				if tokens != nil {
-					if e = s.adjustHold(ctx, tx, &env, i, *tokens); e != nil {
-						return e
-					}
-				}
+				target = tokens
 			case "concurrency":
-				if e = s.adjustHold(ctx, tx, &env, i, 0); e != nil {
+				zero := int64(0)
+				target = &zero
+			}
+			if target == nil {
+				continue
+			}
+			if *target > env.Held[i] {
+				if e = s.adjustIncurredHold(ctx, tx, &env, i, *target); e != nil {
 					return e
 				}
+			} else if e = s.adjustHold(ctx, tx, &env, i, *target); e != nil {
+				return e
 			}
 		}
 		if env.ChargedCost < 0 {
 			return storeError("invalid_accounting_state", 409)
 		}
-		delta := charge - env.ChargedCost
+		var chargedCost, delta *int64
+		var ledgerAmount any
+		if chargeKnown {
+			charged := charge
+			difference := charge - env.ChargedCost
+			chargedCost, delta, ledgerAmount = &charged, &difference, difference
+		}
 		result, e := json.Marshal(struct {
 			core.Reconciliation
 			Admission        string `json:"admission_id"`
 			AdmissionVersion int64  `json:"admission_version"`
 			State            string `json:"state"`
 			Reconciled       bool   `json:"reconciled"`
-			ChargedCost      int64  `json:"charged_cost"`
-			Delta            int64  `json:"delta"`
-		}{r, admission, attemptVersion + 1, state, true, charge, delta})
+			ChargedCost      *int64 `json:"charged_cost,omitempty"`
+			Delta            *int64 `json:"delta,omitempty"`
+		}{r, admission, attemptVersion + 1, state, true, chargedCost, delta})
 		if e != nil {
 			return e
 		}
 		effectKind := "reconciliation:" + r.ReconciliationID
-		if _, e = tx.ExecContext(ctx, s.Query("INSERT INTO usage_ledger(tenant_id,effect_id,attempt_id,effect_kind,amount,data,created_at) VALUES (?,?,?,?,?,?,?)"), p.TenantID, effectKind, admission, effectKind, delta, string(result), time.Now().Unix()); e != nil {
+		if _, e = tx.ExecContext(ctx, s.Query("INSERT INTO usage_ledger(tenant_id,effect_id,attempt_id,effect_kind,amount,data,created_at) VALUES (?,?,?,?,?,?,?)"), p.TenantID, effectKind, admission, effectKind, ledgerAmount, string(result), time.Now().Unix()); e != nil {
 			return e
 		}
 		env.Reconciled = true
-		env.ChargedCost = charge
+		if chargeKnown {
+			env.ChargedCost = charge
+			env.ChargedCostKnown = true
+		}
 		env.UpdatedAt = time.Now().Unix()
 		if r.Mode == "provider_evidence" {
 			env.AcceptedEvidence = r.SourceReference
@@ -245,7 +264,9 @@ func (s *Store) Reconcile(ctx context.Context, p core.Principal, admission strin
 		if env.Outcome == nil {
 			env.Outcome = &core.AttemptOutcome{TenantID: p.TenantID, RequestID: env.Plan.RequestID, AttemptID: admission, State: state}
 		}
-		env.Outcome.ActualCost = &charge
+		if chargeKnown {
+			env.Outcome.ActualCost = &charge
+		}
 		if r.Mode == "provider_evidence" && r.Usage != nil {
 			env.Outcome.Usage = r.Usage
 		}

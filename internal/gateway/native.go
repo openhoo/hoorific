@@ -13,6 +13,7 @@ import (
 
 	"hoorific/internal/core"
 	"hoorific/internal/resource"
+	"hoorific/internal/transport"
 )
 
 const nativeAckLimit = 1 << 20
@@ -119,10 +120,11 @@ func (g *Gateway) prepareNativeResponse(ctx context.Context, request *http.Reque
 	if err := g.rewriteNativeHeaders(durable, response, p, t, b); err != nil {
 		return state, err
 	}
-	var data []byte
 	original := response.Body
+	var data []byte
 	if strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") && policy.IDField != "" {
-		reader := bufio.NewReaderSize(original, 32<<10)
+		guard := transport.NewIdleReader(ctx, original, 120*time.Second)
+		reader := bufio.NewReaderSize(guard, 32<<10)
 		var prefix bytes.Buffer
 		var event bytes.Buffer
 		for prefix.Len() < nativeAckLimit {
@@ -156,11 +158,11 @@ func (g *Gateway) prepareNativeResponse(ctx context.Context, request *http.Reque
 		if len(policy.ContinuationFields) > 0 {
 			return state, failure("unsupported_operation", 502, "stream control URL rewriting is not declared as a supported framing")
 		}
-		response.Body = &nativeReplayBody{Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), reader), Closer: original}
+		response.Body = &nativeReplayBody{Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), reader), Closer: guard}
 	} else if policy.IDField != "" || len(policy.ContinuationFields) > 0 {
 		var err error
-		data, err = io.ReadAll(io.LimitReader(original, nativeAckLimit+1))
-		if err != nil || len(data) > nativeAckLimit || !json.Valid(data) {
+		data, err = transport.ReadBounded(ctx, original, nativeAckLimit, 120*time.Second)
+		if err != nil || !json.Valid(data) {
 			return state, failure("upstream_outcome_unknown", 502, "native acknowledgement could not be inspected")
 		}
 		updated, changed, err := g.rewriteNativeFields(durable, data, p, t, b)

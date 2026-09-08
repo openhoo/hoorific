@@ -8,7 +8,7 @@ Route compatible inference requests through explicit connections, credentials, p
 
 [![CI](https://github.com/openhoo/hoorific/actions/workflows/ci.yml/badge.svg)](https://github.com/openhoo/hoorific/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[Documentation](docs/deployment.md) · [Qualification](docs/qualification.md) · [Performance](docs/performance.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Console guide](docs/console.md) · [Documentation](docs/deployment.md) · [Qualification](docs/qualification.md) · [Performance](docs/performance.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -16,7 +16,7 @@ Route compatible inference requests through explicit connections, credentials, p
 
 *Real console, synthetic local fixture data. The screenshot is not a live-provider or account-entitlement claim.*
 
-Hoorific is a Go gateway for teams that need a small, inspectable control plane in front of model providers and compatible endpoints. The inference listener and management listener are separate; the management API and same-origin Preact console configure the resources that the gateway is allowed to use.
+Hoorific is a Go gateway for teams that need a small, inspectable control plane in front of model providers and compatible endpoints. The inference listener and management listener are separate; the management API and same-origin React console configure the resources that the gateway is allowed to use.
 
 > **Publication status**  Hoorific is published as source. This repository does not currently publish a container image or a release artifact. Build the image locally, or publish it to a registry you control before using the Helm chart.
 
@@ -26,11 +26,35 @@ Hoorific is a Go gateway for teams that need a small, inspectable control plane 
 - **Encrypted credential lifecycle.** Credential listings expose metadata only. Import, rotation, revocation, OAuth, and device flows are bound to a connection and use the encrypted store; generic credential CRUD is intentionally not an administrative contract.
 - **Portable and native protocols.** Built-in codecs cover OpenAI chat, responses, and completions; Anthropic messages; Gemini content; Bedrock Converse; Cohere v2; Ollama; embeddings; and reranking where a registered operation supports them. Streaming is available only for operations whose exact codec advertises a stream.
 - **Provider adapters.** The built-in connector catalog includes OpenAI, Anthropic, Gemini, Cohere, Ollama, Hugging Face, Replicate, fal, Azure OpenAI, Vertex, Bedrock, and explicitly configured compatible endpoints. Optional subscription connectors are disabled unless enabled in configuration.
+- **Cost-safe accounting.** Provider prompt caching is distinct from opt-in response replay; cache controls are never turned into automatic explicit writes, and missing usage or rates remain unknown rather than guessed.
 - **Standalone or cluster storage.** Standalone mode uses SQLite. Cluster mode uses PostgreSQL and can use Redis for coordination. The two storage modes are mutually exclusive in configuration.
-- **A focused operator surface.** `/admin/` serves the embedded console; `/admin/api/v1/` serves the authenticated management API; health and metrics remain on the management listener.
+- **A focused operator surface.** `/admin/` serves the embedded React console, built with shadcn/ui components and Tailwind CSS. Workflow-oriented navigation leads from connections and models to routing and operations. Resource pages open on the collection, with explicit create/edit workspaces, page-local filtering, and draft-discard confirmation when selecting another resource, starting a new one, or returning to the list. The playground shows request and response side by side on wide screens, with copy, clear, and cancellation controls. Forms adapt to their available width; light/dark themes and keyboard navigation work on desktop and mobile. `/admin/api/v1/` serves the authenticated management API; health and metrics remain on the management listener.
 - **A small runtime boundary.** The Dockerfile produces a `scratch` image that runs as UID/GID `10001` and supports a read-only root filesystem, with CA certificates, timezone data, `/tmp`, and the mounted data directory. There is deliberately no shell in the runtime image.
 
 These are implementation boundaries, not provider entitlement claims. A configured connector still needs valid operator-supplied credentials, reachable upstreams, and a model or operation supported by that connection's capability inventory.
+
+## Console visual tour
+
+The embedded [console guide](docs/console.md) turns the post-bootstrap flow into an operator checklist. These views come from the isolated deterministic fixture described there; they illustrate the UI, not provider access or account entitlement.
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="docs/console.md#models-aliases-routes-and-limits">
+        <img src="docs/assets/console-model-editor.webp" alt="Hoorific console model editor showing the selected fixture-model identity and capabilities">
+      </a><br>
+      <strong><a href="docs/console.md#models-aliases-routes-and-limits">Models editor</a></strong> — inspect the selected <code>fixture-model</code> before routing it.
+    </td>
+    <td align="center">
+      <a href="docs/console.md#playground">
+        <img src="docs/assets/console-playground.webp" alt="Hoorific console playground showing a completed deterministic request and response">
+      </a><br>
+      <strong><a href="docs/console.md#playground">Playground</a></strong> — send a deterministic fixture request and inspect its response.
+    </td>
+  </tr>
+</table>
+
+Use the [models and routing workflow](docs/console.md#models-aliases-routes-and-limits) to prepare an approved route, then follow the [playground walkthrough](docs/console.md#playground) to exercise it.
 
 ## Architecture
 
@@ -231,6 +255,20 @@ go run ./tools/verify \
   --output .artifacts/verify-standalone.json
 ```
 
+To inspect only the cost-safety contracts against temporary provider
+fixtures, use the focused selector:
+
+```sh
+go run ./tools/verify \
+  --binary .artifacts/hoorific \
+  --mode standalone \
+  --scenario cost-safety \
+  --output .artifacts/verify-cost-safety.json
+```
+
+This selector does not contact a paid provider; it is not evidence of
+provider entitlement, pricing, or cache savings.
+
 The verifier owns temporary state, credentials, listeners, and fixture data. It does not prove a provider account, paid entitlement, or a production deployment. Browser, cluster, live-provider, and credential crash-boundary procedures are documented in [Qualification](docs/qualification.md). Keep generated reports private; `.artifacts/` is local operator evidence, not a repository asset.
 
 For a repeatable traffic measurement against a provisioned gateway and deterministic loopback upstream, see [Performance](docs/performance.md). Historical timing tables there are machine-specific reference observations, not service-level guarantees.
@@ -245,6 +283,7 @@ For a repeatable traffic measurement against a provisioned gateway and determini
 ## Documentation and project links
 
 - [Deployment and configuration](docs/deployment.md)
+- [Embedded console guide and visual workflows](docs/console.md)
 - [Qualification and benchmark operations](docs/qualification.md)
 - [Performance benchmark and image-footprint methodology](docs/performance.md)
 - [Helm chart](charts/hoorific/)

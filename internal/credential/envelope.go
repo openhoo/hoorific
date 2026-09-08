@@ -313,6 +313,61 @@ func (keylessLease) Authorize(_ context.Context, r *http.Request) error {
 var _ core.CredentialSource = source{}
 var _ core.CredentialLease = keylessLease{}
 
+const (
+	claudeSubscriptionProvider = "claude-subscription"
+	// Source: https://github.com/anthropics/anthropic-sdk-go/commit/d2f6543e
+	claudeSubscriptionOAuthBeta = "oauth-2025-04-20"
+)
+
+func mergeClaudeSubscriptionBeta(header http.Header) error {
+	values := header.Values("anthropic-beta")
+	tokens := make([]string, 0, len(values)+1)
+	seen := make(map[string]struct{}, len(values)+1)
+	for _, value := range values {
+		if value == "" || strings.ContainsAny(value, "\r\n\x00") {
+			return invalidClaudeSubscriptionHeader("Claude subscription anthropic-beta must contain capability values")
+		}
+		for _, raw := range strings.Split(value, ",") {
+			token := strings.TrimSpace(raw)
+			if !validClaudeSubscriptionToken(token) {
+				return invalidClaudeSubscriptionHeader("Claude subscription anthropic-beta contains an invalid capability value")
+			}
+			if _, ok := seen[token]; ok {
+				continue
+			}
+			seen[token] = struct{}{}
+			tokens = append(tokens, token)
+		}
+	}
+	if _, ok := seen[claudeSubscriptionOAuthBeta]; !ok {
+		tokens = append(tokens, claudeSubscriptionOAuthBeta)
+	}
+	header.Set("anthropic-beta", strings.Join(tokens, ","))
+	return nil
+}
+
+func validClaudeSubscriptionToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := range len(value) {
+		c := value[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			continue
+		}
+		switch c {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func invalidClaudeSubscriptionHeader(message string) error {
+	return core.GatewayError{Code: "invalid_request", HTTPStatus: http.StatusBadRequest, Message: message, Param: "anthropic-beta", Origin: "gateway"}
+}
+
 type lease struct {
 	manager *Manager
 	record  Record
@@ -324,7 +379,17 @@ func (l *lease) Authorize(_ context.Context, r *http.Request) error {
 	if l.closed || r == nil {
 		return ErrInvalidCredential
 	}
+	if r.Header == nil {
+		r.Header = make(http.Header)
+	}
 	s := l.secret
+	var claudeBeta string
+	if l.record.Identity.Provider == claudeSubscriptionProvider && s.OAuth != nil {
+		if err := mergeClaudeSubscriptionBeta(r.Header); err != nil {
+			return err
+		}
+		claudeBeta = r.Header.Get("anthropic-beta")
+	}
 	if s.APIKey != nil {
 		h := s.APIKey.Header
 		if h == "" {
@@ -347,6 +412,9 @@ func (l *lease) Authorize(_ context.Context, r *http.Request) error {
 		typ = "Bearer"
 	}
 	r.Header.Set("Authorization", typ+" "+s.OAuth.AccessToken)
+	if claudeBeta != "" {
+		r.Header.Set("anthropic-beta", claudeBeta)
+	}
 	return nil
 }
 func (l *lease) Close() { l.closed = true; l.secret = Secret{} }

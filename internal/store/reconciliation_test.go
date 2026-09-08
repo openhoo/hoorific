@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -14,9 +13,7 @@ func TestReconcileUnknownConservativeIdempotencyAndEvidenceDelta(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	key := filepath.Join(dir, "master.key")
-	if err := os.WriteFile(key, make([]byte, 32), 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeStoreTestKeyring(t, key, make([]byte, 32))
 	var c core.BootstrapConfig
 	c.SchemaVersion = 1
 	c.Mode = "standalone"

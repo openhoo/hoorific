@@ -112,3 +112,97 @@ func RelayHTTP(ctx context.Context, w http.ResponseWriter, response *http.Respon
 		}
 	}
 }
+
+type IdleReader struct {
+	ctx     context.Context
+	body    io.ReadCloser
+	idle    time.Duration
+	timer   *time.Timer
+	stop    func() bool
+	expired atomic.Bool
+}
+
+var ErrReadLimit = errors.New("response body exceeds read limit")
+
+func NewIdleReader(ctx context.Context, body io.ReadCloser, idle time.Duration) *IdleReader {
+	if idle <= 0 {
+		idle = 120 * time.Second
+	}
+	reader := &IdleReader{ctx: ctx, body: body, idle: idle}
+	reader.timer = time.AfterFunc(idle, func() {
+		reader.expired.Store(true)
+		_ = body.Close()
+	})
+	reader.stop = context.AfterFunc(ctx, func() { _ = body.Close() })
+	return reader
+}
+
+func (r *IdleReader) Read(p []byte) (int, error) {
+	if err := r.stopContext(); err != nil {
+		return 0, err
+	}
+	r.timer.Reset(r.idle)
+	n, err := r.body.Read(p)
+	r.timer.Stop()
+	if r.expired.Load() {
+		// Preserve bytes returned by the underlying read, but never turn an
+		// idle-close EOF into successful end-of-stream.
+		return n, context.DeadlineExceeded
+	}
+	if n == 0 && err != nil {
+		if contextErr := r.stopContext(); contextErr != nil {
+			return 0, contextErr
+		}
+	}
+	return n, err
+}
+
+func (r *IdleReader) stopContext() error {
+	if r.ctx == nil {
+		return nil
+	}
+	return r.ctx.Err()
+}
+
+func (r *IdleReader) Close() error {
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	if r.stop != nil {
+		r.stop()
+	}
+	if r.body == nil {
+		return nil
+	}
+	return r.body.Close()
+}
+
+// ReadBounded drains at most maxBytes while retaining cancellable read-idle
+// behavior. It is used for bounded acknowledgement/error bodies only.
+func ReadBounded(ctx context.Context, body io.ReadCloser, maxBytes int64, idle time.Duration) ([]byte, error) {
+	if body == nil || maxBytes <= 0 {
+		return nil, errors.New("invalid bounded response read")
+	}
+	reader := NewIdleReader(ctx, body, idle)
+	defer reader.Close()
+	buf := make([]byte, 32<<10)
+	out := make([]byte, 0, min(maxBytes, int64(cap(buf))))
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			if int64(len(out))+int64(n) > maxBytes {
+				return nil, ErrReadLimit
+			}
+			out = append(out, buf[:n]...)
+		}
+		if err == io.EOF {
+			return out, nil
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+	}
+}

@@ -50,14 +50,21 @@ type Model struct {
 
 // PriceSchedule uses integer USD nanodollars (1 USD = 1,000,000,000).
 // InputPerMillion and OutputPerMillion are nanodollars per million tokens;
-// MaximumUnitCost is nanodollars per UnitOperation. Nil costs are unknown,
-// never zero. Token charges round up to the next nanodollar.
+// cache-read and cache-write rates are independent rates, and nil means
+// unknown rather than zero. CacheWrite5mPerMillion and CacheWrite1hPerMillion
+// are subcategories of CacheWriteInputPerMillion.
+// MaximumUnitCost is nanodollars per UnitOperation. Token charges round up
+// to the next nanodollar.
 type PriceSchedule struct {
-	Version          string    `json:"version"`
-	InputPerMillion  *int64    `json:"input_per_million,omitempty"`
-	OutputPerMillion *int64    `json:"output_per_million,omitempty"`
-	MaximumUnitCost  *int64    `json:"maximum_unit_cost,omitempty"`
-	UnitOperation    Operation `json:"unit_operation,omitempty"`
+	Version                   string    `json:"version"`
+	InputPerMillion           *int64    `json:"input_per_million,omitempty"`
+	OutputPerMillion          *int64    `json:"output_per_million,omitempty"`
+	CachedInputPerMillion     *int64    `json:"cached_input_per_million,omitempty"`
+	CacheWriteInputPerMillion *int64    `json:"cache_write_input_per_million,omitempty"`
+	CacheWrite5mPerMillion    *int64    `json:"cache_write_5m_per_million,omitempty"`
+	CacheWrite1hPerMillion    *int64    `json:"cache_write_1h_per_million,omitempty"`
+	MaximumUnitCost           *int64    `json:"maximum_unit_cost,omitempty"`
+	UnitOperation             Operation `json:"unit_operation,omitempty"`
 }
 type Target interface{ target() }
 type ModelCall struct {
@@ -79,20 +86,24 @@ type Binding struct {
 	Codec                             CodecKey
 	Endpoint, Method, ModelLocation   string
 	ModelField                        string
+	DefaultBody                       string `json:",omitempty"`
 	Framing                           Framing
 	ReplaySafe, CancellationSupported bool
 	RequiredFeatures                  []string
 	Headers                           http.Header
 	AllowedRequestHeaders             []string
-	Response                          NativeResponsePolicy
-	Realtime                          *RealtimePolicy
+	// ValidateRequestHeaders is runtime-only connector validation and is
+	// rebuilt by binding; it must never be persisted with native metadata.
+	ValidateRequestHeaders func(http.Header) error `json:"-"`
+	Response               NativeResponsePolicy
+	Realtime               *RealtimePolicy
 }
 type NativeResponsePolicy struct {
-	IDField, StatusField, PollEndpoint, PollMethod, PollAction, UsageField                          string
-	PollOperation                                                                                   Operation
-	Async                                                                                           bool
-	ContinuationHeaders, ContinuationFields, ContinuationOrigins, TerminalStatuses, FailureStatuses []string
-	ContinuationMethods, ContinuationActions                                                        map[string]string
+	IDField, StatusField, PollEndpoint, PollMethod, PollAction, UsageField, CancelAction, ResultAction string
+	PollOperation                                                                                      Operation
+	Async                                                                                              bool
+	ContinuationHeaders, ContinuationFields, ContinuationOrigins, TerminalStatuses, FailureStatuses    []string
+	ContinuationMethods, ContinuationActions                                                           map[string]string
 }
 type RealtimePolicy struct {
 	Protocol                                                                string
@@ -189,8 +200,18 @@ type BlockEnd struct{ Index Index }
 
 func (BlockEnd) event() {}
 
+// Usage detail fields are provider-reported subsets and must never be added
+// again to Input, Output, or Total. Input is inclusive of cached and
+// cache-write tokens; Output includes reasoning tokens. Nil means unknown,
+// while a non-nil zero is an explicitly reported zero.
 type Usage struct {
 	Input, Output, Total *int64
+	CachedInput          *int64 `json:",omitempty"`
+	CacheWriteInput      *int64 `json:",omitempty"`
+	CacheWrite5mInput    *int64 `json:",omitempty"`
+	CacheWrite1hInput    *int64 `json:",omitempty"`
+	ReasoningOutput      *int64 `json:",omitempty"`
+	ToolInput            *int64 `json:",omitempty"`
 	Source               string
 }
 
@@ -212,13 +233,35 @@ type GatewayError struct {
 	Retryable         bool   `json:"-"`
 	Origin            string `json:"-"`
 	ProviderRequestID string `json:"-"`
+	RetryAfter        string `json:"-"`
 }
 
 func (e GatewayError) Error() string { return e.Message }
 
+type CacheControl struct {
+	Type string
+	TTL  string
+}
+
+// PromptCache carries portable cache identity/options. Protocol selects the
+// native cache contract; fields with no equivalent native representation must
+// be rejected before dispatch rather than silently dropped.
+type PromptCache struct {
+	Protocol      Protocol
+	Key           string
+	Retention     string
+	Mode          string
+	TTL           string
+	CachedContent string
+	SessionID     string
+	Control       *CacheControl
+}
+
 type ContentBlock struct {
 	Kind, Text, URL, MIMEType, ID, Name, Arguments string
 	Data                                           []byte
+	CacheControl                                   *CacheControl
+	CacheBreakpoint                                bool
 }
 type Message struct {
 	Role    string
@@ -227,12 +270,15 @@ type Message struct {
 type Tool struct {
 	Name, Description string
 	Schema            []byte
+	CacheControl      *CacheControl
+	CacheBreakpoint   bool
 }
 type Conversation struct {
 	Model                                                                   string
 	System                                                                  []ContentBlock
 	Messages                                                                []Message
 	Tools                                                                   []Tool
+	Cache                                                                   *PromptCache
 	MaxOutputTokens                                                         *int64
 	Stop                                                                    []string
 	Stream                                                                  bool

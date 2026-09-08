@@ -25,21 +25,25 @@ func New(opts ...endpoint.Option) *endpoint.Connector {
 		endpoint.E("POST", "v1/embed-jobs/{id}/cancel", "embed_jobs.cancel", "batch", "cohere-v1", "json", "none", true),
 	}
 	routes[4].ResourceIDField = "id"
-	routes[6].ResourceIDField = "id"
 	routes[7].ResourceIDField = "id"
-	jobResponse := core.NativeResponsePolicy{
-		IDField: "job_id", StatusField: "status", Async: true,
-		TerminalStatuses: []string{"complete", "cancelled"},
-		FailureStatuses:  []string{"failed"},
-	}
-	for i := 6; i <= 8; i++ {
-		routes[i].Response = jobResponse
-	}
+	routes[8].ResourceIDField = "id"
 	routes[5].Response = core.NativeResponsePolicy{
 		IDField: "job_id", StatusField: "status", Async: true,
+		ResultAction: "embed_jobs.retrieve", CancelAction: "embed_jobs.cancel",
 		PollEndpoint: "v1/embed-jobs/{id}", PollMethod: "GET", PollAction: "embed_jobs.retrieve", PollOperation: "batch", UsageField: "meta.billed_units",
 		TerminalStatuses: []string{"complete", "cancelled"},
 		FailureStatuses:  []string{"failed"},
 	}
+	routes[7].Response = core.NativeResponsePolicy{
+		IDField: "job_id", StatusField: "status",
+		ResultAction: "embed_jobs.retrieve", CancelAction: "embed_jobs.cancel",
+		TerminalStatuses: []string{"complete", "cancelled"},
+		FailureStatuses:  []string{"failed"},
+	}
+	routes[8].DefaultBody = "{}"
+	// Cohere's documented cancel response is an empty JSON object. Its
+	// descriptor deliberately carries no status field so job actions can treat
+	// that object as the cancellation receipt without inventing an ID/usage.
+	routes[8].Response = core.NativeResponsePolicy{}
 	return endpoint.New("cohere", DefaultBaseURL, routes, append([]endpoint.Option{endpoint.WithDiscoveryPath("v1/models")}, opts...)...)
 }

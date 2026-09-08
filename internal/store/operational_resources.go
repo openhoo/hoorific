@@ -138,7 +138,17 @@ func operationalUsage(raw json.RawMessage) (*core.Usage, error) {
 	for _, field := range []struct {
 		name string
 		dst  **int64
-	}{{"Input", &u.Input}, {"Output", &u.Output}, {"Total", &u.Total}} {
+	}{
+		{"Input", &u.Input},
+		{"Output", &u.Output},
+		{"Total", &u.Total},
+		{"CachedInput", &u.CachedInput},
+		{"CacheWriteInput", &u.CacheWriteInput},
+		{"CacheWrite5mInput", &u.CacheWrite5mInput},
+		{"CacheWrite1hInput", &u.CacheWrite1hInput},
+		{"ReasoningOutput", &u.ReasoningOutput},
+		{"ToolInput", &u.ToolInput},
+	} {
 		if err := o.field(field.name, field.dst, false); err != nil {
 			return nil, err
 		}
@@ -301,12 +311,14 @@ func projectOperationalReconciliation(o operationalObject, id, admission string)
 		name string
 		dst  any
 	}{{"reconciliation_id", &d.ReconciliationID}, {"admission_id", &d.AdmissionID}, {"mode", &d.Mode}, {"reason", &d.Reason}, {"source_reference", &d.SourceReference}, {"admission_version", &d.AdmissionVersion}, {"state", &d.State}, {"reconciled", &d.Reconciled}, {"charged_cost", &d.ChargedCost}, {"delta", &d.Delta}} {
-		required := field.name != "source_reference"
+		required := field.name != "source_reference" && field.name != "charged_cost" && field.name != "delta"
 		if err := o.field(field.name, field.dst, required); err != nil {
 			return d, err
 		}
 	}
-	if id == "" || admission == "" || d.ReconciliationID != id || d.AdmissionID != admission || d.Reason == "" || d.AdmissionVersion <= 0 || d.State != "outcome_unknown" || !d.Reconciled || d.ChargedCost == nil || *d.ChargedCost < 0 || d.Delta == nil || (d.Mode != "provider_evidence" && d.Mode != "charge_reserved_maximum") || o.field("cost", &d.Cost, false) != nil || (d.Cost != nil && *d.Cost < 0) {
+	if id == "" || admission == "" || d.ReconciliationID != id || d.AdmissionID != admission || d.Reason == "" || d.AdmissionVersion <= 0 || d.State != "outcome_unknown" || !d.Reconciled ||
+		(d.ChargedCost == nil) != (d.Delta == nil) || d.ChargedCost != nil && *d.ChargedCost < 0 ||
+		(d.Mode != "provider_evidence" && d.Mode != "charge_reserved_maximum") || o.field("cost", &d.Cost, false) != nil || d.Cost != nil && *d.Cost < 0 {
 		return d, invalidOperationalRecord()
 	}
 	var err error

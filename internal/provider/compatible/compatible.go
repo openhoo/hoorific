@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"hoorific/internal/core"
@@ -136,12 +137,24 @@ func openAIRoutes(base string) []endpoint.Route {
 	}
 }
 
+func openRouterRoutes() []endpoint.Route {
+	routes := openAIRoutes("")
+	for i := range routes {
+		if routes[i].Method != "POST" {
+			continue
+		}
+		routes[i].AllowedRequestHeaders = []string{"x-session-id", "HTTP-Referer", "X-Title"}
+		routes[i].ValidateRequestHeaders = validateOpenRouterHeaders
+	}
+	return routes
+}
+
 func NewPreset(name string, opts ...endpoint.Option) (*Connector, error) {
 	var id, base string
 	var routes []endpoint.Route
 	switch strings.ToLower(name) {
 	case OpenRouter:
-		id, base, routes = OpenRouter, OpenRouterBaseURL, openAIRoutes("")
+		id, base, routes = OpenRouter, OpenRouterBaseURL, openRouterRoutes()
 	case Groq:
 		id, base, routes = Groq, GroqBaseURL, openAIRoutes("")
 	case Together:
@@ -211,6 +224,35 @@ func CerebrasConnector(opts ...endpoint.Option) *Connector {
 	return c
 }
 
+func validateOpenRouterHeaders(headers http.Header) error {
+	if values := headers.Values("x-session-id"); len(values) > 1 {
+		return invalidOpenRouterHeader("x-session-id", "OpenRouter accepts one x-session-id value")
+	} else if len(values) == 1 {
+		if values[0] == "" || len([]rune(values[0])) > 256 || strings.ContainsAny(values[0], "\r\n") {
+			return invalidOpenRouterHeader("x-session-id", "OpenRouter x-session-id must be 1 through 256 characters")
+		}
+	}
+	if values := headers.Values("HTTP-Referer"); len(values) > 1 {
+		return invalidOpenRouterHeader("HTTP-Referer", "OpenRouter accepts one HTTP-Referer value")
+	} else if len(values) == 1 && !validOpenRouterAttribution(values[0], 2048) {
+		return invalidOpenRouterHeader("HTTP-Referer", "OpenRouter HTTP-Referer is invalid")
+	}
+	if values := headers.Values("X-Title"); len(values) > 1 {
+		return invalidOpenRouterHeader("X-Title", "OpenRouter accepts one X-Title value")
+	} else if len(values) == 1 && !validOpenRouterAttribution(values[0], 256) {
+		return invalidOpenRouterHeader("X-Title", "OpenRouter X-Title is invalid")
+	}
+	return nil
+}
+
+func validOpenRouterAttribution(value string, max int) bool {
+	return value != "" && len([]rune(value)) <= max && !strings.ContainsAny(value, "\r\n")
+}
+
+func invalidOpenRouterHeader(name, message string) error {
+	return core.GatewayError{Code: "invalid_request", HTTPStatus: 400, Message: message, Param: name, Origin: "gateway"}
+}
+
 func (c *Connector) Inspect(ctx context.Context, target core.Target, op core.Operation, body []byte) error {
 	if c.dialect == Groq && op == "complete" || c.dialect == Mistral && op == "complete" {
 		return core.GatewayError{Code: "unsupported_operation", HTTPStatus: 400, Message: "legacy text completions are not supported by this provider", Origin: "gateway"}
@@ -227,6 +269,9 @@ func (c *Connector) Inspect(ctx context.Context, target core.Target, op core.Ope
 	}
 	switch c.dialect {
 	case Cerebras:
+		if err := rejectForeignCacheDirectives(body); err != nil {
+			return err
+		}
 		if raw, ok := fields["n"]; ok {
 			var n int
 			if json.Unmarshal(raw, &n) == nil && n > 1 {
@@ -236,12 +281,268 @@ func (c *Connector) Inspect(ctx context.Context, target core.Target, op core.Ope
 		if hasExternalImage(fields) {
 			return core.GatewayError{Code: "unsupported_feature", HTTPStatus: 400, Message: "Cerebras accepts only base64 image data URIs", Param: "image_url", Origin: "gateway"}
 		}
-	case DeepSeek, DeepSeekAnthropic:
+	case DeepSeek:
 		if containsThinkingReplay(fields) {
 			return core.GatewayError{Code: "unsupported_feature", HTTPStatus: 400, Message: "DeepSeek thinking replay is not supported by this connector", Param: "reasoning_content", Origin: "gateway"}
 		}
+		if err := rejectForeignCacheDirectives(body); err != nil {
+			return err
+		}
+	case DeepSeekAnthropic:
+		if containsThinkingReplay(fields) {
+			return core.GatewayError{Code: "unsupported_feature", HTTPStatus: 400, Message: "DeepSeek thinking replay is not supported by this connector", Param: "reasoning_content", Origin: "gateway"}
+		}
+		if err := rejectForeignCacheRoutingFields(fields); err != nil {
+			return err
+		}
+	case OpenRouter:
+		if err := validateOpenRouterCacheDirectives(body); err != nil {
+			return err
+		}
+	default:
+		if err := rejectForeignCacheDirectives(body); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+func validateOpenRouterCacheDirectives(body []byte) error {
+	var root map[string]json.RawMessage
+	if len(body) == 0 || json.Unmarshal(body, &root) != nil || root == nil {
+		return nil
+	}
+	if raw, ok := root["cache_control"]; ok {
+		if err := validateCacheControlDirective(raw, "cache_control"); err != nil {
+			return err
+		}
+	}
+	if raw, ok := root["session_id"]; ok {
+		var value string
+		if json.Unmarshal(raw, &value) != nil || !validCacheDirectiveString(value, 256) {
+			return unsupportedCacheDirective("session_id")
+		}
+	}
+	if raw, ok := root["prompt_cache_key"]; ok {
+		var value string
+		if json.Unmarshal(raw, &value) != nil || !validCacheDirectiveString(value, 256) {
+			return unsupportedCacheDirective("prompt_cache_key")
+		}
+	}
+	if raw, ok := root["prompt_cache_retention"]; ok {
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return unsupportedCacheDirective("prompt_cache_retention")
+		}
+		switch value {
+		case "", "in_memory", "24h":
+		default:
+			return unsupportedCacheDirective("prompt_cache_retention")
+		}
+	}
+	if raw, ok := root["prompt_cache_options"]; ok {
+		if err := validatePromptCacheOptions(raw); err != nil {
+			return err
+		}
+	}
+	for _, key := range []string{"messages", "input"} {
+		var items []json.RawMessage
+		if json.Unmarshal(root[key], &items) != nil {
+			continue
+		}
+		for _, item := range items {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(item, &object) != nil {
+				continue
+			}
+			if err := validateContentCacheDirectives(object["content"], key); err != nil {
+				return err
+			}
+		}
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(root["tools"], &tools) == nil {
+		for _, tool := range tools {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(tool, &object) != nil {
+				continue
+			}
+			if raw, ok := object["cache_control"]; ok {
+				if err := validateCacheControlDirective(raw, "tools.cache_control"); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validatePromptCacheOptions(raw json.RawMessage) error {
+	var options map[string]json.RawMessage
+	if json.Unmarshal(raw, &options) != nil || options == nil {
+		return unsupportedCacheDirective("prompt_cache_options")
+	}
+	for key, value := range options {
+		switch key {
+		case "mode":
+			var mode string
+			if json.Unmarshal(value, &mode) != nil {
+				return unsupportedCacheDirective("prompt_cache_options.mode")
+			}
+			switch mode {
+			case "", "implicit", "explicit":
+			default:
+				return unsupportedCacheDirective("prompt_cache_options.mode")
+			}
+		case "ttl":
+			var ttl string
+			if json.Unmarshal(value, &ttl) != nil || !validCacheDirectiveTTL(ttl) {
+				return unsupportedCacheDirective("prompt_cache_options.ttl")
+			}
+		default:
+			return unsupportedCacheDirective("prompt_cache_options." + key)
+		}
+	}
+	return nil
+}
+
+func validateContentCacheDirectives(raw json.RawMessage, param string) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		if value, ok := object["cache_control"]; ok {
+			return validateCacheControlDirective(value, param+".cache_control")
+		}
+		return nil
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	for _, part := range parts {
+		if err := validateContentCacheDirectives(part, param); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCacheControlDirective(raw json.RawMessage, param string) error {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return unsupportedCacheDirective(param)
+	}
+	var typ string
+	if value, ok := object["type"]; !ok || json.Unmarshal(value, &typ) != nil || (typ != "ephemeral" && typ != "default") {
+		return unsupportedCacheDirective(param + ".type")
+	}
+	if value, ok := object["ttl"]; ok {
+		var ttl string
+		if json.Unmarshal(value, &ttl) != nil || !validCacheDirectiveTTL(ttl) {
+			return unsupportedCacheDirective(param + ".ttl")
+		}
+	}
+	for key := range object {
+		if key != "type" && key != "ttl" {
+			return unsupportedCacheDirective(param + "." + key)
+		}
+	}
+	return nil
+}
+
+func validCacheDirectiveString(value string, max int) bool {
+	return value != "" && len([]rune(value)) <= max && !strings.ContainsAny(value, "\x00\r\n")
+}
+
+func validCacheDirectiveTTL(value string) bool {
+	switch value {
+	case "", "5m", "30m", "1h", "24h":
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectForeignCacheRoutingFields(root map[string]json.RawMessage) error {
+	if _, ok := root["session_id"]; ok {
+		return unsupportedCacheDirective("session_id")
+	}
+	return nil
+}
+
+func rejectForeignCacheDirectives(body []byte) error {
+	var root map[string]json.RawMessage
+	if len(body) == 0 || json.Unmarshal(body, &root) != nil || root == nil {
+		return nil
+	}
+	if err := rejectForeignCacheRoutingFields(root); err != nil {
+		return err
+	}
+	if _, ok := root["cache_control"]; ok {
+		return unsupportedCacheDirective("cache_control")
+	}
+	for _, key := range []string{"messages", "input"} {
+		var items []json.RawMessage
+		if json.Unmarshal(root[key], &items) != nil {
+			continue
+		}
+		for _, item := range items {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(item, &object) != nil {
+				continue
+			}
+			if err := rejectContentCacheDirectives(object["content"]); err != nil {
+				return err
+			}
+		}
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(root["tools"], &tools) == nil {
+		for _, tool := range tools {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(tool, &object) != nil {
+				continue
+			}
+			if _, ok := object["cache_control"]; ok {
+				return unsupportedCacheDirective("cache_control")
+			}
+		}
+	}
+	return nil
+}
+
+func rejectContentCacheDirectives(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		if _, ok := object["cache_control"]; ok {
+			return unsupportedCacheDirective("cache_control")
+		}
+		return nil
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	for _, part := range parts {
+		if err := rejectContentCacheDirectives(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func unsupportedCacheDirective(param string) error {
+	return core.GatewayError{
+		Code:       "unsupported_feature",
+		HTTPStatus: 400,
+		Param:      param,
+		Message:    "cache directive is not supported by this compatible provider: " + param,
+		Origin:     "gateway",
+	}
 }
 func NewOpenRouter(opts ...endpoint.Option) *Connector { return OpenRouterConnector(opts...) }
 func NewGroq(opts ...endpoint.Option) *Connector       { return GroqConnector(opts...) }

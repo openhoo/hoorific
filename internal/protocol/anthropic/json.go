@@ -15,7 +15,7 @@ func unsupported(path string) error {
 }
 
 // strict checks every object, including objects embedded in tool schemas.
-func strict(data []byte, dst any) error {
+func validateJSON(data []byte) error {
 	if !utf8.Valid(data) {
 		return unsupported("json")
 	}
@@ -69,13 +69,45 @@ func strict(data []byte, dst any) error {
 	if _, err := d.Token(); err != io.EOF {
 		return unsupported("json.trailing")
 	}
-	d = json.NewDecoder(bytes.NewReader(data))
+	return nil
+}
+
+func strict(data []byte, dst any) error {
+	if err := validateJSON(data); err != nil {
+		return err
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
 	d.UseNumber()
 	if err := d.Decode(dst); err != nil {
 		return unsupported("json.fields")
 	}
 	return nil
+}
+
+// tolerant validates the response envelope's JSON shape and duplicate keys,
+// while allowing newly documented provider metadata that this core does not
+// represent. Callers still validate all semantic fields they consume.
+func tolerant(data []byte, dst any) error {
+	if err := validateJSON(data); err != nil {
+		return err
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.UseNumber()
+	if err := d.Decode(dst); err != nil {
+		return unsupported("json.fields")
+	}
+	return nil
+}
+func readResponseJSON(r io.Reader, dst any) error {
+	b, e := io.ReadAll(io.LimitReader(r, 32<<20+1))
+	if e != nil {
+		return e
+	}
+	if len(b) > 32<<20 {
+		return unsupported("body.size")
+	}
+	return tolerant(b, dst)
 }
 func object(data []byte) error {
 	var v map[string]json.RawMessage

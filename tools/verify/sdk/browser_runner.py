@@ -320,6 +320,12 @@ class BrowserUI:
             timeout=ROUTE_TIMEOUT_MS,
         )
 
+    def new_resource(self) -> Any:
+        if self.page.locator("form.editor").count():
+            raise RuntimeError("resource list unexpectedly opened an editor")
+        self.page.get_by_role("button", name="New resource", exact=True).click()
+        return self.editor()
+
     def editor(self) -> Any:
         editor = self.page.locator("form.editor").first
         editor.wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
@@ -622,7 +628,7 @@ class BrowserCases:
         fill: Callable[[Any], None],
     ) -> Any:
         self.ui.resource(kind)
-        editor = self.ui.editor()
+        editor = self.ui.new_resource()
         editor.get_by_label("ID", exact=True).fill(resource_id)
         fill(editor)
         observed = self.ui.expect_response(
@@ -780,9 +786,7 @@ class BrowserCases:
         self.ui.select_resource(operator_id)
         binding_editor = self.ui.editor()
         binding_editor.get_by_label("Operator subject", exact=True).fill(operator_id)
-        role_select = binding_editor.locator("label.field").filter(
-            has_text="Role"
-        ).locator("select").first
+        role_select = binding_editor.get_by_label("Role", exact=True)
         if role_select.input_value() != "viewer":
             raise RuntimeError("operator creation did not seed a viewer role binding")
         role_select.select_option("operator")
@@ -856,32 +860,67 @@ class BrowserCases:
 
     def model_lifecycle(self) -> dict[str, Any]:
         resource_id = self.uid("model")
-        editor = self.create(
-            "models",
-            resource_id,
-            lambda form: (
-                form.get_by_label("Connection ID", exact=True).fill(
-                    "fixture-connection"
-                ),
-                form.get_by_label("Upstream model ID", exact=True).fill(
-                    resource_id + "-upstream"
-                ),
-                self.add_list(form, "Operations", ["generate"]),
-                self.add_list(form, "Input modalities", ["text"]),
-                self.add_list(form, "Output modalities", ["text"]),
-                self.set_json_map(form, "Features", {"streaming": "supported"}),
-                form.get_by_label("Provenance", exact=True).fill(
-                    "browser resource lifecycle"
-                ),
-            ),
-        )
+        cache_rates = {
+            "Cache-read nanodollars per million tokens": "500000000",
+            "Cache-write nanodollars per million tokens": "3000000000",
+            "5-minute cache-write nanodollars per million tokens": "4000000000",
+            "1-hour cache-write nanodollars per million tokens": "5000000000",
+        }
+
+        def fill_model(form: Any) -> None:
+            form.get_by_label("Connection ID", exact=True).fill("fixture-connection")
+            form.get_by_label("Upstream model ID", exact=True).fill(
+                resource_id + "-upstream"
+            )
+            self.add_list(form, "Operations", ["generate"])
+            self.add_list(form, "Input modalities", ["text"])
+            self.add_list(form, "Output modalities", ["text"])
+            self.set_json_map(form, "Features", {"streaming": "supported"})
+            form.get_by_label("Provenance", exact=True).fill(
+                "browser resource lifecycle"
+            )
+            form.get_by_label("Provide price schedule", exact=True).check()
+            form.get_by_label("Price version", exact=True).fill("browser-price-v1")
+            form.get_by_label(
+                "Input nanodollars per million tokens", exact=True
+            ).fill("1000000000")
+            form.get_by_label(
+                "Output nanodollars per million tokens", exact=True
+            ).fill("2000000000")
+            form.get_by_label(
+                "Maximum nanodollars per operation unit", exact=True
+            ).fill("1000000000000")
+            for label, value in cache_rates.items():
+                form.get_by_label(label, exact=True).fill(value)
+
+        editor = self.create("models", resource_id, fill_model)
         self.selected_id = resource_id
-        editor.get_by_label("Upstream model ID", exact=True).fill(
+        self.save("models", editor)
+
+        self.ui.resource("models")
+        self.ui.select_resource(resource_id)
+        self.selected_id = resource_id
+        reloaded = self.ui.editor()
+        persisted_cache_rates = {
+            label: reloaded.get_by_label(label, exact=True).input_value()
+            for label in cache_rates
+        }
+        if persisted_cache_rates != cache_rates:
+            raise RuntimeError(
+                f"model cache rates did not survive save/reload: {persisted_cache_rates}"
+            )
+        reloaded.get_by_label("Upstream model ID", exact=True).fill(
             resource_id + "-upstream-updated"
         )
-        self.save("models", editor)
+        self.save("models", reloaded)
         self.delete_selected("models", resource_id)
-        return {"created": True, "updated": True, "deleted": True}
+        return {
+            "created": True,
+            "updated": True,
+            "deleted": True,
+            "cache_rates_saved": True,
+            "cache_rates_reloaded": persisted_cache_rates,
+        }
 
     def alias_lifecycle(self) -> dict[str, Any]:
         resource_id = self.uid("alias")
@@ -943,14 +982,10 @@ class BrowserCases:
             "policy_limits",
             resource_id,
             lambda form: (
-                form.locator("label.field").filter(has_text="Policy scope").locator(
-                    "select"
-                ).first.select_option("tenant"),
+                form.get_by_label("Policy scope", exact=True).select_option("tenant"),
                 form.get_by_label("Scope ID", exact=True).fill(scope_id),
                 form.get_by_label("Requests per minute", exact=True).fill("10"),
-                form.locator("label.field").filter(has_text="Cost window").locator(
-                    "select"
-                ).first.select_option("daily"),
+                form.get_by_label("Cost window", exact=True).select_option("daily"),
             ),
         )
         self.selected_id = resource_id
@@ -966,9 +1001,7 @@ class BrowserCases:
             "policy_limits",
             resource_id,
             lambda form: (
-                form.locator("label.field").filter(has_text="Policy scope").locator(
-                    "select"
-                ).first.select_option("tenant"),
+                form.get_by_label("Policy scope", exact=True).select_option("tenant"),
                 form.get_by_label("Scope ID", exact=True).fill(scope_id),
                 form.get_by_label("Requests per minute", exact=True).fill("30"),
             ),
@@ -1055,12 +1088,16 @@ class BrowserCases:
             lambda: actions.get_by_role("button", name="Test", exact=True).click(),
         )
         test_body = tested.get("body")
-        test_code = test_body.get("code") if isinstance(test_body, dict) else None
-        if tested["status"] != 503 or test_code != "configuration_stale":
+        if (
+            tested["status"] != 200
+            or not isinstance(test_body, dict)
+            or test_body.get("status") != "ok"
+            or test_body.get("status_code") != 200
+        ):
             raise RuntimeError(
-                f"fixture connection test returned {tested['status']} / {test_code}"
+                f"fixture connection test did not reach its provider: {tested['status']}"
             )
-        actions.locator('[role="alert"]').first.wait_for(
+        actions.locator(".result").first.wait_for(
             state="visible", timeout=ROUTE_TIMEOUT_MS
         )
         return {
@@ -1068,8 +1105,8 @@ class BrowserCases:
             "discovered_candidate_count": len(candidates),
             "discovery_approved": discovered_body.get("approved"),
             "test_status": tested["status"],
-            "test_error_code": test_code,
-            "test_error_visible": True,
+            "provider_status": test_body.get("status_code"),
+            "test_result_visible": True,
             "seed_connection_preserved": True,
         }
 
@@ -1447,9 +1484,7 @@ class BrowserCases:
 
     def playground(self, payload: str, expected_text: str) -> dict[str, Any]:
         self.ui.goto("/admin/playground", "Inference playground")
-        operation = self.ui.page.locator("label.field").filter(
-            has_text="Operation"
-        ).locator("select").first
+        operation = self.ui.page.get_by_label("Operation", exact=True)
         path = self.ui.page.get_by_label("Gateway operation path", exact=True)
         mappings = {
             "chat": "/playground/v1/chat/completions",
@@ -1705,7 +1740,7 @@ class BrowserCases:
     def validation_errors(self) -> dict[str, Any]:
         # Required browser validation prevents a request before it reaches the API.
         self.ui.resource("tenants")
-        editor = self.ui.editor()
+        editor = self.ui.new_resource()
         editor.get_by_label("ID", exact=True).fill(self.uid("invalid-tenant"))
         name = editor.get_by_label("Tenant name", exact=True)
         editor.get_by_role("button", name="Create", exact=True).click()
@@ -1713,18 +1748,17 @@ class BrowserCases:
             raise RuntimeError("required tenant name did not block form submission")
 
         self.ui.resource("models")
-        model_editor = self.ui.editor()
-        context_limit = model_editor.locator("label.field").filter(
-            has_text="Context token limit (blank = unknown)"
-        ).locator("input").first
+        model_editor = self.ui.new_resource()
+        context_limit = model_editor.get_by_label("Context token limit (blank = unknown)", exact=True)
         context_limit.fill("-1")
         if context_limit.get_attribute("aria-invalid") != "true":
             raise RuntimeError("negative model limit did not become invalid")
-        feature_field = model_editor.locator("label.field").filter(
-            has_text="Features (JSON object of string values)"
-        ).first
-        feature_field.locator("textarea").fill('{"streaming":"invalid"}')
-        feature_field.locator('small[role="alert"]').wait_for(
+        feature_field = model_editor.get_by_label("Features (JSON object of string values)", exact=True)
+        feature_field.fill('{"streaming":"invalid"}')
+        feature_error_id = feature_field.get_attribute("aria-errormessage")
+        if feature_field.get_attribute("aria-invalid") != "true" or not feature_error_id:
+            raise RuntimeError("invalid feature map did not expose an associated error")
+        model_editor.locator(f'[id="{feature_error_id}"][role="alert"]').wait_for(
             state="visible", timeout=ROUTE_TIMEOUT_MS
         )
 
@@ -1850,6 +1884,13 @@ class BrowserCases:
     def mobile_keyboard(self) -> dict[str, Any]:
         self.ui.page.set_viewport_size({"width": 390, "height": 844})
         self.ui.goto("/admin/models", "Models")
+        menu = self.ui.page.get_by_role("button", name="Open navigation", exact=True)
+        menu.wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
+        menu.focus()
+        self.ui.page.keyboard.press("Enter")
+        self.ui.page.get_by_role("navigation", name="Operations", exact=True).wait_for(
+            state="visible", timeout=ROUTE_TIMEOUT_MS
+        )
         metrics = self.ui.page.evaluate(
             """
             () => ({
@@ -1860,7 +1901,7 @@ class BrowserCases:
             })
             """
         )
-        if not metrics.get("navVisible") or metrics.get("innerWidth") != 390:
+        if not metrics.get("navVisible") or metrics.get("innerWidth") != 390 or metrics.get("scrollWidth") > 390:
             raise RuntimeError("mobile shell did not remain reachable at 390px")
         mobile_path = self.ui.evidence_dir / "browser-mobile-layout.png"
         self.ui.page.screenshot(path=str(mobile_path), full_page=True)
@@ -1876,6 +1917,9 @@ class BrowserCases:
         self.ui.page.get_by_role(
             "heading", name="Operations overview", exact=True
         ).wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
+        menu = self.ui.page.get_by_role("button", name="Open navigation", exact=True)
+        menu.wait_for(state="visible", timeout=ROUTE_TIMEOUT_MS)
+        menu.click()
         overview = self.ui.page.locator(
             'nav[aria-label="Operations"] a'
         ).filter(has_text="Overview").first
@@ -1892,6 +1936,7 @@ class BrowserCases:
                 "client_width": metrics.get("clientWidth"),
                 "document_scroll_width": metrics.get("scrollWidth"),
                 "navigation_visible": metrics.get("navVisible"),
+                "menu_keyboard_opened": True,
                 "screenshot": str(mobile_path),
             },
             "keyboard_enter_navigated": True,
@@ -1980,6 +2025,7 @@ def main() -> int:
                     {"role": "user", "content": "Reply exactly OK"}
                 ],
                 "stream": True,
+                "stream_options": {"include_usage": True},
             }
         ),
     )

@@ -224,7 +224,8 @@ func (c *Connector) BindEndpoint(_ context.Context, conn core.Connection, e core
 	variant := ""
 	if strings.Contains(e.Path, "/publishers/anthropic/") {
 		protocol = core.Protocol("anthropic-messages")
-		variant = "vertex-anthropic"
+		// Vertex's Anthropic endpoint receives the portable Messages body
+		// through AdaptRequest; the model is owned by the path.
 	}
 	realtime := (*core.RealtimePolicy)(nil)
 	if e.Framing == "websocket" {

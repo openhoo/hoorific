@@ -242,6 +242,22 @@ func clonePrice(src *core.PriceSchedule) *core.PriceSchedule {
 		v := *src.OutputPerMillion
 		dst.OutputPerMillion = &v
 	}
+	if src.CachedInputPerMillion != nil {
+		v := *src.CachedInputPerMillion
+		dst.CachedInputPerMillion = &v
+	}
+	if src.CacheWriteInputPerMillion != nil {
+		v := *src.CacheWriteInputPerMillion
+		dst.CacheWriteInputPerMillion = &v
+	}
+	if src.CacheWrite5mPerMillion != nil {
+		v := *src.CacheWrite5mPerMillion
+		dst.CacheWrite5mPerMillion = &v
+	}
+	if src.CacheWrite1hPerMillion != nil {
+		v := *src.CacheWrite1hPerMillion
+		dst.CacheWrite1hPerMillion = &v
+	}
 	if src.MaximumUnitCost != nil {
 		v := *src.MaximumUnitCost
 		dst.MaximumUnitCost = &v

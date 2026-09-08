@@ -14,9 +14,12 @@ import (
 
 type Route struct {
 	core.NativeEndpoint
-	Protocol core.Protocol
-	Variant  string
-	Response core.NativeResponsePolicy
+	Protocol               core.Protocol
+	Variant                string
+	Response               core.NativeResponsePolicy
+	AllowedRequestHeaders  []string
+	ValidateRequestHeaders func(http.Header) error
+	DefaultBody            string
 }
 type Option func(*Connector)
 type Connector struct {
@@ -153,7 +156,7 @@ func (c *Connector) BindEndpoint(ctx context.Context, conn core.Connection, e co
 	if err := ValidateRelative(path); err != nil {
 		return core.Binding{}, err
 	}
-	return core.Binding{Codec: core.CodecKey{Protocol: route.Protocol, Variant: route.Variant, Operation: e.Operation}, Endpoint: path, Method: e.Method, ModelLocation: e.ModelLocation, Framing: e.Framing, ReplaySafe: e.Method == http.MethodGet || e.Method == http.MethodHead, CancellationSupported: e.Action == "cancel" || strings.HasSuffix(e.Action, ".cancel"), Response: route.Response}, nil
+	return core.Binding{Codec: core.CodecKey{Protocol: route.Protocol, Variant: route.Variant, Operation: e.Operation}, Endpoint: path, Method: e.Method, ModelLocation: e.ModelLocation, Framing: e.Framing, ReplaySafe: e.Method == http.MethodGet || e.Method == http.MethodHead, CancellationSupported: e.Action == "cancel" || strings.HasSuffix(e.Action, ".cancel"), AllowedRequestHeaders: append([]string(nil), route.AllowedRequestHeaders...), ValidateRequestHeaders: route.ValidateRequestHeaders, DefaultBody: route.DefaultBody, Response: route.Response}, nil
 }
 
 type DiscoveryPage struct {

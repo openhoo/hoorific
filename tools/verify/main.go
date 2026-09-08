@@ -46,7 +46,7 @@ type report struct {
 func main() {
 	binary := flag.String("binary", "", "built gateway executable (required)")
 	mode := flag.String("mode", "standalone", "standalone or cluster")
-	scenario := flag.String("scenario", "all", "all, smoke, protocol, sdk, browser, security, streaming, resources, governance, cluster/governance, credentials, credential-lifecycle, realtime, realtime/bedrock, operations, operations/fal, deep-admin, deep-protocol, packaging, live")
+	scenario := flag.String("scenario", "all", "all, smoke, protocol, sdk, browser, security, streaming, resources, governance, cluster/governance, credentials, credential-lifecycle, realtime, realtime/bedrock, operations, operations/fal, cost-safety, deep-admin, deep-protocol, packaging, live")
 	allowPaid := flag.Bool("allow-paid", false, "permit explicitly requested live qualification (still requires credentials)")
 	connections := flag.String("connections", "", "comma-separated configured connection IDs for live qualification")
 	keyFile := flag.String("gateway-key-file", "", "optional gateway key file for routed scenarios")
@@ -100,7 +100,7 @@ func main() {
 		finish(rep, *out)
 		os.Exit(2)
 	}
-	valid := map[string]bool{"all": true, "smoke": true, "protocol": true, "sdk": true, "security": true, "streaming": true, "resources": true, "governance": true, "cluster/governance": true, "credentials": true, "credential-lifecycle": true, "realtime": true, "realtime/bedrock": true, "operations": true, "operations/fal": true, "packaging": true}
+	valid := map[string]bool{"all": true, "smoke": true, "protocol": true, "sdk": true, "security": true, "streaming": true, "resources": true, "governance": true, "cluster/governance": true, "credentials": true, "credential-lifecycle": true, "realtime": true, "realtime/bedrock": true, "operations": true, "operations/fal": true, "cost-safety": true, "packaging": true}
 	valid["deep-admin"], valid["deep-protocol"] = true, true
 	valid["browser"] = true
 	if !valid[*scenario] {
@@ -159,7 +159,7 @@ func main() {
 		add(env.authRejection())
 	}
 	if key == "" {
-		for _, name := range []string{"protocol", "sdk", "browser", "security", "streaming", "resources", "governance", "cluster/governance", "credentials", "credential-lifecycle", "realtime", "realtime/bedrock", "operations", "operations/fal", "deep-admin", "deep-protocol"} {
+		for _, name := range []string{"protocol", "sdk", "browser", "security", "streaming", "resources", "governance", "cluster/governance", "credentials", "credential-lifecycle", "realtime", "realtime/bedrock", "operations", "operations/fal", "cost-safety", "deep-admin", "deep-protocol"} {
 			if *scenario == "all" || *scenario == name {
 				add(result{name, "failed", "required gateway key could not be seeded; scenario cannot execute", 0, nil})
 			}
@@ -206,6 +206,8 @@ func main() {
 			focused = env.operationsSuccess
 		case "operations/fal":
 			focused = env.falNamespace
+		case "cost-safety":
+			focused = env.costSafetyScenarios
 		case "sdk":
 			focused = env.extSDK
 		case "cluster/governance":
@@ -219,6 +221,9 @@ func main() {
 		}
 		if *scenario == "all" {
 			for _, r := range env.extendedScenarios() {
+				add(r)
+			}
+			for _, r := range env.costSafetyScenarios() {
 				add(r)
 			}
 			for _, r := range env.deepAdminScenarios() {

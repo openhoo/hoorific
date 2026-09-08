@@ -39,25 +39,40 @@ func (c *Connector) EndpointsFor(conn core.Connection) ([]core.NativeEndpoint, e
 		return nil, err
 	}
 	full, app, err := configuredPaths(conn)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	direct := origin == "fal.run"
 	var endpoints []core.NativeEndpoint
 	for _, e := range c.Endpoints() {
-		if (e.Action == "inference") != direct { continue }
+		if (e.Action == "inference") != direct {
+			continue
+		}
 		configured := full
 		pattern := e.Path
 		if e.Action != "inference" && e.Action != "queue.submit" {
 			configured = app
-			if suffix := strings.Index(pattern, "/requests/"); suffix >= 0 { pattern = pattern[:suffix] }
+			if suffix := strings.Index(pattern, "/requests/"); suffix >= 0 {
+				pattern = pattern[:suffix]
+			}
 		}
 		parts, actual := strings.Split(pattern, "/"), strings.Split(configured, "/")
-		if len(parts) != len(actual) { continue }
+		if len(parts) != len(actual) {
+			continue
+		}
 		matches := true
 		for i, part := range parts {
-			if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") { continue }
-			if part != actual[i] { matches = false; break }
+			if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
+				continue
+			}
+			if part != actual[i] {
+				matches = false
+				break
+			}
 		}
-		if matches { endpoints = append(endpoints, e) }
+		if matches {
+			endpoints = append(endpoints, e)
+		}
 	}
 	return endpoints, nil
 }
@@ -296,6 +311,7 @@ func responsePolicy(action string) core.NativeResponsePolicy {
 	case "queue.submit":
 		return core.NativeResponsePolicy{
 			IDField: "request_id", StatusField: "status",
+			ResultAction: "queue.result", CancelAction: "queue.cancel",
 			PollAction: "queue.status", PollOperation: "native",
 			PollEndpoint: "{owner}/{app}/requests/{id}/status", PollMethod: http.MethodGet,
 			Async:               true,

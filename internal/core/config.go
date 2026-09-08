@@ -39,8 +39,8 @@ type BootstrapConfig struct {
 	SubscriptionConnectors struct {
 		Enabled bool `json:"enabled"`
 	} `json:"subscription_connectors"`
-	OAuth map[string]OAuthRegistration `json:"oauth,omitempty"`
-	Transport TransportConfig `json:"transport,omitempty"`
+	OAuth     map[string]OAuthRegistration `json:"oauth,omitempty"`
+	Transport TransportConfig              `json:"transport,omitempty"`
 }
 type OAuthRegistration struct {
 	ClientID         string   `json:"client_id"`
@@ -70,7 +70,9 @@ func (c TransportConfig) Validate() error {
 }
 
 func (c TransportConfig) ConnectionLimit() int {
-	if c.MaxConnsPerHost == 0 { return DefaultMaxConnsPerHost }
+	if c.MaxConnsPerHost == 0 {
+		return DefaultMaxConnsPerHost
+	}
 	return c.MaxConnsPerHost
 }
 
@@ -115,6 +117,8 @@ func (c BootstrapConfig) Validate() error {
 	if (c.OIDC.Issuer == "") != (c.OIDC.ClientID == "") {
 		return fmt.Errorf("OIDC issuer and client_id must be configured together")
 	}
-	if err := c.Transport.Validate(); err != nil { return err }
+	if err := c.Transport.Validate(); err != nil {
+		return err
+	}
 	return nil
 }

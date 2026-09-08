@@ -16,10 +16,11 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"hoorific/internal/core"
+	"hoorific/internal/credential"
 	_ "modernc.org/sqlite"
 )
 
-const SchemaVersion = 2
+const SchemaVersion = 3
 const transactionLock int64 = 719240113
 
 type Store struct {
@@ -27,6 +28,7 @@ type Store struct {
 	Dialect        string
 	CursorKey      []byte
 	Config         core.BootstrapConfig
+	masterKeys     credential.Keyring
 	writer         sync.Mutex
 	listenerMu     sync.RWMutex
 	configListener func(string, int64)
@@ -51,16 +53,20 @@ func Open(ctx context.Context, c core.BootstrapConfig) (*Store, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	key, err := os.ReadFile(c.Encryption.KeyFile)
+	rawKey, err := os.ReadFile(c.Encryption.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read master key: %w", err)
 	}
-	if len(key) < 32 {
-		return nil, errors.New("master key must contain at least 32 bytes")
+	keys, err := credential.LoadKeyring(c.Encryption.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load master keyring: %w", err)
 	}
-	mac := hmac.New(sha256.New, key)
+	if _, _, err = keys.Current(); err != nil {
+		return nil, fmt.Errorf("load current master key: %w", err)
+	}
+	mac := hmac.New(sha256.New, rawKey)
 	mac.Write([]byte("hoorific/admin-cursor/v1"))
-	s := &Store{Config: c, CursorKey: mac.Sum(nil)}
+	s := &Store{Config: c, CursorKey: mac.Sum(nil), masterKeys: keys}
 	var driver, dsn string
 	if c.Mode == "standalone" {
 		s.Dialect = "sqlite"

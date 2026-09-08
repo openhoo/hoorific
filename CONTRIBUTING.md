@@ -80,6 +80,21 @@ podman pull docker.io/library/redis:7.4-alpine
   --scenario all \
   --output .artifacts/verify-standalone.json
 ```
+To exercise only the cost/accounting and provider-control contracts against
+owned temporary fixtures:
+
+```sh
+go run ./tools/verify \
+  --binary .artifacts/hoorific \
+  --mode standalone \
+  --scenario cost-safety \
+  --output .artifacts/verify-cost-safety.json
+```
+
+The selector is deterministic and does not contact a paid provider. Record
+the exact selector and result state you actually ran; it is not a claim of
+provider entitlement, pricing, or cache savings.
+
 
 `passed`, `failed`, and `not-run` results are intentional evidence states. Do
 not turn a focused selector into a claim of complete coverage. The cluster
@@ -118,6 +133,25 @@ fixture. It does not use an operator browser session or contact a paid provider.
 Keep screenshots, storage state, temporary keys, databases, and diagnostics
 private; only deliberately redacted JSON/log evidence belongs in shared CI
 artifacts.
+
+## Maintaining console screenshots
+
+Use the real console against a fresh, isolated verifier fixture/runtime; do not
+mock the page or use production data.
+
+1. Follow the [fresh-checkout build order](#fresh-checkout-build-order) before
+   starting the binary so screenshots include the current source console. For
+   an interactive window, use the existing [browser console
+   proof](docs/qualification.md#browser-console-proof) and its verifier
+   `--keep-alive` option.
+2. Capture only synthetic fixture data. Save WebP images framed to remain
+   readable on desktop and mobile, and include descriptive alt text plus a
+   short caption that names the workflow.
+3. Verify that each saved file exists and opens from its committed path by
+   reading it back from disk; a tool or browser preview alone is not proof that
+   an asset was saved. Commit only intended WebP files under `docs/assets/`,
+   never `.artifacts/`, browser storage, credentials, unredacted real-provider
+   responses, or other secrets.
 
 ## Container image
 

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -16,14 +17,32 @@ import (
 	"hoorific/internal/credential"
 )
 
+func writeStoreKeyring(t *testing.T, path, current string, keys map[string][]byte) {
+	t.Helper()
+	encoded := make(map[string]string, len(keys))
+	for id, key := range keys {
+		encoded[id] = base64.RawStdEncoding.EncodeToString(key)
+	}
+	raw, err := json.Marshal(map[string]any{"current": current, "keys": encoded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeStoreTestKeyring(t *testing.T, path string, key []byte) {
+	t.Helper()
+	writeStoreKeyring(t, path, "fixture", map[string][]byte{"fixture": key})
+}
+
 func newTenancyAuthTestStore(t *testing.T) *Store {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
 	key := filepath.Join(dir, "master.key")
-	if err := os.WriteFile(key, make([]byte, 32), 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeStoreTestKeyring(t, key, make([]byte, 32))
 	var cfg core.BootstrapConfig
 	cfg.SchemaVersion = 1
 	cfg.Mode = "standalone"

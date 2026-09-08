@@ -72,6 +72,27 @@ type storedCredential struct {
 	RefreshStatus string
 }
 
+// withCredentialRevision advances the shared configuration generation in the
+// same transaction as a durable credential identity mutation. The listener is
+// notified only after commit so RuntimeState can re-scope disposable routing
+// hints without querying credential state on request paths.
+func (s *Store) withCredentialRevision(ctx context.Context, tenant string, mutate func(*sql.Tx) error) error {
+	var revision int64
+	err := s.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := mutate(tx); err != nil {
+			return err
+		}
+		if err := s.bumpRevisionTx(ctx, tx); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, s.Query("SELECT revision FROM config_state WHERE id=1")).Scan(&revision)
+	})
+	if err == nil {
+		s.notifyConfig(tenant, revision)
+	}
+	return err
+}
+
 func (s *Store) LoadCredential(ctx context.Context, tenant, id string) (out credential.Record, err error) {
 	err = s.WithTx(ctx, func(tx *sql.Tx) error {
 		var row storedCredential
@@ -111,7 +132,7 @@ func (s *Store) PutCredential(ctx context.Context, r credential.Record, expected
 	if expected < 0 || expected == int64(^uint64(0)>>1) || r.Identity.TenantID == "" || r.Identity.ConnectionID == "" || r.Identity.CredentialID == "" || r.Identity.AccountID == "" || r.Identity.Provider == "" || r.Identity.Version != expected+1 {
 		return credential.ErrConflict
 	}
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.withCredentialRevision(ctx, r.Identity.TenantID, func(tx *sql.Tx) error {
 		var old storedCredential
 		v, e := s.durableGet(ctx, tx, r.Identity.TenantID, "credential", r.Identity.ConnectionID, &old)
 		if errors.Is(e, sql.ErrNoRows) && expected == 0 {
@@ -140,7 +161,7 @@ func (s *Store) RewrapCredential(ctx context.Context, r credential.Record, expec
 	if expected < 1 || expected == int64(^uint64(0)>>1) || r.Identity.Version != expected+1 {
 		return credential.ErrConflict
 	}
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.withCredentialRevision(ctx, r.Identity.TenantID, func(tx *sql.Tx) error {
 		var old storedCredential
 		v, err := s.durableGet(ctx, tx, r.Identity.TenantID, "credential", r.Identity.ConnectionID, &old)
 		if err != nil {
@@ -189,7 +210,7 @@ func (s *Store) CommitRefresh(ctx context.Context, i credential.RefreshIntent, r
 	if i.Identity.TenantID == "" || i.Identity.ConnectionID == "" || i.Identity.CredentialID == "" || i.Identity.AccountID == "" || i.Identity.Provider == "" || i.Identity.Version < 1 || i.Identity.Version == int64(^uint64(0)>>1) || r.Status != "active" {
 		return credential.ErrConflict
 	}
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.withCredentialRevision(ctx, i.Identity.TenantID, func(tx *sql.Tx) error {
 		var row storedCredential
 		v, e := s.durableGet(ctx, tx, i.Identity.TenantID, "credential", i.Identity.ConnectionID, &row)
 		if e != nil {
@@ -204,7 +225,7 @@ func (s *Store) CommitRefresh(ctx context.Context, i credential.RefreshIntent, r
 	})
 }
 func (s *Store) FailRefresh(ctx context.Context, i credential.RefreshIntent, reason string) error {
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.withCredentialRevision(ctx, i.Identity.TenantID, func(tx *sql.Tx) error {
 		var row storedCredential
 		v, e := s.durableGet(ctx, tx, i.Identity.TenantID, "credential", i.Identity.ConnectionID, &row)
 		if e != nil {

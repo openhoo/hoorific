@@ -13,13 +13,6 @@ import (
 	"hoorific/internal/core"
 )
 
-type RoutingHints interface {
-	Healthy(context.Context, core.RouteTarget) (bool, error)
-	Set(context.Context, core.RouteTarget, bool, time.Duration) error
-	GetAffinity(context.Context, string) (core.RouteTarget, bool, error)
-	SetAffinity(context.Context, string, core.RouteTarget, time.Duration) error
-}
-
 func closeCredentialLease(lease core.CredentialLease) {
 	_ = core.CloseCredentialLease(lease)
 }

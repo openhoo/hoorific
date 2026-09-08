@@ -21,7 +21,10 @@ func decodeResult(ctx context.Context, r io.Reader) (core.ResultPayload, error) 
 	for name := range object {
 		switch name {
 		case "results":
-		case "id", "meta", "api_version", "billed_units", "documents":
+		case "id", "meta", "api_version", "billed_units":
+			// Documented response metadata is optional and does not affect the
+			// representable ranked-document result.
+		case "documents":
 			return nil, unsupportedResult(name)
 		default:
 			return nil, invalidResponse(name, "unknown field")
@@ -68,9 +71,74 @@ func decodeResult(ctx context.Context, r io.Reader) (core.ResultPayload, error) 
 		}
 		results[i] = core.RankedDocument{Index: index, Score: score}
 	}
-	return core.RerankResult{Results: results}, nil
+	usage, err := usageFromMetadata(object)
+	if err != nil {
+		return nil, err
+	}
+	return core.RerankResult{Results: results, Usage: usage}, nil
 }
 
+func usageFromMetadata(object map[string]any) (*core.Usage, error) {
+	for _, name := range []string{"billed_units", "meta"} {
+		if value, ok := object[name].(map[string]any); ok {
+			if u, found, err := usageFromMap(value); found || err != nil {
+				return u, err
+			}
+		}
+	}
+	return nil, nil
+}
+
+func usageFromMap(object map[string]any) (*core.Usage, bool, error) {
+	if nested, ok := object["tokens"].(map[string]any); ok {
+		if u, found, err := usageFromMap(nested); found || err != nil {
+			return u, found, err
+		}
+	}
+	input, inputFound, err := usageNumber(object, "input_tokens")
+	if err != nil {
+		return nil, true, err
+	}
+	output, outputFound, err := usageNumber(object, "output_tokens")
+	if err != nil {
+		return nil, true, err
+	}
+	if !inputFound && !outputFound {
+		return nil, false, nil
+	}
+	u := &core.Usage{Source: "cohere"}
+	if inputFound {
+		u.Input = &input
+	}
+	if outputFound {
+		u.Output = &output
+	}
+	if inputFound && outputFound {
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if output > maxInt64-input {
+			return nil, true, invalidResponse("usage", "token count overflow")
+		}
+		total := input + output
+		u.Total = &total
+	}
+	return u, true, nil
+}
+
+func usageNumber(object map[string]any, name string) (int64, bool, error) {
+	value, ok := object[name]
+	if !ok {
+		return 0, false, nil
+	}
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, true, invalidResponse("usage."+name, "must be an integer")
+	}
+	n, err := number.Int64()
+	if err != nil || n < 0 {
+		return 0, true, invalidResponse("usage."+name, "must be a non-negative integer")
+	}
+	return n, true, nil
+}
 func encodeResult(ctx context.Context, payload core.ResultPayload, w io.Writer) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -86,9 +154,6 @@ func encodeResult(ctx context.Context, payload core.ResultPayload, w io.Writer) 
 	}
 	if !ok {
 		return invalidResponse("payload", "must be core.RerankResult")
-	}
-	if result.Usage != nil {
-		return unsupportedResult("usage")
 	}
 	type wireResult struct {
 		Index int     `json:"index"`

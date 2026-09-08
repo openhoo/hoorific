@@ -163,12 +163,10 @@ func (a *Actions) routeAction(ctx context.Context, p core.Principal, id string, 
 }
 
 type persistedJobDescriptor struct {
-	ResultAction string                    `json:"result_action"`
-	CancelAction string                    `json:"cancel_action"`
-	Params       map[string]string         `json:"params"`
-	AttemptID    string                    `json:"AttemptID"`
-	Policy       core.NativeResponsePolicy `json:"Policy"`
-	Binding      core.Binding              `json:"Binding"`
+	Params    map[string]string         `json:"params"`
+	AttemptID string                    `json:"AttemptID"`
+	Policy    core.NativeResponsePolicy `json:"Policy"`
+	Binding   core.Binding              `json:"Binding"`
 }
 
 func (a *Actions) jobAction(ctx context.Context, p core.Principal, id, action string, version int64, data json.RawMessage) (json.RawMessage, error) {
@@ -213,28 +211,9 @@ func (a *Actions) jobAction(ctx context.Context, p core.Principal, id, action st
 	if len(job.Metadata) == 0 || json.Unmarshal(job.Metadata, &descriptor) != nil {
 		return nil, actionError("configuration_stale", 503, "Stored job endpoint descriptor is invalid")
 	}
-	endpointAction := descriptor.ResultAction
-	if endpointAction == "" {
-		for path, candidate := range descriptor.Policy.ContinuationActions {
-			if strings.Contains(strings.ToLower(path), "result") || strings.Contains(strings.ToLower(path), "response") || strings.HasSuffix(candidate, ".result") {
-				endpointAction = candidate
-				break
-			}
-		}
-	}
-	if endpointAction == "" {
-		endpointAction = descriptor.Policy.PollAction
-	}
+	endpointAction := descriptor.Policy.ResultAction
 	if action == "cancel" {
-		endpointAction = descriptor.CancelAction
-		if endpointAction == "" {
-			for path, candidate := range descriptor.Policy.ContinuationActions {
-				if strings.Contains(strings.ToLower(path), "cancel") || strings.HasSuffix(candidate, ".cancel") || strings.HasSuffix(candidate, ".delete") {
-					endpointAction = candidate
-					break
-				}
-			}
-		}
+		endpointAction = descriptor.Policy.CancelAction
 	}
 	if endpointAction == "" || len(endpointAction) > 256 || strings.ContainsAny(endpointAction, "\x00\r\n") {
 		return nil, actionError("unsupported_operation", 400, "Job has no explicit native action")
@@ -314,7 +293,11 @@ func (a *Actions) jobAction(ctx context.Context, p core.Principal, id, action st
 		_ = release(job.Status)
 		return nil, actionError("configuration_stale", 503, "Connection HTTP client unavailable")
 	}
-	req, err := http.NewRequestWithContext(ctx, binding.Method, target, nil)
+	var requestBody io.Reader
+	if binding.DefaultBody != "" {
+		requestBody = strings.NewReader(binding.DefaultBody)
+	}
+	req, err := http.NewRequestWithContext(ctx, binding.Method, target, requestBody)
 	if err != nil {
 		_ = release(job.Status)
 		return nil, err
@@ -322,6 +305,10 @@ func (a *Actions) jobAction(ctx context.Context, p core.Principal, id, action st
 	req.Header.Del("Authorization")
 	req.Header.Del("x-api-key")
 	req.Header.Del("x-goog-api-key")
+	req.Header.Set("Accept", "application/json")
+	if binding.DefaultBody != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	for k, values := range binding.Headers {
 		req.Header[k] = append([]string(nil), values...)
 	}
@@ -363,19 +350,82 @@ func (a *Actions) jobAction(ctx context.Context, p core.Principal, id, action st
 		_ = release(job.Status)
 		return nil, core.GatewayError{Code: "upstream_outcome_unknown", HTTPStatus: resp.StatusCode, Message: "Native job operation failed", Origin: "upstream", Retryable: resp.StatusCode >= 500}
 	}
+	var raw json.RawMessage
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		if action != "cancel" {
+			_ = release(job.Status)
+			return nil, actionError("upstream_outcome_unknown", 502, "Native job response is empty")
+		}
+	} else if json.Unmarshal(trimmed, &raw) != nil {
+		_ = release(job.Status)
+		return nil, actionError("upstream_outcome_unknown", 502, "Native job returned invalid JSON")
+	}
 	status := job.Status
 	if action == "cancel" {
-		status = "cancellation_requested"
+		status = cancellationJobStatus(job.Status, binding.Response, raw)
 	}
 	if err := release(status); err != nil {
 		return nil, core.GatewayError{Code: "upstream_outcome_unknown", HTTPStatus: 502, Message: "Native job operation completed but durable state is unknown", Origin: "gateway", Retryable: true}
 	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		body = []byte(`{}`)
-	}
-	var raw json.RawMessage
-	if json.Unmarshal(body, &raw) != nil {
-		return nil, actionError("upstream_outcome_unknown", 502, "Native job returned invalid JSON")
-	}
 	return json.Marshal(map[string]any{"action": action, "status_code": resp.StatusCode, "data": raw, "version": fenceVersion + 1})
+}
+
+func cancellationJobStatus(current string, policy core.NativeResponsePolicy, raw json.RawMessage) string {
+	current = normalizeJobStatus(current)
+	if isTerminalJobStatus(current) {
+		return current
+	}
+	if status := responseJobStatus(raw, policy.StatusField); status != "" {
+		return normalizeJobStatus(status)
+	}
+	// A provider that explicitly declares no response status may use an empty
+	// JSON object as its cancellation receipt. The route descriptor, not a
+	// provider-name switch, makes that evidence meaningful.
+	if policy.StatusField == "" && bytes.Equal(bytes.TrimSpace(raw), []byte("{}")) {
+		return "cancelled"
+	}
+	return current
+}
+
+func responseJobStatus(raw json.RawMessage, path string) string {
+	if path == "" || len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	value := append(json.RawMessage(nil), raw...)
+	for _, part := range strings.Split(path, ".") {
+		if part == "" {
+			return ""
+		}
+		var object map[string]json.RawMessage
+		if json.Unmarshal(value, &object) != nil {
+			return ""
+		}
+		value = object[part]
+		if len(value) == 0 {
+			return ""
+		}
+	}
+	var status string
+	if json.Unmarshal(value, &status) != nil {
+		return ""
+	}
+	return status
+}
+
+func normalizeJobStatus(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status == "canceled" {
+		return "cancelled"
+	}
+	return status
+}
+
+func isTerminalJobStatus(status string) bool {
+	switch normalizeJobStatus(status) {
+	case "complete", "completed", "succeeded", "failed", "expired", "cancelled":
+		return true
+	default:
+		return false
+	}
 }

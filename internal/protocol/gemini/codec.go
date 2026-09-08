@@ -207,11 +207,15 @@ type fileData struct {
 	FileURI  string `json:"fileUri"`
 }
 type part struct {
-	Text     *string           `json:"text,omitempty"`
-	Inline   *inlineData       `json:"inlineData,omitempty"`
-	File     *fileData         `json:"fileData,omitempty"`
-	Call     *functionCall     `json:"functionCall,omitempty"`
-	Response *functionResponse `json:"functionResponse,omitempty"`
+	Text             *string           `json:"text,omitempty"`
+	Inline           *inlineData       `json:"inlineData,omitempty"`
+	File             *fileData         `json:"fileData,omitempty"`
+	Call             *functionCall     `json:"functionCall,omitempty"`
+	Response         *functionResponse `json:"functionResponse,omitempty"`
+	Thought          *bool             `json:"thought,omitempty"`
+	ThoughtSignature string            `json:"thoughtSignature,omitempty"`
+	ExecutableCode   json.RawMessage   `json:"executableCode,omitempty"`
+	CodeExecution    json.RawMessage   `json:"codeExecutionResult,omitempty"`
 }
 type content struct {
 	Role  string `json:"role,omitempty"`
@@ -233,16 +237,384 @@ type config struct {
 	ResponseJSONSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
 }
 type request struct {
-	Model    string    `json:"-"`
-	Contents []content `json:"contents"`
-	System   *content  `json:"systemInstruction,omitempty"`
-	Tools    []tool    `json:"tools,omitempty"`
-	Config   *config   `json:"generationConfig,omitempty"`
+	Model         string    `json:"-"`
+	Contents      []content `json:"contents"`
+	System        *content  `json:"systemInstruction,omitempty"`
+	Tools         []tool    `json:"tools,omitempty"`
+	Config        *config   `json:"generationConfig,omitempty"`
+	CachedContent *string   `json:"cachedContent,omitempty"`
+}
+
+// validateResponseJSON keeps client requests strict while allowing the
+// documented response-only metadata Gemini may add around semantic content.
+// checkJSON has already rejected duplicate keys and trailing values.
+func validateResponseJSON(data []byte) error {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(data, &root) != nil || root == nil {
+		return invalid("body")
+	}
+	for k, raw := range root {
+		switch k {
+		case "candidates":
+			var xs []json.RawMessage
+			if json.Unmarshal(raw, &xs) != nil {
+				return invalid("candidates")
+			}
+			for _, x := range xs {
+				if err := validateCandidateJSON(x); err != nil {
+					return err
+				}
+			}
+		case "promptFeedback":
+			if err := validatePromptFeedbackJSON(raw); err != nil {
+				return err
+			}
+		case "usageMetadata":
+			if err := validateUsageJSON(raw); err != nil {
+				return err
+			}
+		case "modelVersion", "responseId":
+			var s string
+			if json.Unmarshal(raw, &s) != nil {
+				return invalid("response." + k)
+			}
+		case "modelStatus":
+			if err := object(raw, "response.modelStatus"); err != nil {
+				return err
+			}
+		default:
+			return unsupported("response." + k)
+		}
+	}
+	return nil
+}
+
+func validateObjectFields(raw []byte, path string, allowed map[string]bool) (map[string]json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return nil, invalid(path)
+	}
+	for k := range m {
+		if !allowed[k] {
+			return nil, unsupported(path + "." + k)
+		}
+	}
+	return m, nil
+}
+
+func validatePromptFeedbackJSON(raw []byte) error {
+	m, err := validateObjectFields(raw, "promptFeedback", map[string]bool{"blockReason": true, "safetyRatings": true})
+	if err != nil {
+		return err
+	}
+	if v, ok := m["blockReason"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("promptFeedback.blockReason")
+		}
+	}
+	if v, ok := m["safetyRatings"]; ok {
+		if err := validateSafetyRatings(v, "promptFeedback.safetyRatings"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSafetyRatings(raw []byte, path string) error {
+	var xs []json.RawMessage
+	if json.Unmarshal(raw, &xs) != nil {
+		return invalid(path)
+	}
+	for _, x := range xs {
+		m, err := validateObjectFields(x, path+"[]", map[string]bool{
+			"category": true, "probability": true, "probabilityScore": true,
+			"severity": true, "severityScore": true, "blocked": true,
+		})
+		if err != nil {
+			return err
+		}
+		for _, key := range []string{"category", "probability", "severity"} {
+			if v, ok := m[key]; ok {
+				var s string
+				if json.Unmarshal(v, &s) != nil {
+					return invalid(path + "." + key)
+				}
+			}
+		}
+		if v, ok := m["blocked"]; ok {
+			var b bool
+			if json.Unmarshal(v, &b) != nil {
+				return invalid(path + ".blocked")
+			}
+		}
+	}
+	return nil
+}
+
+func validateCandidateJSON(raw []byte) error {
+	m, err := validateObjectFields(raw, "candidate", map[string]bool{
+		"content": true, "finishReason": true, "safetyRatings": true,
+		"citationMetadata": true, "tokenCount": true, "groundingAttributions": true,
+		"groundingMetadata": true, "finishMessage": true, "index": true,
+		"avgLogprobs": true, "logprobsResult": true,
+	})
+	if err != nil {
+		return err
+	}
+	if v, ok := m["content"]; ok {
+		if err := validateResponseContentJSON(v); err != nil {
+			return err
+		}
+	}
+	if v, ok := m["finishReason"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("candidate.finishReason")
+		}
+	}
+	if v, ok := m["finishMessage"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("candidate.finishMessage")
+		}
+	}
+	if v, ok := m["safetyRatings"]; ok {
+		if err := validateSafetyRatings(v, "candidate.safetyRatings"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateResponseContentJSON(raw []byte) error {
+	m, err := validateObjectFields(raw, "candidate.content", map[string]bool{"role": true, "parts": true})
+	if err != nil {
+		return err
+	}
+	if v, ok := m["role"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("candidate.content.role")
+		}
+	}
+	v, ok := m["parts"]
+	if !ok {
+		return invalid("candidate.content.parts")
+	}
+	var xs []json.RawMessage
+	if json.Unmarshal(v, &xs) != nil {
+		return invalid("candidate.content.parts")
+	}
+	for _, x := range xs {
+		if err := validateResponsePartJSON(x); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateFunctionCallJSON(raw []byte) error {
+	m, err := validateObjectFields(raw, "candidate.content.part.functionCall", map[string]bool{"id": true, "name": true, "args": true})
+	if err != nil {
+		return err
+	}
+	if v, ok := m["name"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil || s == "" {
+			return invalid("functionCall.name")
+		}
+	} else {
+		return invalid("functionCall.name")
+	}
+	if v, ok := m["args"]; ok {
+		if err := object(v, "functionCall.args"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateFunctionResponseJSON(raw []byte) error {
+	m, err := validateObjectFields(raw, "candidate.content.part.functionResponse", map[string]bool{"id": true, "name": true, "response": true})
+	if err != nil {
+		return err
+	}
+	if v, ok := m["name"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil || s == "" {
+			return invalid("functionResponse.name")
+		}
+	} else {
+		return invalid("functionResponse.name")
+	}
+	if v, ok := m["response"]; ok {
+		if err := object(v, "functionResponse.response"); err != nil {
+			return err
+		}
+	} else {
+		return invalid("functionResponse.response")
+	}
+	return nil
+}
+
+func validateResponsePartJSON(raw []byte) error {
+	m, err := validateObjectFields(raw, "candidate.content.part", map[string]bool{
+		"thought": true, "thoughtSignature": true, "partMetadata": true,
+		"mediaResolution": true, "mediaProcessing": true, "text": true,
+		"inlineData": true, "fileData": true, "functionCall": true,
+		"functionResponse": true, "executableCode": true, "codeExecutionResult": true,
+		"videoMetadata": true,
+	})
+	if err != nil {
+		return err
+	}
+	if v, ok := m["thought"]; ok {
+		var b bool
+		if json.Unmarshal(v, &b) != nil {
+			return invalid("candidate.content.part.thought")
+		}
+		if b {
+			return unsupported("candidate.content.part.thought")
+		}
+	}
+	if v, ok := m["thoughtSignature"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("candidate.content.part.thoughtSignature")
+		}
+		if s != "" {
+			return unsupported("candidate.content.part.thoughtSignature")
+		}
+	}
+	for _, key := range []string{"partMetadata", "mediaResolution", "videoMetadata"} {
+		if v, ok := m[key]; ok {
+			if err := object(v, "candidate.content.part."+key); err != nil {
+				return err
+			}
+		}
+	}
+	if v, ok := m["functionCall"]; ok {
+		if err := validateFunctionCallJSON(v); err != nil {
+			return err
+		}
+	}
+	if v, ok := m["functionResponse"]; ok {
+		if err := validateFunctionResponseJSON(v); err != nil {
+			return err
+		}
+	}
+	for _, key := range []string{"inlineData", "fileData"} {
+		if v, ok := m[key]; ok {
+			var allowed map[string]bool
+			if key == "inlineData" {
+				allowed = map[string]bool{"mimeType": true, "data": true}
+			} else {
+				allowed = map[string]bool{"mimeType": true, "fileUri": true}
+			}
+			if _, err := validateObjectFields(v, "candidate.content.part."+key, allowed); err != nil {
+				return err
+			}
+		}
+	}
+	for _, key := range []string{"executableCode", "codeExecutionResult"} {
+		if _, ok := m[key]; ok {
+			return unsupported("candidate.content.part." + key)
+		}
+	}
+	if v, ok := m["mediaProcessing"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("candidate.content.part.mediaProcessing")
+		}
+	}
+	if v, ok := m["text"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("candidate.content.part.text")
+		}
+	}
+	return nil
+}
+
+func validateUsageJSON(raw []byte) error {
+	m, err := validateObjectFields(raw, "usageMetadata", map[string]bool{
+		"promptTokenCount": true, "cachedContentTokenCount": true,
+		"candidatesTokenCount": true, "toolUsePromptTokenCount": true,
+		"thoughtsTokenCount": true, "totalTokenCount": true,
+		"promptTokensDetails": true, "cacheTokensDetails": true,
+		"candidatesTokensDetails": true, "toolUsePromptTokensDetails": true,
+		"serviceTier": true,
+	})
+	if err != nil {
+		return err
+	}
+	for _, key := range []string{"promptTokenCount", "cachedContentTokenCount", "candidatesTokenCount", "toolUsePromptTokenCount", "thoughtsTokenCount", "totalTokenCount"} {
+		if v, ok := m[key]; ok {
+			var n int64
+			if json.Unmarshal(v, &n) != nil {
+				return invalid("usageMetadata." + key)
+			}
+		}
+	}
+	if v, ok := m["serviceTier"]; ok {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return invalid("usageMetadata.serviceTier")
+		}
+	}
+	for _, key := range []string{"promptTokensDetails", "cacheTokensDetails", "candidatesTokensDetails", "toolUsePromptTokensDetails"} {
+		if v, ok := m[key]; ok {
+			var xs []json.RawMessage
+			if json.Unmarshal(v, &xs) != nil {
+				return invalid("usageMetadata." + key)
+			}
+			for _, x := range xs {
+				if err := object(x, "usageMetadata."+key); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func decodeResponseData(data []byte, out any) error {
+	if e := checkJSON(data); e != nil {
+		return e
+	}
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return invalid("body")
+	}
+	if e := validateResponseJSON(data); e != nil {
+		return e
+	}
+	if e := json.Unmarshal(data, out); e != nil {
+		return invalid("JSON field type")
+	}
+	return nil
+}
+
+func readResponseJSON(ctx context.Context, r io.Reader, out any) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	b, e := io.ReadAll(io.LimitReader(r, 16<<20+1))
+	if e != nil {
+		return e
+	}
+	if len(b) > 16<<20 {
+		return invalid("body size")
+	}
+	return decodeResponseData(b, out)
 }
 
 func decodeParts(parts []part) ([]core.ContentBlock, error) {
 	out := make([]core.ContentBlock, 0, len(parts))
 	for _, p := range parts {
+		if p.Thought != nil || p.ThoughtSignature != "" || len(p.ExecutableCode) > 0 || len(p.CodeExecution) > 0 {
+			return nil, unsupported("thought or code-execution part")
+		}
 		n := 0
 		if p.Text != nil {
 			n++
@@ -318,6 +690,9 @@ func decodeParts(parts []part) ([]core.ContentBlock, error) {
 func encodeParts(blocks []core.ContentBlock, names map[string]string) ([]part, error) {
 	out := make([]part, 0, len(blocks))
 	for _, b := range blocks {
+		if b.CacheControl != nil || b.CacheBreakpoint {
+			return nil, unsupported("content cache control")
+		}
 		p := part{}
 		switch b.Kind {
 		case "text":
@@ -441,8 +816,31 @@ func nativeSchema(data json.RawMessage) (json.RawMessage, error) {
 	}
 	return json.Marshal(value)
 }
+
+func validCachedContent(name string) bool {
+	parts := strings.Split(name, "/")
+	switch {
+	case len(parts) == 2 && parts[0] == "cachedContents":
+		return safeResourceSegment(parts[1])
+	case len(parts) == 6 && parts[0] == "projects" && parts[2] == "locations" && parts[4] == "cachedContents":
+		return safeResourceSegment(parts[1]) && safeResourceSegment(parts[3]) && safeResourceSegment(parts[5])
+	default:
+		return false
+	}
+}
+
+func safeResourceSegment(s string) bool {
+	return s != "" && !strings.ContainsAny(s, "{}:")
+}
+
 func fromRequest(w request) (core.Conversation, error) {
 	c := core.Conversation{Model: w.Model}
+	if w.CachedContent != nil {
+		if !validCachedContent(*w.CachedContent) {
+			return c, invalid("cachedContent")
+		}
+		c.Cache = &core.PromptCache{Protocol: core.Protocol("gemini-content"), CachedContent: *w.CachedContent}
+	}
 	if len(w.Contents) == 0 {
 		return c, invalid("contents")
 	}
@@ -548,8 +946,30 @@ func limits(c core.Conversation) error {
 	}
 	return nil
 }
+func cacheRequest(c *core.PromptCache) (*string, error) {
+	if c == nil {
+		return nil, nil
+	}
+	if c.Protocol != "" && c.Protocol != core.Protocol("gemini-content") {
+		return nil, unsupported("cache.protocol")
+	}
+	if c.CachedContent == "" || !validCachedContent(c.CachedContent) {
+		return nil, invalid("cache.cachedContent")
+	}
+	if c.Key != "" || c.Retention != "" || c.Mode != "" || c.TTL != "" || c.SessionID != "" || c.Control != nil {
+		return nil, unsupported("cache")
+	}
+	name := c.CachedContent
+	return &name, nil
+}
+
 func toRequest(c core.Conversation) (request, error) {
 	w := request{Model: c.Model}
+	cached, e := cacheRequest(c.Cache)
+	if e != nil {
+		return w, e
+	}
+	w.CachedContent = cached
 	if c.StructuredOutputName != "" || c.StructuredOutputDescription != "" || c.StructuredOutputStrict != nil {
 		return w, unsupported("structured output metadata")
 	}
@@ -624,6 +1044,9 @@ func toRequest(c core.Conversation) (request, error) {
 	if len(c.Tools) > 0 {
 		t := tool{}
 		for _, f := range c.Tools {
+			if f.CacheControl != nil || f.CacheBreakpoint {
+				return w, unsupported("tool cache control")
+			}
 			if f.Name == "" {
 				return w, invalid("tool.name")
 			}
@@ -666,33 +1089,129 @@ func (*Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.Wri
 	return writeJSON(ctx, w, v)
 }
 
+type safetyRating struct {
+	Category         string   `json:"category,omitempty"`
+	Probability      string   `json:"probability,omitempty"`
+	ProbabilityScore *float64 `json:"probabilityScore,omitempty"`
+	Severity         string   `json:"severity,omitempty"`
+	SeverityScore    *float64 `json:"severityScore,omitempty"`
+	Blocked          *bool    `json:"blocked,omitempty"`
+}
+type promptFeedback struct {
+	BlockReason   string         `json:"blockReason,omitempty"`
+	SafetyRatings []safetyRating `json:"safetyRatings,omitempty"`
+}
 type usage struct {
-	Input  *int64 `json:"promptTokenCount,omitempty"`
-	Output *int64 `json:"candidatesTokenCount,omitempty"`
-	Total  *int64 `json:"totalTokenCount,omitempty"`
+	Input       *int64 `json:"promptTokenCount,omitempty"`
+	CachedInput *int64 `json:"cachedContentTokenCount,omitempty"`
+	Output      *int64 `json:"candidatesTokenCount,omitempty"`
+	ToolInput   *int64 `json:"toolUsePromptTokenCount,omitempty"`
+	Thoughts    *int64 `json:"thoughtsTokenCount,omitempty"`
+	Total       *int64 `json:"totalTokenCount,omitempty"`
 }
 type candidate struct {
-	Content *content `json:"content,omitempty"`
-	Finish  string   `json:"finishReason,omitempty"`
-	Index   *int     `json:"index,omitempty"`
+	Content       *content       `json:"content,omitempty"`
+	Finish        string         `json:"finishReason,omitempty"`
+	Index         *int           `json:"index,omitempty"`
+	SafetyRatings []safetyRating `json:"safetyRatings,omitempty"`
+	FinishMessage string         `json:"finishMessage,omitempty"`
 }
 type response struct {
-	Candidates []candidate `json:"candidates,omitempty"`
-	Usage      *usage      `json:"usageMetadata,omitempty"`
-	Model      string      `json:"modelVersion,omitempty"`
-	ID         string      `json:"responseId,omitempty"`
+	Candidates     []candidate     `json:"candidates,omitempty"`
+	PromptFeedback *promptFeedback `json:"promptFeedback,omitempty"`
+	Usage          *usage          `json:"usageMetadata,omitempty"`
+	Model          string          `json:"modelVersion,omitempty"`
+	ID             string          `json:"responseId,omitempty"`
+	ModelStatus    json.RawMessage `json:"modelStatus,omitempty"`
+}
+
+func addCounts(a, b *int64) (*int64, error) {
+	if a == nil && b == nil {
+		return nil, nil
+	}
+	var x int64
+	if a != nil {
+		x = *a
+	}
+	if b != nil {
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if *b > 0 && x > maxInt64-*b {
+			return nil, invalid("usageMetadata")
+		}
+		x += *b
+	}
+	return &x, nil
 }
 
 func validUsage(u *usage) error {
-	if u != nil {
-		for _, n := range []*int64{u.Input, u.Output, u.Total} {
-			if n != nil && *n < 0 {
-				return invalid("usageMetadata")
-			}
+	if u == nil {
+		return nil
+	}
+	for _, n := range []*int64{u.Input, u.CachedInput, u.Output, u.ToolInput, u.Thoughts, u.Total} {
+		if n != nil && *n < 0 {
+			return invalid("usageMetadata")
+		}
+	}
+	if u.Input != nil && u.Output != nil && u.Total != nil {
+		out, e := addCounts(u.Output, u.Thoughts)
+		if e != nil {
+			return e
+		}
+		sum, e := addCounts(u.Input, out)
+		if e != nil || sum == nil || *sum != *u.Total {
+			return invalid("usageMetadata.totalTokenCount")
 		}
 	}
 	return nil
 }
+
+func usageCore(u *usage) (*core.Usage, error) {
+	if u == nil {
+		return nil, nil
+	}
+	if e := validUsage(u); e != nil {
+		return nil, e
+	}
+	output, e := addCounts(u.Output, u.Thoughts)
+	if e != nil {
+		return nil, e
+	}
+	return &core.Usage{
+		Input:           u.Input,
+		Output:          output,
+		Total:           u.Total,
+		CachedInput:     u.CachedInput,
+		ReasoningOutput: u.Thoughts,
+		ToolInput:       u.ToolInput,
+		Source:          "provider",
+	}, nil
+}
+
+func blocked(ratings []safetyRating) bool {
+	for _, rating := range ratings {
+		if rating.Blocked != nil && *rating.Blocked {
+			return true
+		}
+	}
+	return false
+}
+
+func promptFinish(p *promptFeedback) (core.Finish, error) {
+	if p == nil || p.BlockReason == "" {
+		return core.Finish{}, invalid("promptFeedback.blockReason")
+	}
+	switch p.BlockReason {
+	case "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY":
+		return core.Finish{Reason: "content_filter", Status: "content_filter"}, nil
+	case "OTHER":
+		return core.Finish{Reason: "error", Status: "error"}, nil
+	case "BLOCK_REASON_UNSPECIFIED":
+		return core.Finish{}, unsupported("promptFeedback.blockReason")
+	default:
+		return core.Finish{}, unsupported("promptFeedback.blockReason." + p.BlockReason)
+	}
+}
+
 func finish(native string, hasTools bool) (core.Finish, error) {
 	var reason, status string
 	switch native {
@@ -707,10 +1226,10 @@ func finish(native string, hasTools bool) (core.Finish, error) {
 	case "MAX_TOKENS":
 		reason = "length"
 		status = "length"
-	case "SAFETY", "RECITATION", "LANGUAGE", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+	case "SAFETY", "RECITATION", "LANGUAGE", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "ESCALATION":
 		reason = "content_filter"
 		status = "content_filter"
-	case "OTHER", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "MALFORMED_RESPONSE":
+	case "OTHER", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "MALFORMED_RESPONSE", "MISSING_THOUGHT_SIGNATURE":
 		reason = "error"
 		status = "error"
 	default:
@@ -718,16 +1237,16 @@ func finish(native string, hasTools bool) (core.Finish, error) {
 	}
 	return core.Finish{Reason: reason, Status: status}, nil
 }
+
 func fromResponse(w response, terminal bool) (core.GenerationResult, error) {
 	r := core.GenerationResult{ID: w.ID, Model: w.Model}
 	if len(w.Candidates) > 1 {
 		return r, unsupported("multiple candidates")
 	}
-	if e := validUsage(w.Usage); e != nil {
+	var e error
+	r.Usage, e = usageCore(w.Usage)
+	if e != nil {
 		return r, e
-	}
-	if w.Usage != nil {
-		r.Usage = &core.Usage{Input: w.Usage.Input, Output: w.Usage.Output, Total: w.Usage.Total, Source: "provider"}
 	}
 	if len(w.Candidates) == 1 {
 		c := w.Candidates[0]
@@ -738,7 +1257,6 @@ func fromResponse(w response, terminal bool) (core.GenerationResult, error) {
 			if c.Content.Role != "" && c.Content.Role != "model" {
 				return r, invalid("candidate role")
 			}
-			var e error
 			r.Blocks, e = decodeParts(c.Content.Parts)
 			if e != nil {
 				return r, e
@@ -751,11 +1269,20 @@ func fromResponse(w response, terminal bool) (core.GenerationResult, error) {
 			}
 			tools = tools || b.Kind == "tool_call"
 		}
-		var e error
 		r.Finish, e = finish(c.Finish, tools)
 		if e != nil {
 			return r, e
 		}
+		if r.Finish.Reason == "" && blocked(c.SafetyRatings) {
+			r.Finish = core.Finish{Reason: "content_filter", Status: "content_filter"}
+		}
+	} else if w.PromptFeedback != nil {
+		r.Finish, e = promptFinish(w.PromptFeedback)
+		if e != nil {
+			return r, e
+		}
+	} else if terminal {
+		return r, invalid("missing candidates")
 	}
 	if terminal && r.Finish.Reason == "" {
 		return r, invalid("missing finishReason")
@@ -810,6 +1337,32 @@ func finishReason(f core.Finish) (string, error) {
 	}
 	return "", unsupported("finish")
 }
+func usageWire(u *core.Usage) (*usage, error) {
+	if u == nil {
+		return nil, nil
+	}
+	candidates := u.Output
+	if u.ReasoningOutput != nil {
+		if u.Output == nil || *u.ReasoningOutput > *u.Output {
+			return nil, invalid("usage.reasoning_output")
+		}
+		n := *u.Output - *u.ReasoningOutput
+		candidates = &n
+	}
+	out := &usage{
+		Input:       u.Input,
+		CachedInput: u.CachedInput,
+		Output:      candidates,
+		ToolInput:   u.ToolInput,
+		Thoughts:    u.ReasoningOutput,
+		Total:       u.Total,
+	}
+	if e := validUsage(out); e != nil {
+		return nil, e
+	}
+	return out, nil
+}
+
 func toResponse(r core.GenerationResult, terminal bool) (response, error) {
 	w := response{ID: r.ID, Model: r.Model}
 	for _, b := range r.Blocks {
@@ -834,17 +1387,15 @@ func toResponse(r core.GenerationResult, terminal bool) (response, error) {
 	if len(p) > 0 || c.Finish != "" {
 		w.Candidates = []candidate{c}
 	}
-	if r.Usage != nil {
-		w.Usage = &usage{Input: r.Usage.Input, Output: r.Usage.Output, Total: r.Usage.Total}
-		if e := validUsage(w.Usage); e != nil {
-			return w, e
-		}
+	w.Usage, e = usageWire(r.Usage)
+	if e != nil {
+		return w, e
 	}
 	return w, nil
 }
 func (*Codec) DecodeResult(ctx context.Context, r io.Reader) (core.ResultPayload, error) {
 	var w response
-	if e := readJSON(ctx, r, &w); e != nil {
+	if e := readResponseJSON(ctx, r, &w); e != nil {
 		return nil, e
 	}
 	v, e := fromResponse(w, true)
@@ -870,11 +1421,12 @@ var _ core.RequestCodec = (*CountTokensCodec)(nil)
 var _ core.ResultCodec = (*CountTokensCodec)(nil)
 
 type countGenerate struct {
-	Model    string    `json:"model"`
-	Contents []content `json:"contents"`
-	System   *content  `json:"systemInstruction,omitempty"`
-	Tools    []tool    `json:"tools,omitempty"`
-	Config   *config   `json:"generationConfig,omitempty"`
+	Model         string    `json:"model"`
+	Contents      []content `json:"contents"`
+	System        *content  `json:"systemInstruction,omitempty"`
+	Tools         []tool    `json:"tools,omitempty"`
+	Config        *config   `json:"generationConfig,omitempty"`
+	CachedContent *string   `json:"cachedContent,omitempty"`
 }
 type countRequest struct {
 	Contents []content      `json:"contents,omitempty"`
@@ -894,7 +1446,7 @@ func (*CountTokensCodec) DecodeRequest(ctx context.Context, r io.Reader) (core.R
 		if w.Contents != nil {
 			return nil, invalid("count request union")
 		}
-		v = request{Model: w.Generate.Model, Contents: w.Generate.Contents, System: w.Generate.System, Tools: w.Generate.Tools, Config: w.Generate.Config}
+		v = request{Model: w.Generate.Model, Contents: w.Generate.Contents, System: w.Generate.System, Tools: w.Generate.Tools, Config: w.Generate.Config, CachedContent: w.Generate.CachedContent}
 	}
 	c, e := fromRequest(v)
 	if e != nil {
@@ -914,10 +1466,10 @@ func (*CountTokensCodec) EncodeRequest(ctx context.Context, p core.RequestPayloa
 	if e != nil {
 		return e
 	}
-	if v.System == nil && len(v.Tools) == 0 && v.Config == nil {
+	if v.System == nil && len(v.Tools) == 0 && v.Config == nil && v.CachedContent == nil {
 		return writeJSON(ctx, w, countRequest{Contents: v.Contents})
 	}
-	g := countGenerate{Model: v.Model, Contents: v.Contents, System: v.System, Tools: v.Tools, Config: v.Config}
+	g := countGenerate{Model: v.Model, Contents: v.Contents, System: v.System, Tools: v.Tools, Config: v.Config, CachedContent: v.CachedContent}
 	if g.Model == "" {
 		return invalid("count generateContentRequest.model")
 	}

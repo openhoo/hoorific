@@ -210,7 +210,7 @@ func serve(cfg core.BootstrapConfig, db *store.Store, keys credential.Keyring) e
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 	metrics := gateway.NewMetrics(registry)
-	engine, err := gateway.New(gateway.Dependencies{Auth: db, Snapshots: runtimeState, Admission: db, Planner: db, Credentials: identity, Connectors: connectors, Codecs: protocol.Builtins(), Client: clients, Spool: spool, Resources: db, Keys: keys, Tickets: db, Metrics: metrics, Hints: runtimeState.Hints, PublicURL: cfg.PublicURLs["inference"]})
+	engine, err := gateway.New(gateway.Dependencies{Auth: db, Snapshots: runtimeState, Admission: db, Planner: db, Credentials: identity, Idempotency: db, Connectors: connectors, Codecs: protocol.Builtins(), Client: clients, Spool: spool, Resources: db, Keys: keys, Tickets: db, Metrics: metrics, Hints: runtimeState.Hints, PublicURL: cfg.PublicURLs["inference"]})
 	if err != nil {
 		return err
 	}

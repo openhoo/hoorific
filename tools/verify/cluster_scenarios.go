@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,6 +69,207 @@ func (e *environment) clusterCharges(c *verifyCluster) (count, cost int64, err e
 	return count, cost, err
 }
 
+func clusterOperationRequest(target *environment, f *operationFixture, body []byte, headers map[string]string) (operationReply, error) {
+	if target == nil || target.client == nil || target.inference == "" || f == nil || f.key == "" {
+		return operationReply{}, fmt.Errorf("cluster idempotency request requires two live endpoints and a scoped fixture key")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+target.inference+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return operationReply{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+f.key)
+	req.Header.Set("Content-Type", "application/json")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	client := *target.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return operationReply{header: make(http.Header)}, err
+	}
+	defer resp.Body.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
+	reply := operationReply{status: resp.StatusCode, header: resp.Header.Clone(), body: raw}
+	if readErr != nil {
+		return reply, readErr
+	}
+	if len(raw) > 4<<20 {
+		return reply, fmt.Errorf("cluster idempotency response exceeded fixture bound")
+	}
+	return reply, nil
+}
+
+func (e *environment) clusterIdempotencyReplay(replica *environment) result {
+	start := time.Now()
+	f, err := e.operationFixture("cluster-idempotency", "openai", []string{"generate"}, func(w http.ResponseWriter, r *http.Request) error {
+		return operationJSON(w, map[string]any{
+			"id":     "cluster-idempotent",
+			"object": "chat.completion",
+			"model":  "fixture-model",
+			"choices": []any{map[string]any{
+				"message":       map[string]any{"role": "assistant", "content": "OK"},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+		})
+	})
+	if f != nil {
+		defer f.server.Close()
+	}
+	if err != nil {
+		return result{"cluster/idempotency-replay", "failed", "scoped fixture setup failed: " + err.Error(), time.Since(start).Milliseconds(), nil}
+	}
+	body := []byte(`{"model":"` + f.alias + `","messages":[{"role":"user","content":"cluster durable replay"}],"max_tokens":8}`)
+	headers := map[string]string{"Idempotency-Key": "cluster-durable-replay"}
+	first, firstErr := clusterOperationRequest(e, f, body, headers)
+	second, secondErr := clusterOperationRequest(replica, f, body, headers)
+	firstRequestID := first.header.Get("X-Request-ID")
+	secondRequestID := second.header.Get("X-Request-ID")
+	evidence := map[string]any{
+		"fixture_id":                f.id,
+		"alias":                     f.alias,
+		"primary_status":            first.status,
+		"replica_status":            second.status,
+		"primary_request_id":        firstRequestID,
+		"replica_request_id":        secondRequestID,
+		"request_id_equal":          firstRequestID != "" && firstRequestID == secondRequestID,
+		"response_body_equal":       bytes.Equal(first.body, second.body),
+		"response_contains_fixture": bytes.Contains(first.body, []byte("OK")),
+		"upstream_calls":            f.count(),
+	}
+	if firstErr != nil {
+		err = fmt.Errorf("primary idempotency request failed: %w", firstErr)
+	} else if secondErr != nil {
+		err = fmt.Errorf("replica idempotency replay failed: %w", secondErr)
+	} else if first.status != http.StatusOK || second.status != http.StatusOK || !bytes.Equal(first.body, second.body) || !bytes.Contains(first.body, []byte("OK")) || firstRequestID == "" || firstRequestID != secondRequestID || f.count() != 1 {
+		err = fmt.Errorf("completed cross-replica idempotency replay was not exact or redispatched: statuses=%d/%d request_ids=%q/%q calls=%d", first.status, second.status, firstRequestID, secondRequestID, f.count())
+	}
+
+	var concurrentErr error
+	var blockedCalls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	releaseOwner := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	blocked, blockedSetupErr := e.operationFixture("cluster-idempotency-pending", "openai", []string{"generate"}, func(w http.ResponseWriter, r *http.Request) error {
+		blockedCalls.Add(1)
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return operationJSON(w, map[string]any{
+			"id":      "cluster-pending",
+			"object":  "chat.completion",
+			"model":   "fixture-model",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "OK"}, "finish_reason": "stop"}},
+			"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	})
+	if blocked != nil {
+		defer blocked.server.Close()
+	}
+	pendingEvidence := map[string]any{}
+	if blockedSetupErr != nil {
+		concurrentErr = fmt.Errorf("scoped pending fixture setup failed: %w", blockedSetupErr)
+	} else {
+		pendingBody := []byte(`{"model":"` + blocked.alias + `","messages":[{"role":"user","content":"cluster pending replay"}],"max_tokens":8}`)
+		pendingHeaders := map[string]string{"Idempotency-Key": "cluster-pending-replay"}
+		type requestResult struct {
+			reply operationReply
+			err   error
+		}
+		ownerDone := make(chan requestResult, 1)
+		go func() {
+			reply, requestErr := clusterOperationRequest(e, blocked, pendingBody, pendingHeaders)
+			ownerDone <- requestResult{reply: reply, err: requestErr}
+		}()
+		pending := operationReply{}
+		var pendingErr error
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			pendingErr = fmt.Errorf("idempotency owner did not reach the scoped upstream fixture")
+		}
+		if pendingErr == nil {
+			pending, pendingErr = clusterOperationRequest(replica, blocked, pendingBody, pendingHeaders)
+			if pendingErr == nil && (pending.status != http.StatusConflict || pending.header.Get("X-Hoorific-Error-Code") != "idempotency_in_progress" || blockedCalls.Load() != 1) {
+				pendingErr = fmt.Errorf("in-flight cross-replica request was not rejected without dispatch: HTTP %d/%s calls=%d", pending.status, pending.header.Get("X-Hoorific-Error-Code"), blockedCalls.Load())
+			}
+		}
+		releaseOwner()
+		owner := requestResult{}
+		var ownerWaitErr error
+		select {
+		case owner = <-ownerDone:
+		case <-time.After(5 * time.Second):
+			ownerWaitErr = fmt.Errorf("idempotency owner did not complete after release")
+		}
+		replay := operationReply{}
+		var replayErr error
+		if ownerWaitErr == nil && owner.err == nil && owner.reply.status == http.StatusOK {
+			replay, replayErr = clusterOperationRequest(replica, blocked, pendingBody, pendingHeaders)
+			if replayErr == nil && (replay.status != http.StatusOK || !bytes.Equal(replay.body, owner.reply.body) || owner.reply.header.Get("X-Request-ID") == "" || replay.header.Get("X-Request-ID") != owner.reply.header.Get("X-Request-ID") || blockedCalls.Load() != 1) {
+				replayErr = fmt.Errorf("completed cross-replica replay after pending owner was not exact or redispatched: status=%d request_ids=%q/%q calls=%d", replay.status, owner.reply.header.Get("X-Request-ID"), replay.header.Get("X-Request-ID"), blockedCalls.Load())
+			}
+		}
+		if pendingErr != nil {
+			concurrentErr = pendingErr
+		} else if ownerWaitErr != nil {
+			concurrentErr = ownerWaitErr
+		} else if owner.err != nil {
+			concurrentErr = fmt.Errorf("idempotency owner request failed: %w", owner.err)
+		} else if owner.reply.status != http.StatusOK || !bytes.Contains(owner.reply.body, []byte("OK")) {
+			concurrentErr = fmt.Errorf("idempotency owner returned HTTP %d without fixture response", owner.reply.status)
+		} else if replayErr != nil {
+			concurrentErr = replayErr
+		}
+		fixtureCalls := -1
+		if ownerWaitErr == nil {
+			fixtureCalls = blocked.count()
+		}
+		ownerRequestID := owner.reply.header.Get("X-Request-ID")
+		replayRequestID := replay.header.Get("X-Request-ID")
+		pendingError := ""
+		if pendingErr != nil {
+			pendingError = pendingErr.Error()
+		}
+		ownerError := ""
+		if owner.err != nil {
+			ownerError = owner.err.Error()
+		}
+		replayError := ""
+		if replayErr != nil {
+			replayError = replayErr.Error()
+		}
+		pendingEvidence = map[string]any{
+			"pending_status":      pending.status,
+			"pending_error_code":  pending.header.Get("X-Hoorific-Error-Code"),
+			"pending_error":       pendingError,
+			"owner_status":        owner.reply.status,
+			"owner_request_id":    ownerRequestID,
+			"owner_error":         ownerError,
+			"replay_status":       replay.status,
+			"replay_request_id":   replayRequestID,
+			"replay_error":        replayError,
+			"request_id_equal":    ownerRequestID != "" && ownerRequestID == replayRequestID,
+			"response_body_equal": bytes.Equal(owner.reply.body, replay.body),
+			"upstream_calls":      blockedCalls.Load(),
+			"fixture_calls":       fixtureCalls,
+		}
+	}
+	if err == nil && concurrentErr != nil {
+		err = fmt.Errorf("concurrent cross-replica idempotency proof failed: %w", concurrentErr)
+	}
+	return extResult("cluster/idempotency-replay", start, map[string]any{
+		"completed":   evidence,
+		"pending":     pendingEvidence,
+		"quota_scope": "checked before cluster-hard-cost allowance mutation",
+	}, err)
+}
+
 func (e *environment) clusterScenarios() []result {
 	start := time.Now()
 	if e.mode != "cluster" {
@@ -100,6 +302,7 @@ func (e *environment) clusterScenarios() []result {
 			out = append(out, result{"cluster/baseline-" + name, "passed", "independent process served validated gateway API response", time.Since(start).Milliseconds(), map[string]any{"status": status}})
 		}
 	}
+	out = append(out, e.clusterIdempotencyReplay(replica))
 
 	// Declared context bound 32768 at 1000 nanodollars/token plus the
 	// request's 16 output tokens at 2000 nanodollars/token. One reservation

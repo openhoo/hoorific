@@ -58,7 +58,7 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			Type    string     `json:"type"`
 			Message resultWire `json:"message"`
 		}
-		if err := strict([]byte(e.Data), &x); err != nil {
+		if err := tolerant([]byte(e.Data), &x); err != nil {
 			return nil, err
 		}
 		if x.Type != "message_start" || x.Message.ID == "" || x.Message.Model == "" {
@@ -66,10 +66,7 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 		}
 		d.started = true
 		if x.Message.Usage != nil {
-			if x.Message.Usage.Input != nil && *x.Message.Usage.Input < 0 || x.Message.Usage.Output != nil && *x.Message.Usage.Output < 0 {
-				return nil, unsupported("usage")
-			}
-			d.usage = *x.Message.Usage
+			mergeUsageWire(&d.usage, x.Message.Usage)
 		}
 		return core.Start{ID: x.Message.ID, Model: x.Message.Model}, nil
 	case "content_block_start":
@@ -81,7 +78,7 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			Index   int       `json:"index"`
 			Content blockWire `json:"content_block"`
 		}
-		if err := strict([]byte(e.Data), &x); err != nil {
+		if err := tolerant([]byte(e.Data), &x); err != nil {
 			return nil, err
 		}
 		if x.Index < 0 {
@@ -91,6 +88,8 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 		switch kind {
 		case "text":
 			kind = "text"
+		case "thinking":
+			kind = "reasoning"
 		case "tool_use":
 			kind = "tool_call"
 		default:
@@ -117,7 +116,7 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			Index int             `json:"index"`
 			Delta json.RawMessage `json:"delta"`
 		}
-		if err := strict([]byte(e.Data), &x); err != nil {
+		if err := tolerant([]byte(e.Data), &x); err != nil {
 			return nil, err
 		}
 		kind, ok := d.blocks[x.Index]
@@ -129,12 +128,12 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			Text    string `json:"text"`
 			Partial string `json:"partial_json"`
 		}
-		if err := strict(x.Delta, &dh); err != nil {
+		if err := tolerant(x.Delta, &dh); err != nil {
 			return nil, err
 		}
 		switch dh.Type {
 		case "text_delta":
-			if kind != "text" {
+			if kind != "text" && kind != "reasoning" {
 				return nil, unsupported("delta.type")
 			}
 			return core.TextDelta{Index: core.Index{Block: x.Index}, Text: dh.Text}, nil
@@ -154,7 +153,7 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			Type  string `json:"type"`
 			Index int    `json:"index"`
 		}
-		if err := strict([]byte(e.Data), &x); err != nil {
+		if err := tolerant([]byte(e.Data), &x); err != nil {
 			return nil, err
 		}
 		if _, ok := d.blocks[x.Index]; !ok {
@@ -174,7 +173,7 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			} `json:"delta"`
 			Usage *usageWire `json:"usage"`
 		}
-		if err := strict([]byte(e.Data), &x); err != nil {
+		if err := tolerant([]byte(e.Data), &x); err != nil {
 			return nil, err
 		}
 		var fin *core.Finish
@@ -194,28 +193,19 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			fin = &f
 		}
 		if x.Usage != nil {
-			if x.Usage.Input != nil && *x.Usage.Input < 0 || x.Usage.Output != nil && *x.Usage.Output < 0 {
-				return nil, unsupported("usage")
-			}
 			d.usageSeen = true
+			mergeUsageWire(&d.usage, x.Usage)
+			u, err := usageFromWire(&d.usage)
+			if err != nil {
+				return nil, err
+			}
 			if fin != nil {
 				d.pendingFinish = fin
 			}
-			if x.Usage.Input != nil {
-				d.usage.Input = x.Usage.Input
+			if u == nil {
+				return nil, unsupported("usage")
 			}
-			if x.Usage.Output != nil {
-				d.usage.Output = x.Usage.Output
-			}
-			var total *int64
-			if d.usage.Input != nil && d.usage.Output != nil {
-				if *d.usage.Input > int64(^uint64(0)>>1)-*d.usage.Output {
-					return nil, unsupported("usage")
-				}
-				n := *d.usage.Input + *d.usage.Output
-				total = &n
-			}
-			return core.Usage{Input: d.usage.Input, Output: d.usage.Output, Total: total, Source: "anthropic"}, nil
+			return *u, nil
 		}
 		if fin != nil {
 			return *fin, nil
@@ -235,7 +225,7 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			Type  string            `json:"type"`
 			Error core.GatewayError `json:"error"`
 		}
-		if err := strict([]byte(e.Data), &x); err != nil {
+		if err := tolerant([]byte(e.Data), &x); err != nil {
 			return nil, err
 		}
 		if x.Type != "error" {
@@ -302,8 +292,13 @@ func (x *streamEncoder) Write(ctx context.Context, e core.Event) error {
 		case "text":
 			text := ""
 			block.Text = &text
-		case "tool_use":
+		case "reasoning":
+			return unsupported("block.kind")
+		case "tool_call":
+			block.Type = "tool_use"
 			block.Input = json.RawMessage("{}")
+		default:
+			return unsupported("block.kind")
 		}
 		x.blocks[v.Index.Block] = v.Kind
 		return x.write("content_block_start", struct {
@@ -358,15 +353,11 @@ func (x *streamEncoder) Write(ctx context.Context, e core.Event) error {
 			Index int    `json:"index"`
 		}{"content_block_stop", v.Index.Block})
 	case core.Usage:
-		if v.Input != nil && *v.Input < 0 || v.Output != nil && *v.Output < 0 {
-			return unsupported("usage")
+		wire, err := usageToWire(&v)
+		if err != nil {
+			return err
 		}
-		if v.Input != nil {
-			x.usage.Input = v.Input
-		}
-		if v.Output != nil {
-			x.usage.Output = v.Output
-		}
+		mergeUsageWire(&x.usage, wire)
 		return x.write("message_delta", struct {
 			Type  string    `json:"type"`
 			Delta any       `json:"delta"`

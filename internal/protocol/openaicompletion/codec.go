@@ -117,10 +117,16 @@ func value(m map[string]json.RawMessage, k string, v any) error {
 	return decode(bytes.NewReader(b), v)
 }
 
+type usageDetails struct {
+	Cached    *int64 `json:"cached_tokens,omitempty"`
+	Reasoning *int64 `json:"reasoning_tokens,omitempty"`
+}
 type wireUsage struct {
-	Input  *int64 `json:"prompt_tokens,omitempty"`
-	Output *int64 `json:"completion_tokens,omitempty"`
-	Total  *int64 `json:"total_tokens,omitempty"`
+	Input         *int64        `json:"prompt_tokens,omitempty"`
+	Output        *int64        `json:"completion_tokens,omitempty"`
+	Total         *int64        `json:"total_tokens,omitempty"`
+	InputDetails  *usageDetails `json:"prompt_tokens_details,omitempty"`
+	OutputDetails *usageDetails `json:"completion_tokens_details,omitempty"`
 }
 
 func (u *wireUsage) core() (*core.Usage, error) {
@@ -132,13 +138,56 @@ func (u *wireUsage) core() (*core.Usage, error) {
 			return nil, malformed()
 		}
 	}
-	return &core.Usage{Input: u.Input, Output: u.Output, Total: u.Total, Source: "provider"}, nil
-}
-func usage(u *core.Usage) *wireUsage {
-	if u == nil {
-		return nil
+	var cached, reasoning *int64
+	if u.InputDetails != nil {
+		cached = u.InputDetails.Cached
 	}
-	return &wireUsage{u.Input, u.Output, u.Total}
+	if u.OutputDetails != nil {
+		reasoning = u.OutputDetails.Reasoning
+	}
+	for _, n := range []*int64{cached, reasoning} {
+		if n != nil && *n < 0 {
+			return nil, malformed()
+		}
+	}
+	if reasoning != nil && u.Output != nil && *reasoning > *u.Output {
+		return nil, malformed()
+	}
+	if u.Input != nil && u.Output != nil && u.Total != nil && *u.Input != *u.Total-*u.Output {
+		return nil, malformed()
+	}
+	return &core.Usage{Input: u.Input, Output: u.Output, Total: u.Total, CachedInput: cached, ReasoningOutput: reasoning, Source: "provider"}, nil
+}
+
+func usage(u *core.Usage) (*wireUsage, error) {
+	if u == nil {
+		return nil, nil
+	}
+	for _, n := range []*int64{
+		u.Input, u.Output, u.Total, u.CachedInput, u.CacheWriteInput,
+		u.CacheWrite5mInput, u.CacheWrite1hInput, u.ReasoningOutput, u.ToolInput,
+	} {
+		if n != nil && *n < 0 {
+			return nil, malformed()
+		}
+	}
+	if u.Input != nil && u.Output != nil && u.Total != nil && *u.Input != *u.Total-*u.Output {
+		return nil, malformed()
+	}
+	if u.ReasoningOutput != nil && (u.Output == nil || *u.ReasoningOutput > *u.Output) {
+		return nil, malformed()
+	}
+	out := &wireUsage{Input: u.Input, Output: u.Output, Total: u.Total}
+	if u.CachedInput != nil {
+		out.InputDetails = &usageDetails{Cached: u.CachedInput}
+	}
+	if u.ReasoningOutput != nil {
+		out.OutputDetails = &usageDetails{Reasoning: u.ReasoningOutput}
+	}
+	if _, e := out.core(); e != nil {
+		return nil, e
+	}
+	return out, nil
 }
 func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPayload, error) {
 	if e := ctx.Err(); e != nil {
@@ -357,8 +406,8 @@ func (c *Codec) EncodeResult(ctx context.Context, p core.ResultPayload, w io.Wri
 	if e != nil {
 		return e
 	}
-	u := usage(v.Usage)
-	if _, e := u.core(); e != nil {
+	u, e := usage(v.Usage)
+	if e != nil {
 		return e
 	}
 	return json.NewEncoder(w).Encode(response{ID: v.ID, Object: "text_completion", Model: v.Model, Choices: []choice{{Text: v.Text, Finish: &reason}}, Usage: u})

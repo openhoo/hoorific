@@ -315,7 +315,83 @@ func (c *Connector) Discover(ctx context.Context, conn core.Connection) ([]core.
 	}
 	return out, nil
 }
-func (c *Connector) Inspect(context.Context, core.Target, core.Operation, []byte) error { return nil }
+func (c *Connector) Inspect(_ context.Context, _ core.Target, _ core.Operation, body []byte) error {
+	return rejectForeignCacheDirectives(body)
+}
+
+func rejectForeignCacheDirectives(body []byte) error {
+	var root map[string]json.RawMessage
+	if len(body) == 0 || json.Unmarshal(body, &root) != nil || root == nil {
+		return nil
+	}
+	if _, ok := root["session_id"]; ok {
+		return unsupportedCacheDirective("session_id")
+	}
+	if _, ok := root["cache_control"]; ok {
+		return unsupportedCacheDirective("cache_control")
+	}
+	for _, key := range []string{"messages", "input"} {
+		var items []json.RawMessage
+		if json.Unmarshal(root[key], &items) != nil {
+			continue
+		}
+		for _, item := range items {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(item, &object) != nil {
+				continue
+			}
+			if err := rejectContentCacheDirectives(object["content"]); err != nil {
+				return err
+			}
+		}
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(root["tools"], &tools) == nil {
+		for _, tool := range tools {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(tool, &object) != nil {
+				continue
+			}
+			if _, ok := object["cache_control"]; ok {
+				return unsupportedCacheDirective("cache_control")
+			}
+		}
+	}
+	return nil
+}
+
+func rejectContentCacheDirectives(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		if _, ok := object["cache_control"]; ok {
+			return unsupportedCacheDirective("cache_control")
+		}
+		return nil
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	for _, part := range parts {
+		if err := rejectContentCacheDirectives(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func unsupportedCacheDirective(param string) error {
+	return core.GatewayError{
+		Code:       "unsupported_feature",
+		HTTPStatus: 400,
+		Param:      param,
+		Message:    "cache directive is not supported by the direct Azure OpenAI provider: " + param,
+		Origin:     "gateway",
+	}
+}
 
 // BindStream selects the stream-capable binding. Azure uses the same endpoint
 // path as unary chat; the request codec controls the stream field.

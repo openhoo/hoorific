@@ -31,6 +31,7 @@ type Dependencies struct {
 	Admission   core.AdmissionStore
 	Planner     core.AdmissionPlanner
 	Credentials core.CredentialSource
+	Idempotency core.IdempotencyStore
 	Connectors  map[string]core.Connector
 	Codecs      map[core.CodecKey]protocol.Entry
 	Client      func(core.Connection) (*http.Client, error)
@@ -39,7 +40,7 @@ type Dependencies struct {
 	Keys        credential.Keyring
 	Tickets     realtime.TicketStore
 	Metrics     *Metrics
-	Hints       RoutingHints
+	Hints       core.ScopedRoutingHints
 	PublicURL   string
 }
 type Gateway struct {
@@ -145,6 +146,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if idempotencyKey(r) != "" {
+		p, err = g.reauthorizeIdempotency(r.Context(), r, x, p)
+		if err != nil {
+			writeError(w, x.protocol, err)
+			return
+		}
+	}
+	stripCredentialQuery(r, x)
 	r = r.WithContext(core.WithPrincipal(r.Context(), p))
 	if ticketAuth {
 		r = r.WithContext(context.WithValue(r.Context(), realtimeTicketAuthKey{}, true))
@@ -180,6 +189,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if x.native && !contains(p.Connections, x.connection) {
 		writeError(w, x.protocol, failure("forbidden", 403, "connection access is not granted"))
+		return
+	}
+	if idempotencyKey(r) != "" && ((r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket")) || strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/vnd.amazon.eventstream")) {
+		writeError(w, x.protocol, failure("unsupported_operation", http.StatusBadRequest, "idempotency is not supported for realtime or duplex sessions"))
 		return
 	}
 	if (r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket")) || strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/vnd.amazon.eventstream") {
@@ -238,6 +251,37 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		x.operation = binding.Codec.Operation
+		if idempotencyKey(r) != "" {
+			p, e = g.reauthorizeIdempotency(ctx, r, x, p)
+			if e != nil {
+				writeError(w, x.protocol, e)
+				return
+			}
+			if c.TenantID != p.TenantID {
+				writeError(w, x.protocol, failure("model_not_found", 404, "connection not found"))
+				return
+			}
+			r = r.WithContext(core.WithPrincipal(r.Context(), p))
+			target, binding, continued, e = g.resolveContinuation(ctx, r, p, c, strings.TrimPrefix(x.path, "continuations/"))
+			if e != nil {
+				writeError(w, x.protocol, e)
+				return
+			}
+			x.operation = binding.Codec.Operation
+			idem, replay, e := g.beginIdempotency(ctx, r, p, raw, captured)
+			if e != nil {
+				writeError(w, x.protocol, e)
+				return
+			}
+			if replay != nil {
+				_ = writeIdempotencyReplay(w, replay)
+				return
+			}
+			idem.write = newIdempotencyCaptureWriter(w)
+			defer idem.finish(ctx)
+			w = idem.write
+			continued = continued.WithContext(context.WithValue(continued.Context(), idempotencyStateKey{}, idem.state))
+		}
 		_, e = g.attempt(continued.Context(), w, continued, p, x, snapshot, target, raw, fields, id)
 		if e != nil {
 			writeError(w, x.protocol, e)
@@ -248,6 +292,34 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, x.protocol, err)
 		return
+	}
+	if idempotencyKey(r) != "" {
+		p, err = g.reauthorizeIdempotency(ctx, r, x, p)
+		if err != nil {
+			writeError(w, x.protocol, err)
+			return
+		}
+		ctx = core.WithPrincipal(ctx, p)
+		r = r.WithContext(ctx)
+		candidates, err = g.targets(ctx, snapshot, p, x, r.Method, raw, fields)
+		if err != nil {
+			writeError(w, x.protocol, err)
+			return
+		}
+		idem, replay, e := g.beginIdempotency(ctx, r, p, raw, captured)
+		if e != nil {
+			writeError(w, x.protocol, e)
+			return
+		}
+		if replay != nil {
+			_ = writeIdempotencyReplay(w, replay)
+			return
+		}
+		idem.write = newIdempotencyCaptureWriter(w)
+		defer idem.finish(ctx)
+		w = idem.write
+		ctx = context.WithValue(ctx, idempotencyStateKey{}, idem.state)
+		r = r.WithContext(ctx)
 	}
 	var last error
 	replanned := false
@@ -389,8 +461,11 @@ func (g *Gateway) targets(ctx context.Context, s core.RuntimeSnapshot, p core.Pr
 	requirements := x.requirements
 	requirements.Operation = x.operation
 	if g.deps.Hints != nil && s.RoutePolicies[x.model].Affinity {
-		if preferred, ok, e := g.deps.Hints.GetAffinity(ctx, affinityKey(p, x.model)); e == nil && ok {
-			requirements.Preferred = &preferred
+		scope := core.HealthScope{TenantID: p.TenantID, Revision: s.Revision}
+		if scope.Valid() {
+			if preferred, ok, e := g.deps.Hints.GetAffinityScoped(ctx, scope, affinityKey(p, x.model)); e == nil && ok {
+				requirements.Preferred = &preferred
+			}
 		}
 	}
 	routes, err := routing.Order(ctx, s, x.model, requirements, g.deps.Hints)
@@ -420,6 +495,15 @@ func (g *Gateway) targets(ctx context.Context, s core.RuntimeSnapshot, p core.Pr
 	if len(result) == 0 {
 		return nil, failure("model_not_found", 404, "no compatible model is configured")
 	}
+	if conversation, ok := ctx.Value(portablePayloadKey{}).(core.Conversation); ok && conversation.Cache != nil && conversation.Cache.CachedContent != "" {
+		first := result[0].connection
+		for _, candidate := range result[1:] {
+			c := candidate.connection
+			if c.ID != first.ID || c.AccountID != first.AccountID || c.Project != first.Project || c.Region != first.Region {
+				return nil, failure("unsupported_feature", 400, "cached content requires one connection, account, project, and region")
+			}
+		}
+	}
 	return result, nil
 }
 func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Request, p core.Principal, x route, s core.RuntimeSnapshot, t selected, raw []byte, fields map[string]json.RawMessage, id string) (bool, error) {
@@ -427,8 +511,16 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	var err error
 	op := x.operation
 	var stream bool
-	_ = json.Unmarshal(fields["stream"], &stream)
+	var streamFieldPresent bool
+	var suppressUsage bool
+	if streamRaw, ok := fields["stream"]; ok {
+		streamFieldPresent = true
+		_ = json.Unmarshal(streamRaw, &stream)
+	}
 	stream = stream || strings.Contains(r.URL.Path, ":streamGenerateContent")
+	if !streamFieldPresent && x.native && t.endpoint != nil && t.endpoint.Framing == "ndjson" {
+		stream = true
+	}
 	continuation, isContinuation := ctx.Value(nativeContinuationKey{}).(nativeContinuationDispatch)
 	if isContinuation {
 		binding = continuation.Binding
@@ -455,11 +547,20 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 			}
 		}
 	}
+	if binding.Framing == "ndjson" && (binding.Codec.Protocol != "ollama" || !streamFieldPresent) {
+		stream = true
+	}
+	if binding.ValidateRequestHeaders != nil {
+		if err = binding.ValidateRequestHeaders(r.Header); err != nil {
+			markIdempotency(ctx, "terminal")
+			return false, err
+		}
+	}
 	inputKey := core.CodecKey{Protocol: x.protocol, Operation: op}
 	input, inputOK := g.deps.Codecs[inputKey]
 	output, outputOK := g.deps.Codecs[binding.Codec]
-	nativeWire := x.native || binding.Codec == inputKey
 	body := raw
+	nativeWire := x.native || binding.Codec == inputKey
 	if !x.native {
 		var payload core.RequestPayload
 		if !inputOK || input.Request == nil {
@@ -474,7 +575,17 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 			if payload == nil {
 				return false, failure("invalid_request", 400, "portable request was not decoded")
 			}
+			if conversation, ok := payload.(core.Conversation); ok && x.protocol == "openai-chat" {
+				suppressUsage = conversation.StreamIncludeUsage == nil || !*conversation.StreamIncludeUsage
+			}
 			payload = withModel(payload, t.model.ID)
+			// A portable OpenAI Chat stream must be translated when the caller
+			// did not request usage. The gateway still forces usage upstream so
+			// admission can settle from canonical provider metadata, but the
+			// optional usage event must not leak into the client protocol.
+			if stream && suppressUsage && binding.Codec.Protocol == "openai-chat" {
+				nativeWire = false
+			}
 		}
 		if nativeWire {
 			if binding.ModelLocation == "body" || binding.ModelLocation == "" {
@@ -503,6 +614,12 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		if err != nil {
 			return false, err
 		}
+		if stream && !x.native && binding.Codec.Protocol == "openai-chat" {
+			body, err = forceOpenAIStreamUsage(body)
+			if err != nil {
+				return false, failure("invalid_request", 400, "upstream stream usage option could not be encoded")
+			}
+		}
 	}
 	if !x.native {
 		if adapter, ok := t.connector.(core.WireAdapter); ok {
@@ -511,6 +628,9 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 				return false, err
 			}
 		}
+	}
+	if len(body) == 0 && binding.DefaultBody != "" {
+		body = []byte(binding.DefaultBody)
 	}
 	upstreamURL, err := joinEndpoint(t.connection.BaseURL, binding.Endpoint)
 	if err != nil {
@@ -649,36 +769,75 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	response, err := client.Do(req)
 	if err != nil {
 		g.recordUnknownNative(ctx, p, t, binding, permit, id)
+		markIdempotency(ctx, "unknown")
 		return false, failure("upstream_outcome_unknown", 502, "upstream execution outcome is unknown")
 	}
-	defer response.Body.Close()
-	if response.StatusCode == 429 && g.deps.Hints != nil && !x.native {
-		_ = g.deps.Hints.Set(ctx, t.route, false, cooldownDuration(response.Header))
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusTooManyRequests && g.deps.Hints != nil && !x.native {
+		scope := core.HealthScope{TenantID: p.TenantID, Revision: s.Revision}
+		if scope.Valid() {
+			_ = g.deps.Hints.SetScoped(ctx, scope, t.route, false, cooldownDuration(response.Header))
+		}
 	}
-	if response.StatusCode == 429 && !x.native {
+	if response.StatusCode == http.StatusTooManyRequests && !x.native {
 		outcome.State = "not_executed"
-		return true, failure("quota_exceeded", 429, "upstream rejected the request without execution")
+		e := failure("quota_exceeded", http.StatusTooManyRequests, "upstream rejected the request without execution")
+		e.RetryAfter = response.Header.Get("Retry-After")
+		markIdempotency(ctx, "terminal")
+		return true, e
 	}
 	if response.StatusCode >= 400 { // Native errors retain safe bytes and status; do not expose credentials or arbitrary HTML.
-		data, e := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		data, e := transport.ReadBounded(ctx, response.Body, 1<<20, 120*time.Second)
 		if e != nil {
+			if x.native && response.StatusCode == http.StatusTooManyRequests {
+				outcome.State = "not_executed"
+				rejection := failure("upstream_error", http.StatusTooManyRequests, "upstream rejected the request")
+				rejection.RetryAfter = response.Header.Get("Retry-After")
+				markIdempotency(ctx, "terminal")
+				return false, rejection
+			}
+			markIdempotency(ctx, "unknown")
 			return false, failure("upstream_error", 502, "upstream error response was truncated")
 		}
 		if x.native && json.Valid(data) {
-			w.Header().Set("Content-Type", "application/json")
+			copyResponseHeaders(w.Header(), response.Header)
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", "application/json")
+			}
 			w.WriteHeader(response.StatusCode)
-			_, _ = w.Write(data)
+			if _, e = w.Write(data); e != nil {
+				markIdempotency(ctx, "unknown")
+				return false, nil
+			}
+			if response.StatusCode == http.StatusTooManyRequests {
+				outcome.State = "not_executed"
+				markIdempotency(ctx, "terminal")
+			} else {
+				markIdempotency(ctx, "unknown")
+			}
 			return false, nil
 		}
+		if x.native && response.StatusCode == http.StatusTooManyRequests {
+			outcome.State = "not_executed"
+			rejection := failure("upstream_error", http.StatusTooManyRequests, "upstream rejected the request")
+			rejection.RetryAfter = response.Header.Get("Retry-After")
+			markIdempotency(ctx, "terminal")
+			return false, rejection
+		}
+		markIdempotency(ctx, "unknown")
 		return false, failure("upstream_error", response.StatusCode, "upstream rejected the request")
 	}
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
 		if err = g.deps.Admission.MarkAccepted(ctx, permit, fmt.Sprintf("http:%d", response.StatusCode)); err != nil {
+			markIdempotency(ctx, "unknown")
 			return false, failure("unavailable", 503, "acceptance persistence unavailable")
 		}
 	}
 	if g.deps.Hints != nil && s.RoutePolicies[x.model].Affinity && !x.native {
-		_ = g.deps.Hints.SetAffinity(ctx, affinityKey(p, x.model), t.route, 10*time.Minute)
+		scope := core.HealthScope{TenantID: p.TenantID, Revision: s.Revision}
+		if scope.Valid() {
+			_ = g.deps.Hints.SetAffinityScoped(ctx, scope, affinityKey(p, x.model), t.route, 10*time.Minute)
+		}
 	}
 	if !x.native {
 		if adapter, ok := t.connector.(core.WireAdapter); ok {
@@ -689,11 +848,13 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}
 	nativeState, err := g.prepareNativeResponse(ctx, r, response, p, t, binding, permit, id)
 	if err != nil {
+		markIdempotency(ctx, "unknown")
 		return false, err
 	}
 	if nativeState.JobPending {
 		outcome.State = "job_pending"
 		finalized = true
+		markIdempotency(ctx, "terminal")
 	}
 	if nativeWire {
 		relayResult, seen, relayErr := relayNative(ctx, w, response, output, stream)
@@ -703,19 +864,25 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		outcome.Usage = seen.usage
 		if !nativeState.JobPending && relayErr == nil && seen.err == nil && seen.terminal {
 			outcome.State = "settled"
+			markIdempotency(ctx, "terminal")
+		} else if relayErr != nil || seen.err != nil || relayResult.Truncated {
+			markIdempotency(ctx, "unknown")
 		}
 		return false, nil
 	}
 	if stream {
+		response.Body = transport.NewIdleReader(ctx, response.Body, 120*time.Second)
 		if output.Stream == nil || input.Stream == nil {
 			return false, failure("unsupported_operation", 400, "stream codec unavailable")
 		}
 		decoder, e := output.Stream.NewDecoder(response.Body)
 		if e != nil {
+			markIdempotency(ctx, "unknown")
 			return false, e
 		}
 		encoder, e := input.Stream.NewEncoder(w)
 		if e != nil {
+			markIdempotency(ctx, "unknown")
 			return false, e
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -728,47 +895,61 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 			if e != nil {
 				if e != io.EOF || !terminal {
 					failed = true
+					markIdempotency(ctx, "unknown")
 					_ = encoder.Write(ctx, core.StreamError{Error: failure("upstream_outcome_unknown", 502, "upstream stream was truncated")})
 				}
 				break
 			}
 			if usage, ok := event.(core.Usage); ok {
 				outcome.Usage = &usage
+				if suppressUsage {
+					continue
+				}
 			}
 			if _, ok := event.(core.Finish); ok {
 				terminal = true
 			}
 			if _, ok := event.(core.StreamError); ok {
 				failed = true
+				markIdempotency(ctx, "unknown")
 			}
 			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if e = encoder.Write(ctx, event); e != nil {
 				outcome.Cancellation = "requested"
+				markIdempotency(ctx, "unknown")
 				return false, nil
 			}
 			_ = http.NewResponseController(w).Flush()
 		}
 		if terminal && !failed {
 			outcome.State = "settled"
+			markIdempotency(ctx, "terminal")
 		}
 		return false, nil
 	}
 	if output.Result == nil || input.Result == nil {
+		markIdempotency(ctx, "unknown")
 		return false, failure("unsupported_operation", 400, "result codec unavailable")
 	}
 	result, err := output.Result.DecodeResult(ctx, io.LimitReader(response.Body, 32<<20))
 	if err != nil {
+		markIdempotency(ctx, "unknown")
 		return false, failure("upstream_outcome_unknown", 502, "upstream result could not be decoded")
 	}
 	var encoded bytes.Buffer
 	if err = input.Result.EncodeResult(ctx, result, &encoded); err != nil {
+		markIdempotency(ctx, "unknown")
 		return false, err
 	}
 	outcome.Usage = resultUsage(result)
 	outcome.State = "settled"
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(response.StatusCode)
-	_, _ = w.Write(encoded.Bytes())
+	if _, err = w.Write(encoded.Bytes()); err != nil {
+		markIdempotency(ctx, "unknown")
+		return false, nil
+	}
+	markIdempotency(ctx, "terminal")
 	return false, nil
 }
 func withModel(p core.RequestPayload, model string) core.RequestPayload {
@@ -803,6 +984,28 @@ func resultUsage(p core.ResultPayload) *core.Usage {
 		return v.Usage
 	}
 	return nil
+}
+func forceOpenAIStreamUsage(body []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	var options map[string]json.RawMessage
+	if raw := fields["stream_options"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &options); err != nil {
+			return nil, err
+		}
+	}
+	if options == nil {
+		options = make(map[string]json.RawMessage)
+	}
+	options["include_usage"] = json.RawMessage("true")
+	encodedOptions, err := json.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+	fields["stream_options"] = encodedOptions
+	return json.Marshal(fields)
 }
 func joinEndpoint(base, path string) (string, error) {
 	u, e := url.Parse(base)
@@ -847,9 +1050,6 @@ func extractKey(r *http.Request, x route) (string, error) {
 		for _, v := range r.URL.Query()["key"] {
 			values = append(values, v)
 		}
-		q := r.URL.Query()
-		q.Del("key")
-		r.URL.RawQuery = q.Encode()
 	}
 	if len(values) == 0 {
 		return "", failure("unauthorized", 401, "gateway credential required")
@@ -860,6 +1060,17 @@ func extractKey(r *http.Request, x route) (string, error) {
 		}
 	}
 	return values[0], nil
+}
+func stripCredentialQuery(r *http.Request, x route) {
+	if r == nil || x.protocol != "gemini-content" || r.URL == nil {
+		return
+	}
+	query := r.URL.Query()
+	if !query.Has("key") {
+		return
+	}
+	query.Del("key")
+	r.URL.RawQuery = query.Encode()
 }
 func copyResponseHeaders(dst, src http.Header) {
 	for _, k := range []string{"Content-Type", "Content-Disposition", "Cache-Control", "Retry-After", "Request-Id", "X-Request-Id"} {
@@ -879,8 +1090,11 @@ func writeError(w http.ResponseWriter, p core.Protocol, err error) {
 	}
 	w.Header().Set("X-Hoorific-Error-Code", e.Code)
 	w.Header().Set("Content-Type", "application/json")
-	if e.HTTPStatus == 429 {
-		w.Header().Set("Retry-After", "1")
+	if e.HTTPStatus == http.StatusTooManyRequests {
+		if e.RetryAfter == "" {
+			e.RetryAfter = "1"
+		}
+		w.Header().Set("Retry-After", e.RetryAfter)
 	}
 	w.WriteHeader(e.HTTPStatus)
 	switch p {

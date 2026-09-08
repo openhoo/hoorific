@@ -204,6 +204,9 @@ func objectJSON(raw []byte, param string) error {
 	return nil
 }
 func cleanBlock(b core.ContentBlock, kind string) error {
+	if b.CacheControl != nil || b.CacheBreakpoint {
+		return unsupported("content cache control")
+	}
 	if b.Kind != kind {
 		return unsupported("content." + b.Kind)
 	}

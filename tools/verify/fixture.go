@@ -95,8 +95,8 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		query := r.URL.Query()
-		if len(query) != 1 || len(query["limit"]) != 1 || query.Get("limit") != "1000" {
-			http.Error(w, "fixture discovery requires limit=1000", http.StatusBadRequest)
+		if len(query) != 0 && (len(query) != 1 || len(query["limit"]) != 1 || query.Get("limit") != "1000") {
+			http.Error(w, "fixture discovery accepts the default page or limit=1000", http.StatusBadRequest)
 			return
 		}
 		io.WriteString(w, `{"data":[{"id":"fixture-chat","type":"model","display_name":"Deterministic fixture chat","created_at":"2026-01-01T00:00:00Z"}],"has_more":false,"first_id":"fixture-chat","last_id":"fixture-chat"}`)

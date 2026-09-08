@@ -330,11 +330,16 @@ func validIndex(i core.Index) error {
 	return nil
 }
 func validUsage(u core.Usage) error {
-	if u.Input != nil && *u.Input < 0 || u.Output != nil && *u.Output < 0 || u.Total != nil && *u.Total < 0 {
-		return invalid("usage", "counts must be non-negative")
+	for _, n := range []*int64{
+		u.Input, u.Output, u.Total, u.CachedInput, u.CacheWriteInput,
+		u.CacheWrite5mInput, u.CacheWrite1hInput, u.ReasoningOutput, u.ToolInput,
+	} {
+		if n != nil && *n < 0 {
+			return invalid("usage", "counts must be non-negative")
+		}
 	}
-	if u.Total != nil && (u.Input == nil || u.Output == nil || *u.Total != *u.Input+*u.Output) {
-		return unsupported("usage.total")
+	if u.Input != nil && u.Output != nil && u.Total != nil && *u.Total != *u.Input+*u.Output {
+		return invalid("usage.total", "does not match input plus output")
 	}
 	return nil
 }

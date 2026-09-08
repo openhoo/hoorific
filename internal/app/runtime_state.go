@@ -23,11 +23,10 @@ type snapshotStore interface {
 	SetConfigListener(func(tenant string, revision int64))
 }
 
+// HintStore is the sole production contract for tenant/revision-scoped
+// disposable health and affinity hints.
 type HintStore interface {
-	Healthy(context.Context, core.RouteTarget) (bool, error)
-	Set(context.Context, core.RouteTarget, bool, time.Duration) error
-	GetAffinity(context.Context, string) (core.RouteTarget, bool, error)
-	SetAffinity(context.Context, string, core.RouteTarget, time.Duration) error
+	core.ScopedRoutingHints
 }
 type invalidationSubscriber interface {
 	Subscribe(context.Context) (<-chan []byte, error)
@@ -157,9 +156,14 @@ func (s *RuntimeState) onConfigCommit(tenant string, revision int64) {
 	if tenant == "" {
 		return
 	}
+	s.mu.Lock()
 	// The local writer knows this commit completed; invalidate even if a
 	// backend reports an unexpectedly unchanged revision.
-	s.mu.Lock()
+	// Health and affinity hints include this global revision in their scoped
+	// keys. A committed connection, account, or credential mutation therefore
+	// re-scopes all old hints without a request-path SQL lookup or a delete
+	// round-trip to Redis. The global counter advances for one tenant, so this
+	// intentionally invalidates disposable hints for other tenants too.
 	s.generation[tenant]++
 	delete(s.cache, tenant)
 	s.mu.Unlock()

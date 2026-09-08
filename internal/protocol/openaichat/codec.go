@@ -15,21 +15,183 @@ import (
 type Codec struct{}
 
 func New() *Codec { return &Codec{} }
+func validCacheString(v string, max int) bool {
+	return v != "" && len([]rune(v)) <= max && !strings.ContainsAny(v, "\x00\r\n")
+}
+
+func validCacheTTL(v string) bool {
+	switch v {
+	case "", "5m", "30m", "1h", "24h":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateCacheControl(c *core.CacheControl, param string) error {
+	if c == nil {
+		return nil
+	}
+	if !validCacheString(c.Type, 32) {
+		return unsupported(param + ".type")
+	}
+	switch c.Type {
+	case "ephemeral":
+	default:
+		return unsupported(param + ".type")
+	}
+	if !validCacheTTL(c.TTL) {
+		return unsupported(param + ".ttl")
+	}
+	return nil
+}
+
+func validatePromptCache(c *core.PromptCache) error {
+	if c == nil {
+		return nil
+	}
+	switch c.Protocol {
+	case "openai-chat", "openrouter", "openai-responses":
+	default:
+		return unsupported("cache.protocol")
+	}
+	if c.Key != "" && !validCacheString(c.Key, 256) {
+		return unsupported("prompt_cache_key")
+	}
+	if c.SessionID != "" {
+		if c.Protocol != "openrouter" || !validCacheString(c.SessionID, 256) {
+			return unsupported("session_id")
+		}
+	}
+	switch c.Retention {
+	case "", "in_memory", "24h":
+	default:
+		return unsupported("prompt_cache_retention")
+	}
+	switch c.Mode {
+	case "", "implicit", "explicit":
+	default:
+		return unsupported("prompt_cache_options.mode")
+	}
+	if !validCacheTTL(c.TTL) {
+		return unsupported("prompt_cache_options.ttl")
+	}
+	if c.CachedContent != "" {
+		return unsupported("cache.cached_content")
+	}
+	if c.Control != nil {
+		if err := validateCacheControl(c.Control, "cache.control"); err != nil {
+			return err
+		}
+		return unsupported("cache.control")
+	}
+	return nil
+}
+func validateConversationCache(q core.Conversation) error {
+	if err := validatePromptCache(q.Cache); err != nil {
+		return err
+	}
+	proto := core.Protocol("")
+	if q.Cache != nil {
+		proto = q.Cache.Protocol
+	}
+	checkBlock := func(b core.ContentBlock, param string) error {
+		if b.CacheControl != nil {
+			if proto != "openrouter" {
+				return unsupported(param + ".cache_control")
+			}
+			if err := validateCacheControl(b.CacheControl, param+".cache_control"); err != nil {
+				return err
+			}
+		}
+		if b.CacheBreakpoint {
+			if proto != "openai-chat" && proto != "openrouter" && proto != "openai-responses" {
+				return unsupported(param + ".prompt_cache_breakpoint")
+			}
+			if b.Kind != "text" {
+				return unsupported(param + ".prompt_cache_breakpoint")
+			}
+		}
+		return nil
+	}
+	for i, b := range q.System {
+		if err := checkBlock(b, fmt.Sprintf("system[%d]", i)); err != nil {
+			return err
+		}
+	}
+	for i, m := range q.Messages {
+		for j, b := range m.Content {
+			if err := checkBlock(b, fmt.Sprintf("messages[%d].content[%d]", i, j)); err != nil {
+				return err
+			}
+		}
+	}
+	for i, t := range q.Tools {
+		if t.CacheControl != nil {
+			if proto != "openrouter" {
+				return unsupported(fmt.Sprintf("tools[%d].cache_control", i))
+			}
+			if err := validateCacheControl(t.CacheControl, fmt.Sprintf("tools[%d].cache_control", i)); err != nil {
+				return err
+			}
+		}
+		if t.CacheBreakpoint {
+			return unsupported(fmt.Sprintf("tools[%d].prompt_cache_breakpoint", i))
+		}
+	}
+	return nil
+}
+
+func cacheControlFromWire(v *cacheControl, param string) (*core.CacheControl, error) {
+	if v == nil {
+		return nil, nil
+	}
+	c := &core.CacheControl{Type: v.Type, TTL: v.TTL}
+	if err := validateCacheControl(c, param); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func breakpointFromWire(v *cacheBreakpoint, param string) (bool, error) {
+	if v == nil {
+		return false, nil
+	}
+	if v.Mode != "explicit" {
+		return false, unsupported(param + ".mode")
+	}
+	return true, nil
+}
 
 // Wire structures deliberately contain only fields supported by this codec.
 type request struct {
-	Model               string          `json:"model"`
-	Messages            []message       `json:"messages"`
-	Tools               []wireTool      `json:"tools,omitempty"`
-	MaxTokens           *int64          `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *int64          `json:"max_completion_tokens,omitempty"`
-	Stream              bool            `json:"stream,omitempty"`
-	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
-	Stop                any             `json:"stop,omitempty"`
-	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	Model                string              `json:"model"`
+	Messages             []message           `json:"messages"`
+	Tools                []wireTool          `json:"tools,omitempty"`
+	MaxTokens            *int64              `json:"max_tokens,omitempty"`
+	MaxCompletionTokens  *int64              `json:"max_completion_tokens,omitempty"`
+	Stream               bool                `json:"stream,omitempty"`
+	StreamOptions        *streamOptions      `json:"stream_options,omitempty"`
+	Stop                 any                 `json:"stop,omitempty"`
+	ResponseFormat       json.RawMessage     `json:"response_format,omitempty"`
+	PromptCacheKey       string              `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string              `json:"prompt_cache_retention,omitempty"`
+	PromptCacheOptions   *promptCacheOptions `json:"prompt_cache_options,omitempty"`
+	SessionID            string              `json:"session_id,omitempty"`
 }
 type streamOptions struct {
 	IncludeUsage *bool `json:"include_usage,omitempty"`
+}
+type promptCacheOptions struct {
+	Mode string `json:"mode,omitempty"`
+	TTL  string `json:"ttl,omitempty"`
+}
+type cacheControl struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
+}
+type cacheBreakpoint struct {
+	Mode string `json:"mode"`
 }
 type message struct {
 	Role       string          `json:"role"`
@@ -39,10 +201,12 @@ type message struct {
 	ToolCalls  []wireToolCall  `json:"tool_calls,omitempty"`
 }
 type contentPart struct {
-	Type     string    `json:"type"`
-	Text     string    `json:"text,omitempty"`
-	ImageURL *imageURL `json:"image_url,omitempty"`
-	File     *filePart `json:"file,omitempty"`
+	Type                  string           `json:"type"`
+	Text                  string           `json:"text,omitempty"`
+	ImageURL              *imageURL        `json:"image_url,omitempty"`
+	File                  *filePart        `json:"file,omitempty"`
+	CacheControl          *cacheControl    `json:"cache_control,omitempty"`
+	PromptCacheBreakpoint *cacheBreakpoint `json:"prompt_cache_breakpoint,omitempty"`
 }
 type imageURL struct {
 	URL    string `json:"url"`
@@ -54,8 +218,9 @@ type filePart struct {
 	Filename string `json:"filename,omitempty"`
 }
 type wireTool struct {
-	Type     string       `json:"type"`
-	Function wireFunction `json:"function"`
+	Type         string        `json:"type"`
+	Function     wireFunction  `json:"function"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
 }
 type wireFunction struct {
 	Name        string          `json:"name"`
@@ -91,12 +256,20 @@ func decodeParts(b json.RawMessage) ([]contentPart, error) {
 	return p, nil
 }
 func blockFromPart(p contentPart) (core.ContentBlock, error) {
+	cache, err := cacheControlFromWire(p.CacheControl, "content.cache_control")
+	if err != nil {
+		return core.ContentBlock{}, err
+	}
+	breakpoint, err := breakpointFromWire(p.PromptCacheBreakpoint, "content.prompt_cache_breakpoint")
+	if err != nil {
+		return core.ContentBlock{}, err
+	}
 	switch p.Type {
 	case "text":
 		if p.ImageURL != nil || p.File != nil {
 			return core.ContentBlock{}, unsupported("content.text")
 		}
-		return core.ContentBlock{Kind: "text", Text: p.Text}, nil
+		return core.ContentBlock{Kind: "text", Text: p.Text, CacheControl: cache, CacheBreakpoint: breakpoint}, nil
 	case "image_url":
 		if p.ImageURL == nil || p.ImageURL.URL == "" || p.File != nil {
 			return core.ContentBlock{}, unsupported("content.image_url")
@@ -104,7 +277,10 @@ func blockFromPart(p contentPart) (core.ContentBlock, error) {
 		if p.ImageURL.Detail != "" && p.ImageURL.Detail != "auto" {
 			return core.ContentBlock{}, unsupported("content.image_url.detail")
 		}
-		return core.ContentBlock{Kind: "image", URL: p.ImageURL.URL}, nil
+		if breakpoint {
+			return core.ContentBlock{}, unsupported("content.prompt_cache_breakpoint")
+		}
+		return core.ContentBlock{Kind: "image", URL: p.ImageURL.URL, CacheControl: cache}, nil
 	case "file":
 		if p.File == nil {
 			return core.ContentBlock{}, unsupported("content.file")
@@ -112,7 +288,10 @@ func blockFromPart(p contentPart) (core.ContentBlock, error) {
 		if p.File.FileID != "" || p.File.FileData == "" {
 			return core.ContentBlock{}, unsupported("content.file.file_id")
 		}
-		b := core.ContentBlock{Kind: "document", URL: p.File.FileData, Name: p.File.Filename}
+		if breakpoint {
+			return core.ContentBlock{}, unsupported("content.prompt_cache_breakpoint")
+		}
+		b := core.ContentBlock{Kind: "document", URL: p.File.FileData, Name: p.File.Filename, CacheControl: cache}
 		if strings.HasPrefix(p.File.FileData, "data:") {
 			if i := strings.Index(p.File.FileData, ","); i > 5 {
 				meta := p.File.FileData[5:i]
@@ -216,6 +395,57 @@ func messageFromWire(m message) (core.Message, error) {
 		return core.Message{}, unsupported("messages.role")
 	}
 }
+func promptCacheFromWire(q request) (*core.PromptCache, error) {
+	if q.PromptCacheKey == "" && q.PromptCacheRetention == "" && q.PromptCacheOptions == nil && q.SessionID == "" {
+		return nil, nil
+	}
+	protocol := core.Protocol("openai-chat")
+	if q.SessionID != "" {
+		protocol = "openrouter"
+	}
+	c := &core.PromptCache{
+		Protocol:  protocol,
+		Key:       q.PromptCacheKey,
+		Retention: q.PromptCacheRetention,
+		SessionID: q.SessionID,
+	}
+	if q.PromptCacheOptions != nil {
+		c.Mode = q.PromptCacheOptions.Mode
+		c.TTL = q.PromptCacheOptions.TTL
+	}
+	if err := validatePromptCache(c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func markDecodedCache(conv *core.Conversation) {
+	var hasControl, hasBreakpoint bool
+	for _, b := range conv.System {
+		hasControl = hasControl || b.CacheControl != nil
+		hasBreakpoint = hasBreakpoint || b.CacheBreakpoint
+	}
+	for _, m := range conv.Messages {
+		for _, b := range m.Content {
+			hasControl = hasControl || b.CacheControl != nil
+			hasBreakpoint = hasBreakpoint || b.CacheBreakpoint
+		}
+	}
+	for _, t := range conv.Tools {
+		hasControl = hasControl || t.CacheControl != nil
+	}
+	if !hasControl && !hasBreakpoint {
+		return
+	}
+	if conv.Cache == nil {
+		conv.Cache = &core.PromptCache{}
+	}
+	if hasControl {
+		conv.Cache.Protocol = "openrouter"
+	} else if conv.Cache.Protocol == "" {
+		conv.Cache.Protocol = "openai-chat"
+	}
+}
 func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPayload, error) {
 	var q request
 	if e := input(ctx, r, &q); e != nil {
@@ -234,7 +464,11 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 	if max != nil && *max < 0 {
 		return nil, unsupported("max_tokens")
 	}
-	conv := core.Conversation{Model: q.Model, MaxOutputTokens: max, Stream: q.Stream}
+	cache, e := promptCacheFromWire(q)
+	if e != nil {
+		return nil, e
+	}
+	conv := core.Conversation{Model: q.Model, MaxOutputTokens: max, Stream: q.Stream, Cache: cache}
 	if q.StreamOptions != nil {
 		if !q.Stream {
 			return nil, unsupported("stream_options")
@@ -267,7 +501,14 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 		if t.Function.Strict != nil && !*t.Function.Strict {
 			return nil, unsupported("tools.function.strict")
 		}
-		conv.Tools = append(conv.Tools, core.Tool{Name: t.Function.Name, Description: t.Function.Description, Schema: append([]byte(nil), t.Function.Parameters...)})
+		cache, e := cacheControlFromWire(t.CacheControl, "tools.cache_control")
+		if e != nil {
+			return nil, e
+		}
+		conv.Tools = append(conv.Tools, core.Tool{
+			Name: t.Function.Name, Description: t.Function.Description,
+			Schema: append([]byte(nil), t.Function.Parameters...), CacheControl: cache,
+		})
 	}
 	switch s := q.Stop.(type) {
 	case nil:
@@ -295,13 +536,16 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 		conv.StructuredOutputStrict = st
 		conv.StructuredOutput = schema
 	}
+	markDecodedCache(&conv)
+	if e := validateConversationCache(conv); e != nil {
+		return nil, e
+	}
 	return conv, nil
 }
 func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.Writer) error {
 	return encodeConversation(ctx, p, w)
 }
 
-// Result wire representation.
 type choice struct {
 	Index        int             `json:"index"`
 	Message      message         `json:"message"`
@@ -317,9 +561,23 @@ type result struct {
 	Usage   *wireUsage `json:"usage,omitempty"`
 }
 type wireUsage struct {
-	PromptTokens     *int64 `json:"prompt_tokens,omitempty"`
-	CompletionTokens *int64 `json:"completion_tokens,omitempty"`
-	TotalTokens      *int64 `json:"total_tokens,omitempty"`
+	PromptTokens            *int64                   `json:"prompt_tokens,omitempty"`
+	CompletionTokens        *int64                   `json:"completion_tokens,omitempty"`
+	TotalTokens             *int64                   `json:"total_tokens,omitempty"`
+	PromptTokensDetails     *promptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *completionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+type promptTokensDetails struct {
+	CachedTokens        *int64 `json:"cached_tokens,omitempty"`
+	CacheWriteTokens    *int64 `json:"cache_write_tokens,omitempty"`
+	CacheReadTokens     *int64 `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
+	AudioTokens         *int64 `json:"audio_tokens,omitempty"`
+}
+type completionTokensDetails struct {
+	ReasoningTokens *int64 `json:"reasoning_tokens,omitempty"`
+	ReasoningOutput *int64 `json:"reasoning_output_tokens,omitempty"`
+	AudioTokens     *int64 `json:"audio_tokens,omitempty"`
 }
 
 func resultBlocks(m message) ([]core.ContentBlock, error) {
@@ -341,6 +599,101 @@ func resultBlocks(m message) ([]core.ContentBlock, error) {
 	}
 	return b, nil
 }
+func validUsageValue(v *int64) bool { return v == nil || *v >= 0 }
+
+func decodeUsage(u *wireUsage) (*core.Usage, error) {
+	if u == nil {
+		return nil, nil
+	}
+	values := []*int64{u.PromptTokens, u.CompletionTokens, u.TotalTokens}
+	if u.PromptTokensDetails != nil {
+		values = append(values,
+			u.PromptTokensDetails.CachedTokens,
+			u.PromptTokensDetails.CacheWriteTokens,
+			u.PromptTokensDetails.CacheReadTokens,
+			u.PromptTokensDetails.CacheCreationTokens,
+			u.PromptTokensDetails.AudioTokens,
+		)
+	}
+	if u.CompletionTokensDetails != nil {
+		values = append(values,
+			u.CompletionTokensDetails.ReasoningTokens,
+			u.CompletionTokensDetails.ReasoningOutput,
+			u.CompletionTokensDetails.AudioTokens,
+		)
+	}
+	for _, v := range values {
+		if !validUsageValue(v) {
+			return nil, unsupported("usage")
+		}
+	}
+	out := &core.Usage{Input: u.PromptTokens, Output: u.CompletionTokens, Total: u.TotalTokens, Source: "provider"}
+	if d := u.PromptTokensDetails; d != nil {
+		out.CachedInput = d.CachedTokens
+		out.CacheWriteInput = d.CacheWriteTokens
+		if out.CacheWriteInput == nil {
+			out.CacheWriteInput = d.CacheCreationTokens
+		}
+		if out.CachedInput == nil {
+			out.CachedInput = d.CacheReadTokens
+		}
+	}
+	if d := u.CompletionTokensDetails; d != nil {
+		out.ReasoningOutput = d.ReasoningTokens
+		if out.ReasoningOutput == nil {
+			out.ReasoningOutput = d.ReasoningOutput
+		}
+	}
+	return out, nil
+}
+
+func cacheWriteAggregate(u *core.Usage) (*int64, error) {
+	if u.CacheWriteInput != nil {
+		return u.CacheWriteInput, nil
+	}
+	var total int64
+	var present bool
+	const maxInt64 = int64(^uint64(0) >> 1)
+	for _, part := range []*int64{u.CacheWrite5mInput, u.CacheWrite1hInput} {
+		if part == nil {
+			continue
+		}
+		if total > maxInt64-*part {
+			return nil, unsupported("usage")
+		}
+		total += *part
+		present = true
+	}
+	if !present {
+		return nil, nil
+	}
+	return &total, nil
+}
+
+func encodeUsage(u *core.Usage) (*wireUsage, error) {
+	if u == nil {
+		return nil, nil
+	}
+	values := []*int64{u.Input, u.Output, u.Total, u.CachedInput, u.CacheWriteInput, u.CacheWrite5mInput, u.CacheWrite1hInput, u.ReasoningOutput, u.ToolInput}
+	for _, v := range values {
+		if !validUsageValue(v) {
+			return nil, unsupported("usage")
+		}
+	}
+	write, err := cacheWriteAggregate(u)
+	if err != nil {
+		return nil, err
+	}
+	out := &wireUsage{PromptTokens: u.Input, CompletionTokens: u.Output, TotalTokens: u.Total}
+	if u.CachedInput != nil || write != nil {
+		out.PromptTokensDetails = &promptTokensDetails{CachedTokens: u.CachedInput, CacheWriteTokens: write}
+	}
+	if u.ReasoningOutput != nil {
+		out.CompletionTokensDetails = &completionTokensDetails{ReasoningTokens: u.ReasoningOutput}
+	}
+	return out, nil
+}
+
 func (c *Codec) DecodeResult(ctx context.Context, r io.Reader) (core.ResultPayload, error) {
 	var v result
 	if e := input(ctx, r, &v); e != nil {
@@ -366,10 +719,10 @@ func (c *Codec) DecodeResult(ctx context.Context, r io.Reader) (core.ResultPaylo
 	}
 	var u *core.Usage
 	if v.Usage != nil {
-		if v.Usage.PromptTokens != nil && *v.Usage.PromptTokens < 0 || v.Usage.CompletionTokens != nil && *v.Usage.CompletionTokens < 0 || v.Usage.TotalTokens != nil && *v.Usage.TotalTokens < 0 {
-			return nil, unsupported("usage")
+		u, e = decodeUsage(v.Usage)
+		if e != nil {
+			return nil, e
 		}
-		u = &core.Usage{Input: v.Usage.PromptTokens, Output: v.Usage.CompletionTokens, Total: v.Usage.TotalTokens, Source: "provider"}
 	}
 	return core.GenerationResult{ID: v.ID, Model: v.Model, Blocks: b, Finish: f, Usage: u}, nil
 }
@@ -479,6 +832,48 @@ func decodeStructured(b []byte) (string, string, string, []byte, *bool, error) {
 		return "", "", "", nil, nil, unsupported("response_format.type")
 	}
 }
+func wireCacheControlFromCore(c *core.CacheControl, param string) (*cacheControl, error) {
+	if c == nil {
+		return nil, nil
+	}
+	if err := validateCacheControl(c, param); err != nil {
+		return nil, err
+	}
+	return &cacheControl{Type: c.Type, TTL: c.TTL}, nil
+}
+
+func wirePartFromBlock(b core.ContentBlock, typ string) (contentPart, error) {
+	cc, err := wireCacheControlFromCore(b.CacheControl, "content.cache_control")
+	if err != nil {
+		return contentPart{}, err
+	}
+	bp := (*cacheBreakpoint)(nil)
+	if b.CacheBreakpoint {
+		bp = &cacheBreakpoint{Mode: "explicit"}
+	}
+	part := contentPart{Type: typ, CacheControl: cc, PromptCacheBreakpoint: bp}
+	switch typ {
+	case "text":
+		if !cleanBlock(b, "text") {
+			return contentPart{}, unsupported("messages.content")
+		}
+		part.Text = b.Text
+	case "image_url":
+		if !cleanBlock(b, "image") || b.CacheBreakpoint {
+			return contentPart{}, unsupported("messages.content")
+		}
+		part.ImageURL = &imageURL{URL: b.URL}
+	case "file":
+		if !cleanBlock(b, "document") || b.CacheBreakpoint {
+			return contentPart{}, unsupported("messages.content")
+		}
+		part.File = &filePart{FileData: b.URL, Filename: b.Name}
+	default:
+		return contentPart{}, unsupported("messages.content")
+	}
+	return part, nil
+}
+
 func encodeConversation(ctx context.Context, p core.RequestPayload, w io.Writer) error {
 	q, ok := p.(core.Conversation)
 	if !ok {
@@ -487,7 +882,18 @@ func encodeConversation(ctx context.Context, p core.RequestPayload, w io.Writer)
 	if q.Model == "" || len(q.Messages) == 0 {
 		return unsupported("model/messages")
 	}
+	if err := validateConversationCache(q); err != nil {
+		return err
+	}
 	out := request{Model: q.Model, MaxTokens: q.MaxOutputTokens, Stream: q.Stream}
+	if q.Cache != nil {
+		out.PromptCacheKey = q.Cache.Key
+		out.PromptCacheRetention = q.Cache.Retention
+		out.SessionID = q.Cache.SessionID
+		if q.Cache.Mode != "" || q.Cache.TTL != "" {
+			out.PromptCacheOptions = &promptCacheOptions{Mode: q.Cache.Mode, TTL: q.Cache.TTL}
+		}
+	}
 	if q.StreamIncludeUsage != nil {
 		if !q.Stream {
 			return unsupported("stream_options")
@@ -495,12 +901,16 @@ func encodeConversation(ctx context.Context, p core.RequestPayload, w io.Writer)
 		out.StreamOptions = &streamOptions{IncludeUsage: q.StreamIncludeUsage}
 	}
 	for _, b := range q.System {
-		if b.Kind != "text" || !cleanBlock(b, "text") {
+		if b.Kind != "text" {
 			return unsupported("system")
 		}
 	}
 	if len(q.System) > 0 {
-		out.Messages = append(out.Messages, message{Role: "system", Content: rawTextBlocks(q.System)})
+		content, err := rawTextBlocks(q.System)
+		if err != nil {
+			return err
+		}
+		out.Messages = append(out.Messages, message{Role: "system", Content: content})
 	}
 	for _, m := range q.Messages {
 		wm, e := wireMessage(m)
@@ -510,13 +920,21 @@ func encodeConversation(ctx context.Context, p core.RequestPayload, w io.Writer)
 		out.Messages = append(out.Messages, wm)
 	}
 	for _, t := range q.Tools {
-		if t.Name == "" {
+		if t.Name == "" || t.CacheBreakpoint {
 			return unsupported("tools")
 		}
 		if e := object(t.Schema); e != nil {
 			return e
 		}
-		out.Tools = append(out.Tools, wireTool{Type: "function", Function: wireFunction{Name: t.Name, Description: t.Description, Parameters: t.Schema}})
+		cc, e := wireCacheControlFromCore(t.CacheControl, "tools.cache_control")
+		if e != nil {
+			return e
+		}
+		out.Tools = append(out.Tools, wireTool{
+			Type:         "function",
+			Function:     wireFunction{Name: t.Name, Description: t.Description, Parameters: t.Schema},
+			CacheControl: cc,
+		})
 	}
 	if len(q.Stop) > 0 {
 		out.Stop = q.Stop
@@ -555,15 +973,35 @@ func encodeConversation(ctx context.Context, p core.RequestPayload, w io.Writer)
 	}
 	return output(ctx, w, out)
 }
-func rawTextBlocks(b []core.ContentBlock) json.RawMessage {
-	if len(b) == 1 {
-		return json.RawMessage(mustJSON(b[0].Text))
+
+func rawTextBlocks(b []core.ContentBlock) (json.RawMessage, error) {
+	if len(b) == 1 && b[0].Kind == "text" && b[0].CacheControl == nil && !b[0].CacheBreakpoint {
+		return json.RawMessage(mustJSON(b[0].Text)), nil
 	}
 	p := make([]contentPart, 0, len(b))
 	for _, x := range b {
-		p = append(p, contentPart{Type: "text", Text: x.Text})
+		if x.Kind == "tool_result" {
+			if !cleanBlock(x, "tool_result") {
+				return nil, unsupported("messages.content")
+			}
+			cc, err := wireCacheControlFromCore(x.CacheControl, "content.cache_control")
+			if err != nil {
+				return nil, err
+			}
+			bp := (*cacheBreakpoint)(nil)
+			if x.CacheBreakpoint {
+				bp = &cacheBreakpoint{Mode: "explicit"}
+			}
+			p = append(p, contentPart{Type: "text", Text: x.Text, CacheControl: cc, PromptCacheBreakpoint: bp})
+			continue
+		}
+		part, err := wirePartFromBlock(x, "text")
+		if err != nil {
+			return nil, err
+		}
+		p = append(p, part)
 	}
-	return mustJSON(p)
+	return mustJSON(p), nil
 }
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
 func wireMessage(m core.Message) (message, error) {
@@ -585,28 +1023,35 @@ func wireMessage(m core.Message) (message, error) {
 			}
 		}
 		wm.ToolCallID = id
-		wm.Content = rawTextBlocks(m.Content)
+		content, err := rawTextBlocks(m.Content)
+		if err != nil {
+			return message{}, err
+		}
+		wm.Content = content
 		return wm, nil
 	}
 	for _, b := range m.Content {
 		switch b.Kind {
 		case "text":
-			if !cleanBlock(b, "text") {
-				return message{}, unsupported("messages.content")
+			part, err := wirePartFromBlock(b, "text")
+			if err != nil {
+				return message{}, err
 			}
-			wm.Content = appendRaw(wm.Content, mustJSON(contentPart{Type: "text", Text: b.Text}))
+			wm.Content = appendRaw(wm.Content, mustJSON(part))
 		case "image":
-			if !cleanBlock(b, "image") {
-				return message{}, unsupported("messages.content")
+			part, err := wirePartFromBlock(b, "image_url")
+			if err != nil {
+				return message{}, err
 			}
-			wm.Content = appendRaw(wm.Content, mustJSON(contentPart{Type: "image_url", ImageURL: &imageURL{URL: b.URL}}))
+			wm.Content = appendRaw(wm.Content, mustJSON(part))
 		case "document":
-			if !cleanBlock(b, "document") {
-				return message{}, unsupported("messages.content")
+			part, err := wirePartFromBlock(b, "file")
+			if err != nil {
+				return message{}, err
 			}
-			wm.Content = appendRaw(wm.Content, mustJSON(contentPart{Type: "file", File: &filePart{FileData: b.URL, Filename: b.Name}}))
+			wm.Content = appendRaw(wm.Content, mustJSON(part))
 		case "tool_call":
-			if m.Role != "assistant" || !cleanBlock(b, "tool_call") || b.ID == "" || b.Name == "" {
+			if m.Role != "assistant" || !cleanBlock(b, "tool_call") || b.ID == "" || b.Name == "" || b.CacheControl != nil || b.CacheBreakpoint {
 				return message{}, unsupported("messages.tool_calls")
 			}
 			if e := arguments(b.Arguments); e != nil {
@@ -638,7 +1083,7 @@ func collapseParts(b json.RawMessage) json.RawMessage {
 	_ = json.Unmarshal(b, &a)
 	if len(a) == 1 {
 		var p contentPart
-		if json.Unmarshal(a[0], &p) == nil && p.Type == "text" {
+		if json.Unmarshal(a[0], &p) == nil && p.Type == "text" && p.CacheControl == nil && p.PromptCacheBreakpoint == nil {
 			return mustJSON(p.Text)
 		}
 	}
@@ -656,12 +1101,13 @@ func (c *Codec) EncodeResult(ctx context.Context, p core.ResultPayload, w io.Wri
 	for _, b := range g.Blocks {
 		switch b.Kind {
 		case "text":
-			if !cleanBlock(b, "text") {
-				return unsupported("blocks")
+			part, err := wirePartFromBlock(b, "text")
+			if err != nil {
+				return err
 			}
-			m.Content = appendRaw(m.Content, mustJSON(contentPart{Type: "text", Text: b.Text}))
+			m.Content = appendRaw(m.Content, mustJSON(part))
 		case "tool_call":
-			if !cleanBlock(b, "tool_call") || b.ID == "" || b.Name == "" {
+			if !cleanBlock(b, "tool_call") || b.ID == "" || b.Name == "" || b.CacheControl != nil || b.CacheBreakpoint {
 				return unsupported("blocks")
 			}
 			if e := arguments(b.Arguments); e != nil {
@@ -680,10 +1126,11 @@ func (c *Codec) EncodeResult(ctx context.Context, p core.ResultPayload, w io.Wri
 	}
 	v := result{ID: g.ID, Object: "chat.completion", Model: g.Model, Choices: []choice{{Index: 0, Message: m, FinishReason: &g.Finish.Reason}}}
 	if g.Usage != nil {
-		if g.Usage.Input != nil && *g.Usage.Input < 0 || g.Usage.Output != nil && *g.Usage.Output < 0 || g.Usage.Total != nil && *g.Usage.Total < 0 {
-			return unsupported("usage")
+		usage, err := encodeUsage(g.Usage)
+		if err != nil {
+			return err
 		}
-		v.Usage = &wireUsage{PromptTokens: g.Usage.Input, CompletionTokens: g.Usage.Output, TotalTokens: g.Usage.Total}
+		v.Usage = usage
 	}
 	return output(ctx, w, v)
 }

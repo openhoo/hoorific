@@ -23,8 +23,28 @@ type Requirements struct {
 	Preferred *core.RouteTarget
 }
 type Health interface {
-	Healthy(context.Context, core.RouteTarget) (bool, error)
+	HealthyScoped(context.Context, core.HealthScope, core.RouteTarget) (bool, error)
 }
+
+// TargetScope resolves the tenant and immutable snapshot generation for a
+// route target. The global configuration revision intentionally acts as the
+// connection/account/credential generation: every committed mutation advances
+// it, while health data remains keyed by the target's tenant.
+func TargetScope(s core.RuntimeSnapshot, target core.RouteTarget) (core.HealthScope, bool) {
+	if s.Revision < 0 || target.ConnectionID == "" || target.ModelID == "" {
+		return core.HealthScope{}, false
+	}
+	connection, ok := s.Connections[target.ConnectionID]
+	if !ok || connection.ID != target.ConnectionID || connection.TenantID == "" {
+		return core.HealthScope{}, false
+	}
+	model, ok := s.Models[target.ModelID]
+	if !ok || model.ConnectionID != target.ConnectionID {
+		return core.HealthScope{}, false
+	}
+	return core.HealthScope{TenantID: connection.TenantID, Revision: s.Revision}, true
+}
+
 type Router struct {
 	catalog *catalog.Catalog
 	health  Health
@@ -90,7 +110,14 @@ func Order(ctx context.Context, s core.RuntimeSnapshot, alias string, req Requir
 			return nil, fmt.Errorf("invalid route priority or weight")
 		}
 		if health != nil {
-			healthy, err := health.Healthy(ctx, t)
+			scope, valid := TargetScope(s, t)
+			healthy := true
+			var err error
+			if valid {
+				healthy, err = health.HealthyScoped(ctx, scope, t)
+			}
+			// A malformed scope cannot safely read a hint. Treat the
+			// disposable signal as absent rather than suppressing a target.
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}

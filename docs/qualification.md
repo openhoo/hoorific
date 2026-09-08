@@ -48,6 +48,27 @@ The runner executes `migrate --config PATH`, starts `serve --config PATH`, probe
 `--gateway-key-file` (or `HOORIFIC_VERIFY_KEY`) overrides the generated key for a pre-seeded configuration. The public `--config` flag is intentionally rejected for qualification; the harness never copies, starts, migrates, or mutates an operator-supplied database or service.
 
 Fixture fault modes are selected with `--fixture-mode=truncate`, `disconnect`, `429`, `slow`, `unicode`, `named-error`, or `tool` (the default is `normal`). These modes exercise the owned loopback fixture only. Exit status is nonzero for setup or observed behavior failures; `not-run` coverage is visible in the JSON report and summary counters.
+### Cost-safety selector
+
+Run the focused cost/accounting and protocol-control qualification against the
+owned loopback fixture:
+
+```text
+go run ./tools/verify \
+  --binary .artifacts/hoorific \
+  --mode standalone \
+  --scenario cost-safety \
+  --output .artifacts/verify-cost-safety.json
+```
+
+This selector exercises cache settlement and representable controls,
+cross-protocol rejection, translated cache controls, idempotent replay and
+pending/mismatch handling, streaming usage, `Retry-After`, Cohere
+cancellation, Replicate creation headers, budget admission, and unknown-usage
+reconciliation. It uses temporary provider fixtures and configured fixture
+rates only; it does not contact a paid provider or claim provider pricing,
+entitlement, or cache savings. `--scenario all` includes this selector.
+
 
 ### Deep regression and browser suites
 
@@ -122,6 +143,13 @@ go run ./tools/verify --scenario live --allow-paid --connections openai,anthropi
   --live-spend-ceiling-nanodollars 1000000000 \
   --output .artifacts/verify-live.json
 ```
+
+The approval is for this exact gateway, connection-ID set, case file, and
+positive aggregate ceiling. The `--allow-paid` switch is only an explicit
+operator opt-in; it is not a provider entitlement or a pricing check. No
+fixture, deterministic selector, or prior report authorizes a live run, and
+the live procedure must not be described as successful unless that exact
+operator-approved run was actually observed.
 
 The example origins are placeholders. The URL inputs must be HTTPS origins, or literal-loopback HTTP origins. Secret files contain raw values, are regular non-symlink files, and have no group or other permissions. The cases file is strict version 1: each selected connection/advertised operation requires one explicit catalog `model_id`, exact production descriptor `action`, a timeout from 1 through 120 seconds, and wire request JSON. The runner reads authenticated management data and an existing hard-cost policy fence; it never creates or mutates that fence.
 

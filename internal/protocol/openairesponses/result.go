@@ -7,10 +7,18 @@ import (
 	"io"
 )
 
+type usageInputDetails struct {
+	CachedTokens *int64 `json:"cached_tokens,omitempty"`
+}
+type usageOutputDetails struct {
+	ReasoningTokens *int64 `json:"reasoning_tokens,omitempty"`
+}
 type wireUsageResult struct {
-	Input  *int64 `json:"input_tokens"`
-	Output *int64 `json:"output_tokens"`
-	Total  *int64 `json:"total_tokens"`
+	Input         *int64              `json:"input_tokens"`
+	Output        *int64              `json:"output_tokens"`
+	Total         *int64              `json:"total_tokens"`
+	InputDetails  *usageInputDetails  `json:"input_tokens_details,omitempty"`
+	OutputDetails *usageOutputDetails `json:"output_tokens_details,omitempty"`
 }
 type resultWire struct {
 	ID         string            `json:"id"`
@@ -27,18 +35,39 @@ func decodeUsage(u *wireUsageResult) (*core.Usage, error) {
 	if u == nil {
 		return nil, nil
 	}
-	for _, n := range []*int64{u.Input, u.Output, u.Total} {
+	values := []*int64{u.Input, u.Output, u.Total}
+	if u.InputDetails != nil {
+		values = append(values, u.InputDetails.CachedTokens)
+	}
+	if u.OutputDetails != nil {
+		values = append(values, u.OutputDetails.ReasoningTokens)
+	}
+	for _, n := range values {
 		if n != nil && *n < 0 {
 			return nil, unsupported("usage")
 		}
 	}
-	return &core.Usage{Input: u.Input, Output: u.Output, Total: u.Total, Source: "provider"}, nil
+	out := &core.Usage{Input: u.Input, Output: u.Output, Total: u.Total, Source: "provider"}
+	if u.InputDetails != nil {
+		out.CachedInput = u.InputDetails.CachedTokens
+	}
+	if u.OutputDetails != nil {
+		out.ReasoningOutput = u.OutputDetails.ReasoningTokens
+	}
+	return out, nil
 }
 func encodeUsage(u *core.Usage) *wireUsageResult {
 	if u == nil {
 		return nil
 	}
-	return &wireUsageResult{u.Input, u.Output, u.Total}
+	out := &wireUsageResult{Input: u.Input, Output: u.Output, Total: u.Total}
+	if u.CachedInput != nil {
+		out.InputDetails = &usageInputDetails{CachedTokens: u.CachedInput}
+	}
+	if u.ReasoningOutput != nil {
+		out.OutputDetails = &usageOutputDetails{ReasoningTokens: u.ReasoningOutput}
+	}
+	return out
 }
 func outputBlock(v object) ([]core.ContentBlock, error) {
 	t, e := str(v, "type")

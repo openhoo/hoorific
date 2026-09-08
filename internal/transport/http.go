@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"hoorific/internal/core"
 	"net"
 	"net/http"
 	"net/netip"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"hoorific/internal/core"
 )
 
 type NetworkPolicy struct {
@@ -21,18 +21,20 @@ type NetworkPolicy struct {
 	AllowPrivate, AllowSameOriginRedirect bool
 }
 type Pool struct {
-	mu      sync.Mutex
-	clients map[string]*http.Client
+	mu              sync.Mutex
+	clients         map[string]*http.Client
 	maxConnsPerHost int
 }
 
 func NewPool() *Pool {
-	return &Pool{clients:make(map[string]*http.Client), maxConnsPerHost:core.DefaultMaxConnsPerHost}
+	return &Pool{clients: make(map[string]*http.Client), maxConnsPerHost: core.DefaultMaxConnsPerHost}
 }
 
 func NewPoolWithConfig(config core.TransportConfig) (*Pool, error) {
-	if err := config.Validate(); err != nil { return nil, err }
-	return &Pool{clients:make(map[string]*http.Client), maxConnsPerHost:config.ConnectionLimit()}, nil
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	return &Pool{clients: make(map[string]*http.Client), maxConnsPerHost: config.ConnectionLimit()}, nil
 }
 func (p *Pool) Client(policy NetworkPolicy) (*http.Client, error) {
 	hosts := append([]string(nil), policy.AllowedHosts...)

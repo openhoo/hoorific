@@ -46,7 +46,7 @@ func (Codec) DecodeResult(ctx context.Context, r io.Reader) (core.ResultPayload,
 		return nil, err
 	}
 	var a resultWire
-	if err := readJSON(r, &a); err != nil {
+	if err := readResponseJSON(r, &a); err != nil {
 		return nil, err
 	}
 	return resultFromWire(a)
@@ -80,6 +80,10 @@ func (Codec) NewEncoder(w io.Writer) (core.EventEncoder, error) {
 
 // Wire types are deliberately closed; strict() rejects provider extensions that
 // the core cannot retain.
+type cacheControlWire struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
+}
 type requestWire struct {
 	Model        string            `json:"model"`
 	MaxTokens    *int64            `json:"max_tokens"`
@@ -88,6 +92,7 @@ type requestWire struct {
 	Tools        []toolWire        `json:"tools,omitempty"`
 	Stop         []string          `json:"stop_sequences,omitempty"`
 	Stream       bool              `json:"stream,omitempty"`
+	CacheControl *cacheControlWire `json:"cache_control,omitempty"`
 	OutputConfig *outputConfigWire `json:"output_config,omitempty"`
 }
 type outputConfigWire struct {
@@ -105,25 +110,101 @@ type messageWire struct {
 	Content json.RawMessage `json:"content"`
 }
 type toolWire struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name         string            `json:"name"`
+	Description  string            `json:"description,omitempty"`
+	InputSchema  json.RawMessage   `json:"input_schema"`
+	CacheControl *cacheControlWire `json:"cache_control,omitempty"`
 }
 type blockWire struct {
-	Type      string          `json:"type"`
-	Text      *string         `json:"text,omitempty"`
-	Source    *sourceWire     `json:"source,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
+	Type         string            `json:"type"`
+	Text         *string           `json:"text,omitempty"`
+	Thinking     *string           `json:"thinking,omitempty"`
+	Source       *sourceWire       `json:"source,omitempty"`
+	ID           string            `json:"id,omitempty"`
+	Name         string            `json:"name,omitempty"`
+	Input        json.RawMessage   `json:"input,omitempty"`
+	ToolUseID    string            `json:"tool_use_id,omitempty"`
+	Content      json.RawMessage   `json:"content,omitempty"`
+	CacheControl *cacheControlWire `json:"cache_control,omitempty"`
 }
 type sourceWire struct {
 	Type      string `json:"type"`
 	MediaType string `json:"media_type,omitempty"`
 	Data      string `json:"data,omitempty"`
 	URL       string `json:"url,omitempty"`
+}
+
+func cacheControlFromWire(v *cacheControlWire, path string) (*core.CacheControl, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if v.Type != "ephemeral" || v.TTL != "" && v.TTL != "5m" && v.TTL != "1h" {
+		return nil, unsupported(path)
+	}
+	return &core.CacheControl{Type: v.Type, TTL: v.TTL}, nil
+}
+
+func cacheControlToWire(v *core.CacheControl, path string) (*cacheControlWire, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if v.Type != "ephemeral" && v.Type != "default" {
+		return nil, unsupported(path + ".type")
+	}
+	if v.TTL != "" && v.TTL != "5m" && v.TTL != "1h" {
+		return nil, unsupported(path + ".ttl")
+	}
+	// Bedrock's default cache-point and Anthropic's ephemeral breakpoint have
+	// the same prefix/TTL semantics. Translate only that equivalent form.
+	return &cacheControlWire{Type: "ephemeral", TTL: v.TTL}, nil
+}
+
+func validatePromptCache(c *core.PromptCache) (*cacheControlWire, error) {
+	if c == nil {
+		return nil, nil
+	}
+	if c.Key != "" || c.Retention != "" || c.Mode != "" || c.CachedContent != "" || c.SessionID != "" || c.TTL != "" {
+		return nil, unsupported("cache")
+	}
+	if c.Protocol != "" && c.Protocol != "anthropic-messages" && c.Protocol != "anthropic" && c.Protocol != "bedrock-converse" {
+		return nil, unsupported("cache.protocol")
+	}
+	return cacheControlToWire(c.Control, "cache.control")
+}
+
+func normalizeBlocks(in []core.ContentBlock, path string) ([]core.ContentBlock, error) {
+	out := make([]core.ContentBlock, 0, len(in))
+	for i, original := range in {
+		b := original
+		if b.CacheBreakpoint {
+			return nil, unsupported(field(path, i) + ".cache_breakpoint")
+		}
+		if b.Kind == "cache_point" {
+			if len(out) == 0 {
+				return nil, unsupported(field(path, i))
+			}
+			cc := b.CacheControl
+			if cc == nil {
+				cc = &core.CacheControl{Type: "default"}
+			}
+			if _, err := cacheControlToWire(cc, field(path, i)+".cache_control"); err != nil {
+				return nil, err
+			}
+			prev := &out[len(out)-1]
+			if prev.CacheControl != nil && (prev.CacheControl.Type != cc.Type || prev.CacheControl.TTL != cc.TTL) {
+				return nil, unsupported(field(path, i) + ".cache_control")
+			}
+			prev.CacheControl = &core.CacheControl{Type: "ephemeral", TTL: cc.TTL}
+			continue
+		}
+		if b.CacheControl != nil {
+			if _, err := cacheControlToWire(b.CacheControl, field(path, i)+".cache_control"); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, b)
+	}
+	return out, nil
 }
 
 func conversationToWire(c core.Conversation) (requestWire, error) {
@@ -139,9 +220,13 @@ func conversationToWire(c core.Conversation) (requestWire, error) {
 		return requestWire{}, unsupported("max_output_tokens")
 	}
 	a := requestWire{Model: c.Model, MaxTokens: max, Stream: c.Stream}
+	var err error
+	a.CacheControl, err = validatePromptCache(c.Cache)
+	if err != nil {
+		return a, err
+	}
 	a.Stop = append([]string(nil), c.Stop...)
 	if len(c.System) > 0 {
-		var err error
 		a.System, err = blocksToJSON(c.System, "system")
 		if err != nil {
 			return a, err
@@ -165,6 +250,22 @@ func conversationToWire(c core.Conversation) (requestWire, error) {
 			return a, err
 		}
 		a.Messages = append(a.Messages, messageWire{Role: role, Content: b})
+	}
+	for i, t := range c.Tools {
+		if err := required(t.Name, field("tools.name", i)); err != nil {
+			return a, err
+		}
+		if err := object(t.Schema); err != nil {
+			return a, err
+		}
+		if t.CacheBreakpoint {
+			return a, unsupported(field("tools", i) + ".cache_breakpoint")
+		}
+		cc, err := cacheControlToWire(t.CacheControl, field("tools", i)+".cache_control")
+		if err != nil {
+			return a, err
+		}
+		a.Tools = append(a.Tools, toolWire{Name: t.Name, Description: t.Description, InputSchema: json.RawMessage(t.Schema), CacheControl: cc})
 	}
 	if c.StructuredOutput != nil {
 		if c.StructuredOutputMode != "" && c.StructuredOutputMode != "json_schema" {
@@ -190,6 +291,13 @@ func conversationFromWire(a requestWire) (core.RequestPayload, error) {
 		return nil, unsupported("messages")
 	}
 	c := core.Conversation{Model: a.Model, MaxOutputTokens: a.MaxTokens, Stream: a.Stream, Stop: append([]string(nil), a.Stop...)}
+	if a.CacheControl != nil {
+		cc, err := cacheControlFromWire(a.CacheControl, "cache_control")
+		if err != nil {
+			return nil, err
+		}
+		c.Cache = &core.PromptCache{Protocol: "anthropic-messages", Control: cc}
+	}
 	if len(a.System) > 0 {
 		b, err := blocksFromJSON(a.System, "system")
 		if err != nil {
@@ -227,7 +335,11 @@ func conversationFromWire(a requestWire) (core.RequestPayload, error) {
 		if len(t.InputSchema) == 0 || object(t.InputSchema) != nil {
 			return nil, unsupported(field("tools.input_schema", i))
 		}
-		c.Tools = append(c.Tools, core.Tool{Name: t.Name, Description: t.Description, Schema: append([]byte(nil), t.InputSchema...)})
+		cc, err := cacheControlFromWire(t.CacheControl, field("tools", i)+".cache_control")
+		if err != nil {
+			return nil, err
+		}
+		c.Tools = append(c.Tools, core.Tool{Name: t.Name, Description: t.Description, Schema: append([]byte(nil), t.InputSchema...), CacheControl: cc})
 	}
 	if a.OutputConfig != nil {
 		if a.OutputConfig.Format.Type != "json_schema" || len(a.OutputConfig.Format.Schema) == 0 || object(a.OutputConfig.Format.Schema) != nil {
@@ -239,11 +351,44 @@ func conversationFromWire(a requestWire) (core.RequestPayload, error) {
 		c.StructuredOutputMode = "json_schema"
 		c.StructuredOutputStrict = a.OutputConfig.Format.Strict
 	}
+	if c.Cache == nil {
+		for _, bs := range append([][]core.ContentBlock{c.System}, messageBlocks(c.Messages)...) {
+			for _, b := range bs {
+				if b.CacheControl != nil {
+					c.Cache = &core.PromptCache{Protocol: "anthropic-messages"}
+					break
+				}
+			}
+			if c.Cache != nil {
+				break
+			}
+		}
+	}
+	if c.Cache == nil {
+		for _, t := range c.Tools {
+			if t.CacheControl != nil {
+				c.Cache = &core.PromptCache{Protocol: "anthropic-messages"}
+				break
+			}
+		}
+	}
 	return c, nil
 }
+
+func messageBlocks(ms []core.Message) [][]core.ContentBlock {
+	out := make([][]core.ContentBlock, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.Content)
+	}
+	return out
+}
 func blocksToJSON(in []core.ContentBlock, path string) (json.RawMessage, error) {
-	out := make([]blockWire, 0, len(in))
-	for i, b := range in {
+	normalized, err := normalizeBlocks(in, path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]blockWire, 0, len(normalized))
+	for i, b := range normalized {
 		x, err := blockToWire(b, field(path, i))
 		if err != nil {
 			return nil, err
@@ -287,12 +432,24 @@ func blockType(raw json.RawMessage) (string, error) {
 	return t, nil
 }
 func blockToWire(b core.ContentBlock, path string) (blockWire, error) {
+	if b.CacheBreakpoint {
+		return blockWire{}, unsupported(path + ".cache_breakpoint")
+	}
+	cc, err := cacheControlToWire(b.CacheControl, path+".cache_control")
+	if err != nil {
+		return blockWire{}, err
+	}
 	switch b.Kind {
 	case "text":
 		if b.URL != "" || b.MIMEType != "" || len(b.Data) > 0 || b.ID != "" || b.Name != "" || b.Arguments != "" {
 			return blockWire{}, unsupported(path)
 		}
-		return blockWire{Type: "text", Text: &b.Text}, nil
+		return blockWire{Type: "text", Text: &b.Text, CacheControl: cc}, nil
+	case "reasoning":
+		if b.Text == "" || b.URL != "" || b.MIMEType != "" || len(b.Data) > 0 || b.ID != "" || b.Name != "" || b.Arguments != "" {
+			return blockWire{}, unsupported(path)
+		}
+		return blockWire{Type: "thinking", Thinking: &b.Text, CacheControl: cc}, nil
 	case "image", "document":
 		if b.ID != "" || b.Name != "" || b.Arguments != "" {
 			return blockWire{}, unsupported(path)
@@ -311,7 +468,7 @@ func blockToWire(b core.ContentBlock, path string) (blockWire, error) {
 		} else {
 			return blockWire{}, unsupported(path + ".source")
 		}
-		return blockWire{Type: b.Kind, Source: &s}, nil
+		return blockWire{Type: b.Kind, Source: &s, CacheControl: cc}, nil
 	case "tool_call":
 		if b.ID == "" || b.Name == "" || len(b.Arguments) == 0 || b.Text != "" || b.URL != "" || b.MIMEType != "" || len(b.Data) > 0 {
 			return blockWire{}, unsupported(path)
@@ -319,7 +476,7 @@ func blockToWire(b core.ContentBlock, path string) (blockWire, error) {
 		if err := object([]byte(b.Arguments)); err != nil {
 			return blockWire{}, unsupported(path + ".input")
 		}
-		return blockWire{Type: "tool_use", ID: b.ID, Name: b.Name, Input: json.RawMessage(b.Arguments)}, nil
+		return blockWire{Type: "tool_use", ID: b.ID, Name: b.Name, Input: json.RawMessage(b.Arguments), CacheControl: cc}, nil
 	case "tool_result":
 		if b.ID == "" || b.URL != "" || b.MIMEType != "" || len(b.Data) > 0 || b.Name != "" || b.Arguments != "" {
 			return blockWire{}, unsupported(path + ".tool_use_id")
@@ -330,7 +487,7 @@ func blockToWire(b core.ContentBlock, path string) (blockWire, error) {
 		} else {
 			content, _ = json.Marshal([]blockWire{{Type: "text", Text: &b.Text}})
 		}
-		return blockWire{Type: "tool_result", ToolUseID: b.ID, Content: content}, nil
+		return blockWire{Type: "tool_result", ToolUseID: b.ID, Content: content, CacheControl: cc}, nil
 	default:
 		return blockWire{}, unsupported(path + ".kind")
 	}
@@ -346,8 +503,9 @@ func blockFromRaw(raw json.RawMessage, path string) (core.ContentBlock, error) {
 	switch typ {
 	case "text":
 		var x struct {
-			Type string  `json:"type"`
-			Text *string `json:"text"`
+			Type         string            `json:"type"`
+			Text         *string           `json:"text"`
+			CacheControl *cacheControlWire `json:"cache_control,omitempty"`
 		}
 		if err := strict(raw, &x); err != nil {
 			return core.ContentBlock{}, err
@@ -355,32 +513,59 @@ func blockFromRaw(raw json.RawMessage, path string) (core.ContentBlock, error) {
 		if x.Text == nil {
 			return core.ContentBlock{}, unsupported(path + ".text")
 		}
-		return core.ContentBlock{Kind: "text", Text: *x.Text}, nil
-	case "image", "document":
+		cc, err := cacheControlFromWire(x.CacheControl, path+".cache_control")
+		if err != nil {
+			return core.ContentBlock{}, err
+		}
+		return core.ContentBlock{Kind: "text", Text: *x.Text, CacheControl: cc}, nil
+	case "thinking":
 		var x struct {
-			Type   string     `json:"type"`
-			Source sourceWire `json:"source"`
+			Type         string            `json:"type"`
+			Thinking     *string           `json:"thinking"`
+			CacheControl *cacheControlWire `json:"cache_control,omitempty"`
 		}
 		if err := strict(raw, &x); err != nil {
 			return core.ContentBlock{}, err
 		}
+		if x.Thinking == nil {
+			return core.ContentBlock{}, unsupported(path + ".thinking")
+		}
+		cc, err := cacheControlFromWire(x.CacheControl, path+".cache_control")
+		if err != nil {
+			return core.ContentBlock{}, err
+		}
+		return core.ContentBlock{Kind: "reasoning", Text: *x.Thinking, CacheControl: cc}, nil
+	case "image", "document":
+		var x struct {
+			Type         string            `json:"type"`
+			Source       sourceWire        `json:"source"`
+			CacheControl *cacheControlWire `json:"cache_control,omitempty"`
+		}
+		if err := strict(raw, &x); err != nil {
+			return core.ContentBlock{}, err
+		}
+		cc, err := cacheControlFromWire(x.CacheControl, path+".cache_control")
+		if err != nil {
+			return core.ContentBlock{}, err
+		}
 		if x.Source.Type == "url" && x.Source.URL != "" {
-			return core.ContentBlock{Kind: typ, URL: x.Source.URL}, nil
+			return core.ContentBlock{Kind: typ, URL: x.Source.URL, CacheControl: cc}, nil
 		}
 		if x.Source.Type == "base64" && x.Source.Data != "" && x.Source.MediaType != "" {
 			data, e := base64.StdEncoding.DecodeString(x.Source.Data)
 			if e != nil {
 				return core.ContentBlock{}, unsupported(path + ".source.data")
 			}
-			return core.ContentBlock{Kind: typ, MIMEType: x.Source.MediaType, Data: data}, nil
+			return core.ContentBlock{Kind: typ, MIMEType: x.Source.MediaType, Data: data, CacheControl: cc}, nil
 		}
 		return core.ContentBlock{}, unsupported(path + ".source")
 	case "tool_use":
 		var x struct {
-			Type  string          `json:"type"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
+			Type         string            `json:"type"`
+			ID           string            `json:"id"`
+			Name         string            `json:"name"`
+			Input        json.RawMessage   `json:"input"`
+			CacheControl *cacheControlWire `json:"cache_control,omitempty"`
 		}
 		if err := strict(raw, &x); err != nil {
 			return core.ContentBlock{}, err
@@ -391,12 +576,17 @@ func blockFromRaw(raw json.RawMessage, path string) (core.ContentBlock, error) {
 		if err := object(x.Input); err != nil {
 			return core.ContentBlock{}, err
 		}
-		return core.ContentBlock{Kind: "tool_call", ID: x.ID, Name: x.Name, Arguments: string(x.Input)}, nil
+		cc, err := cacheControlFromWire(x.CacheControl, path+".cache_control")
+		if err != nil {
+			return core.ContentBlock{}, err
+		}
+		return core.ContentBlock{Kind: "tool_call", ID: x.ID, Name: x.Name, Arguments: string(x.Input), CacheControl: cc}, nil
 	case "tool_result":
 		var x struct {
-			Type      string          `json:"type"`
-			ToolUseID string          `json:"tool_use_id"`
-			Content   json.RawMessage `json:"content"`
+			Type         string            `json:"type"`
+			ToolUseID    string            `json:"tool_use_id"`
+			Content      json.RawMessage   `json:"content"`
+			CacheControl *cacheControlWire `json:"cache_control,omitempty"`
 		}
 		if err := strict(raw, &x); err != nil {
 			return core.ContentBlock{}, err
@@ -408,10 +598,92 @@ func blockFromRaw(raw json.RawMessage, path string) (core.ContentBlock, error) {
 		if err != nil {
 			return core.ContentBlock{}, err
 		}
-		return core.ContentBlock{Kind: "tool_result", ID: x.ToolUseID, Text: text}, nil
+		cc, err := cacheControlFromWire(x.CacheControl, path+".cache_control")
+		if err != nil {
+			return core.ContentBlock{}, err
+		}
+		return core.ContentBlock{Kind: "tool_result", ID: x.ToolUseID, Text: text, CacheControl: cc}, nil
 	default:
 		return core.ContentBlock{}, unsupported(path + ".type")
 	}
+}
+func responseBlockFromRaw(raw json.RawMessage, path string) (core.ContentBlock, error) {
+	var x struct {
+		Type         string            `json:"type"`
+		Text         *string           `json:"text"`
+		Thinking     *string           `json:"thinking"`
+		Source       sourceWire        `json:"source"`
+		ID           string            `json:"id"`
+		Name         string            `json:"name"`
+		Input        json.RawMessage   `json:"input"`
+		ToolUseID    string            `json:"tool_use_id"`
+		Content      json.RawMessage   `json:"content"`
+		CacheControl *cacheControlWire `json:"cache_control"`
+	}
+	if err := tolerant(raw, &x); err != nil {
+		return core.ContentBlock{}, err
+	}
+	cc, err := cacheControlFromWire(x.CacheControl, path+".cache_control")
+	if err != nil {
+		return core.ContentBlock{}, err
+	}
+	switch x.Type {
+	case "text":
+		if x.Text == nil {
+			return core.ContentBlock{}, unsupported(path + ".text")
+		}
+		return core.ContentBlock{Kind: "text", Text: *x.Text, CacheControl: cc}, nil
+	case "thinking":
+		if x.Thinking == nil {
+			return core.ContentBlock{}, unsupported(path + ".thinking")
+		}
+		return core.ContentBlock{Kind: "reasoning", Text: *x.Thinking, CacheControl: cc}, nil
+	case "tool_use", "server_tool_use":
+		if x.ID == "" || x.Name == "" || len(x.Input) == 0 {
+			return core.ContentBlock{}, unsupported(path)
+		}
+		if err := object(x.Input); err != nil {
+			return core.ContentBlock{}, err
+		}
+		return core.ContentBlock{Kind: "tool_call", ID: x.ID, Name: x.Name, Arguments: string(x.Input), CacheControl: cc}, nil
+	case "tool_result", "web_search_tool_result":
+		if x.ToolUseID == "" {
+			return core.ContentBlock{}, unsupported(path)
+		}
+		text, err := responseToolResultText(x.Content, path+".content")
+		if err != nil {
+			return core.ContentBlock{}, err
+		}
+		return core.ContentBlock{Kind: "tool_result", ID: x.ToolUseID, Text: text, CacheControl: cc}, nil
+	default:
+		return core.ContentBlock{}, unsupported(path + ".type")
+	}
+}
+
+func responseToolResultText(raw json.RawMessage, path string) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+	var s string
+	if tolerant(raw, &s) == nil {
+		return s, nil
+	}
+	var bs []json.RawMessage
+	if err := tolerant(raw, &bs); err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	for i, r := range bs {
+		b, err := responseBlockFromRaw(r, field(path, i))
+		if err != nil {
+			return "", err
+		}
+		if b.Kind != "text" && b.Kind != "reasoning" {
+			return "", unsupported(field(path, i))
+		}
+		out.WriteString(b.Text)
+	}
+	return out.String(), nil
 }
 func toolResultText(raw json.RawMessage, path string) (string, error) {
 	if len(raw) == 0 {

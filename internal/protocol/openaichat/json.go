@@ -128,6 +128,8 @@ func cleanBlock(b core.ContentBlock, kind string) bool {
 		return b.Text == "" && b.URL == "" && b.MIMEType == "" && len(b.Data) == 0
 	case "tool_result":
 		return b.URL == "" && b.MIMEType == "" && b.Arguments == "" && len(b.Data) == 0
+	case "image":
+		return b.Text == "" && b.MIMEType == "" && b.ID == "" && b.Name == "" && b.Arguments == "" && len(b.Data) == 0 && b.URL != ""
 	case "document":
 		return b.Text == "" && b.Arguments == "" && b.ID == "" && b.URL != "" && (len(b.Data) == 0 || strings.HasPrefix(b.URL, "data:"))
 	}

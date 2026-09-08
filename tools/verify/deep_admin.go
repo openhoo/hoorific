@@ -891,14 +891,14 @@ func (e *environment) deepAdminConnectionLifecycle(s deepAdminState) result {
 	}
 	testBefore := e.fixture.count()
 	test, testErr := e.deepCall(true, http.MethodPost, "/admin/api/v1/connections/"+url.PathEscape(connectionID)+"/test", map[string]any{"data": map[string]any{}}, nil)
-	evidence["test_transport_fence"] = deepSafeObservation(test)
+	evidence["test"] = deepSafeObservation(test)
 	if err == nil {
 		if testErr != nil {
 			err = testErr
-		} else if test.Status < 400 {
-			err = fmt.Errorf("HTTP connection test unexpectedly succeeded against an insecure fixture origin")
-		} else if e.fixture.count() != testBefore {
-			err = errors.New("rejected insecure connection test dispatched upstream")
+		} else if test.Status != http.StatusOK {
+			err = fmt.Errorf("connection test returned HTTP %d", test.Status)
+		} else if e.fixture.count()-testBefore != 1 {
+			err = errors.New("connection test did not make exactly one configured upstream request")
 		}
 	}
 	disabled, disabledErr := e.deepCall(true, http.MethodPost, "/admin/api/v1/connections/"+url.PathEscape(connectionID)+"/disable", map[string]any{"data": map[string]any{}}, func(r *http.Request) {

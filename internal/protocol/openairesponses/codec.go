@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"hoorific/internal/core"
 	"io"
 	"strings"
@@ -13,6 +14,13 @@ type Codec struct{}
 
 func New() *Codec { return &Codec{} }
 
+type cacheBreakpoint struct {
+	Mode string `json:"mode"`
+}
+type promptCacheOptions struct {
+	Mode string `json:"mode,omitempty"`
+	TTL  string `json:"ttl,omitempty"`
+}
 type wireInput struct {
 	Role      string        `json:"role,omitempty"`
 	Content   []wireContent `json:"content,omitempty"`
@@ -24,12 +32,13 @@ type wireInput struct {
 	Output    any           `json:"output,omitempty"`
 }
 type wireContent struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	ImageURL string `json:"image_url,omitempty"`
-	FileURL  string `json:"file_url,omitempty"`
-	Filename string `json:"filename,omitempty"`
-	FileData string `json:"file_data,omitempty"`
+	Type                  string           `json:"type"`
+	Text                  string           `json:"text,omitempty"`
+	ImageURL              string           `json:"image_url,omitempty"`
+	FileURL               string           `json:"file_url,omitempty"`
+	Filename              string           `json:"filename,omitempty"`
+	FileData              string           `json:"file_data,omitempty"`
+	PromptCacheBreakpoint *cacheBreakpoint `json:"prompt_cache_breakpoint,omitempty"`
 }
 type wireTool struct {
 	Type        string          `json:"type"`
@@ -48,19 +57,111 @@ type wireFormat struct {
 	Strict      *bool           `json:"strict,omitempty"`
 }
 type requestWire struct {
-	Model  string      `json:"model"`
-	Store  *bool       `json:"store"`
-	Input  []wireInput `json:"input"`
-	Max    *int64      `json:"max_output_tokens,omitempty"`
-	Stream bool        `json:"stream,omitempty"`
-	Tools  []wireTool  `json:"tools,omitempty"`
-	Text   *wireText   `json:"text,omitempty"`
+	Model                string              `json:"model"`
+	Store                *bool               `json:"store"`
+	Input                []wireInput         `json:"input"`
+	Max                  *int64              `json:"max_output_tokens,omitempty"`
+	Stream               bool                `json:"stream,omitempty"`
+	Tools                []wireTool          `json:"tools,omitempty"`
+	Text                 *wireText           `json:"text,omitempty"`
+	PromptCacheKey       string              `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string              `json:"prompt_cache_retention,omitempty"`
+	PromptCacheOptions   *promptCacheOptions `json:"prompt_cache_options,omitempty"`
+}
+
+func validCacheString(v string, max int) bool {
+	return v != "" && len([]rune(v)) <= max && !strings.ContainsAny(v, "\x00\r\n")
+}
+
+func validCacheTTL(v string) bool {
+	switch v {
+	case "", "5m", "30m", "1h", "24h":
+		return true
+	default:
+		return false
+	}
+}
+
+func validatePromptCache(c *core.PromptCache) error {
+	if c == nil {
+		return nil
+	}
+	switch c.Protocol {
+	case "", "openai-chat", "openai-responses":
+	default:
+		return unsupported("cache.protocol")
+	}
+	if c.Key != "" && !validCacheString(c.Key, 256) {
+		return unsupported("prompt_cache_key")
+	}
+	if c.Retention != "" && c.Retention != "in_memory" && c.Retention != "24h" {
+		return unsupported("prompt_cache_retention")
+	}
+	if c.Mode != "" && c.Mode != "implicit" && c.Mode != "explicit" {
+		return unsupported("prompt_cache_options.mode")
+	}
+	if !validCacheTTL(c.TTL) {
+		return unsupported("prompt_cache_options.ttl")
+	}
+	if c.SessionID != "" {
+		return unsupported("session_id")
+	}
+	if c.Control != nil {
+		return unsupported("cache.control")
+	}
+	if c.CachedContent != "" {
+		return unsupported("cache.cached_content")
+	}
+	return nil
+}
+
+func validateResponsesCache(q core.Conversation) error {
+	if err := validatePromptCache(q.Cache); err != nil {
+		return err
+	}
+	check := func(b core.ContentBlock, param string) error {
+		if b.CacheControl != nil {
+			return unsupported(param + ".cache_control")
+		}
+		if b.CacheBreakpoint && b.Kind != "text" {
+			return unsupported(param + ".prompt_cache_breakpoint")
+		}
+		return nil
+	}
+	for i, b := range q.System {
+		if err := check(b, "system["+fmt.Sprint(i)+"]"); err != nil {
+			return err
+		}
+	}
+	for i, m := range q.Messages {
+		for j, b := range m.Content {
+			if err := check(b, "messages["+fmt.Sprint(i)+"].content["+fmt.Sprint(j)+"]"); err != nil {
+				return err
+			}
+		}
+	}
+	for i, t := range q.Tools {
+		if t.CacheControl != nil || t.CacheBreakpoint {
+			return unsupported("tools[" + fmt.Sprint(i) + "].cache_control")
+		}
+	}
+	return nil
 }
 
 func contentToWire(b core.ContentBlock) (wireContent, error) {
+	if b.CacheControl != nil {
+		return wireContent{}, unsupported("input.cache_control")
+	}
+	if b.CacheBreakpoint && b.Kind != "text" {
+		return wireContent{}, unsupported("input.prompt_cache_breakpoint")
+	}
+	var breakpoint *cacheBreakpoint
+	if b.CacheBreakpoint {
+		breakpoint = &cacheBreakpoint{Mode: "explicit"}
+	}
 	switch b.Kind {
 	case "text":
-		return wireContent{Type: "input_text", Text: b.Text}, nil
+		return wireContent{Type: "input_text", Text: b.Text, PromptCacheBreakpoint: breakpoint}, nil
 	case "image":
 		if b.URL != "" {
 			return wireContent{Type: "input_image", ImageURL: b.URL}, nil
@@ -130,8 +231,18 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 	if q.Model == "" {
 		return unsupported("model")
 	}
+	if err := validateResponsesCache(q); err != nil {
+		return err
+	}
 	rw := requestWire{Model: q.Model, Store: new(bool), Max: q.MaxOutputTokens, Stream: q.Stream}
 	*rw.Store = false
+	if q.Cache != nil {
+		rw.PromptCacheKey = q.Cache.Key
+		rw.PromptCacheRetention = q.Cache.Retention
+		if q.Cache.Mode != "" || q.Cache.TTL != "" {
+			rw.PromptCacheOptions = &promptCacheOptions{Mode: q.Cache.Mode, TTL: q.Cache.TTL}
+		}
+	}
 	if len(q.Stop) > 0 {
 		return unsupported("stop")
 	}
@@ -191,6 +302,31 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 	}
 	return encode(w, rw)
 }
+func contentMetadata(v object) (bool, error) {
+	if _, ok := v["cache_control"]; ok {
+		return false, unsupported("input.cache_control")
+	}
+	raw, ok := v["prompt_cache_breakpoint"]
+	if !ok {
+		return false, nil
+	}
+	b, err := obj(raw)
+	if err != nil {
+		return false, err
+	}
+	if err := fields(b, "mode"); err != nil {
+		return false, err
+	}
+	var mode string
+	if err := get(b, "mode", &mode, true); err != nil {
+		return false, err
+	}
+	if mode != "explicit" {
+		return false, unsupported("input.prompt_cache_breakpoint.mode")
+	}
+	return true, nil
+}
+
 func parseContent(v object) (core.ContentBlock, error) {
 	t, e := str(v, "type")
 	if e != nil {
@@ -198,17 +334,28 @@ func parseContent(v object) (core.ContentBlock, error) {
 	}
 	switch t {
 	case "input_text", "output_text":
-		if e := fields(v, "type", "text"); e != nil {
+		if e := fields(v, "type", "text", "prompt_cache_breakpoint", "cache_control"); e != nil {
+			return core.ContentBlock{}, e
+		}
+		breakpoint, e := contentMetadata(v)
+		if e != nil {
 			return core.ContentBlock{}, e
 		}
 		var s string
 		if e = get(v, "text", &s, true); e != nil {
 			return core.ContentBlock{}, e
 		}
-		return core.ContentBlock{Kind: "text", Text: s}, nil
+		return core.ContentBlock{Kind: "text", Text: s, CacheBreakpoint: breakpoint}, nil
 	case "input_image":
-		if e := fields(v, "type", "image_url"); e != nil {
+		if e := fields(v, "type", "image_url", "prompt_cache_breakpoint", "cache_control"); e != nil {
 			return core.ContentBlock{}, e
+		}
+		breakpoint, e := contentMetadata(v)
+		if e != nil {
+			return core.ContentBlock{}, e
+		}
+		if breakpoint {
+			return core.ContentBlock{}, unsupported("input.prompt_cache_breakpoint")
 		}
 		var s string
 		if e = get(v, "image_url", &s, true); e != nil {
@@ -216,8 +363,15 @@ func parseContent(v object) (core.ContentBlock, error) {
 		}
 		return core.ContentBlock{Kind: "image", URL: s}, nil
 	case "input_file":
-		if e := fields(v, "type", "file_url", "file_data", "filename"); e != nil {
+		if e := fields(v, "type", "file_url", "file_data", "filename", "prompt_cache_breakpoint", "cache_control"); e != nil {
 			return core.ContentBlock{}, e
+		}
+		breakpoint, e := contentMetadata(v)
+		if e != nil {
+			return core.ContentBlock{}, e
+		}
+		if breakpoint {
+			return core.ContentBlock{}, unsupported("input.prompt_cache_breakpoint")
 		}
 		var id string
 		if e = get(v, "file_url", &id, false); e == nil && id != "" {
@@ -319,6 +473,87 @@ func parseInput(b json.RawMessage) ([]core.Message, error) {
 	}
 	return []core.Message{{Role: "user", Content: []core.ContentBlock{{Kind: "text", Text: s}}}}, nil
 }
+func promptCacheFromObject(m object) (*core.PromptCache, error) {
+	if _, key := m["prompt_cache_key"]; !key {
+		if _, retention := m["prompt_cache_retention"]; !retention {
+			if _, options := m["prompt_cache_options"]; !options {
+				return nil, nil
+			}
+		}
+	}
+	c := &core.PromptCache{Protocol: "openai-responses"}
+	if _, ok := m["prompt_cache_key"]; ok {
+		if err := get(m, "prompt_cache_key", &c.Key, false); err != nil {
+			return nil, err
+		}
+		if !validCacheString(c.Key, 256) {
+			return nil, unsupported("prompt_cache_key")
+		}
+	}
+	if _, ok := m["prompt_cache_retention"]; ok {
+		if err := get(m, "prompt_cache_retention", &c.Retention, false); err != nil {
+			return nil, err
+		}
+		switch c.Retention {
+		case "in_memory", "24h":
+		default:
+			return nil, unsupported("prompt_cache_retention")
+		}
+	}
+	if raw, ok := m["prompt_cache_options"]; ok {
+		var options object
+		if err := json.Unmarshal(raw, &options); err != nil {
+			return nil, unsupported("prompt_cache_options")
+		}
+		if err := fields(options, "mode", "ttl"); err != nil {
+			return nil, err
+		}
+		if _, ok := options["mode"]; ok {
+			if err := get(options, "mode", &c.Mode, false); err != nil {
+				return nil, err
+			}
+			switch c.Mode {
+			case "implicit", "explicit":
+			default:
+				return nil, unsupported("prompt_cache_options.mode")
+			}
+		}
+		if _, ok := options["ttl"]; ok {
+			if err := get(options, "ttl", &c.TTL, false); err != nil {
+				return nil, err
+			}
+			if !validCacheTTL(c.TTL) || c.TTL == "" {
+				return nil, unsupported("prompt_cache_options.ttl")
+			}
+		}
+	}
+	if err := validatePromptCache(c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func markDecodedCache(q *core.Conversation) {
+	for _, b := range q.System {
+		if b.CacheBreakpoint {
+			if q.Cache == nil {
+				q.Cache = &core.PromptCache{Protocol: "openai-responses"}
+			}
+			return
+		}
+	}
+	for _, m := range q.Messages {
+		for _, b := range m.Content {
+			if b.CacheBreakpoint {
+				if q.Cache == nil {
+					q.Cache = &core.PromptCache{Protocol: "openai-responses"}
+				}
+				return
+			}
+		}
+	}
+}
+
 func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPayload, error) {
 	if e := ctx.Err(); e != nil {
 		return nil, e
@@ -327,12 +562,16 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 	if e := load(r, &m); e != nil {
 		return nil, e
 	}
-	if e := fields(m, "model", "store", "input", "max_output_tokens", "stream", "tools", "text"); e != nil {
+	if e := fields(m, "model", "store", "input", "max_output_tokens", "stream", "tools", "text", "prompt_cache_key", "prompt_cache_retention", "prompt_cache_options"); e != nil {
 		return nil, e
 	}
 	var q core.Conversation
 	var e error
 	q.Model, e = str(m, "model")
+	if e != nil {
+		return nil, e
+	}
+	q.Cache, e = promptCacheFromObject(m)
 	if e != nil {
 		return nil, e
 	}
@@ -437,6 +676,10 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 			}
 			q.StructuredOutput = schema
 		}
+	}
+	markDecodedCache(&q)
+	if err := validateResponsesCache(q); err != nil {
+		return nil, err
 	}
 	return q, nil
 }

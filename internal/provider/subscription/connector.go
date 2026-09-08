@@ -13,11 +13,14 @@ import (
 )
 
 type Route struct {
-	Endpoint   core.NativeEndpoint
-	Protocol   core.Protocol
-	Variant    string
-	Headers    http.Header
-	HeadersFor func(core.Connection) http.Header
+	Endpoint               core.NativeEndpoint
+	Protocol               core.Protocol
+	Variant                string
+	Headers                http.Header
+	HeadersFor             func(core.Connection) http.Header
+	AllowedRequestHeaders  []string
+	ValidateRequestHeaders func(http.Header) error
+	DefaultBody            string
 }
 type Connector struct {
 	id     string
@@ -156,8 +159,9 @@ func (c *Connector) BindEndpoint(ctx context.Context, conn core.Connection, e co
 		}
 	}
 	// Closing the HTTP transport does not prove upstream execution was cancelled.
-	return core.Binding{Codec: core.CodecKey{Protocol: route.Protocol, Variant: route.Variant, Operation: e.Operation}, Endpoint: p, Method: e.Method, ModelLocation: e.ModelLocation, Framing: e.Framing, ReplaySafe: e.Method == http.MethodGet, CancellationSupported: false, Headers: headers}, nil
+	return core.Binding{Codec: core.CodecKey{Protocol: route.Protocol, Variant: route.Variant, Operation: e.Operation}, Endpoint: p, Method: e.Method, ModelLocation: e.ModelLocation, Framing: e.Framing, ReplaySafe: e.Method == http.MethodGet, CancellationSupported: false, Headers: headers, AllowedRequestHeaders: append([]string(nil), route.AllowedRequestHeaders...), ValidateRequestHeaders: route.ValidateRequestHeaders, DefaultBody: route.DefaultBody}, nil
 }
+
 func (c *Connector) Discover(context.Context, core.Connection) ([]core.Model, error) {
 	return nil, failure("subscription discovery requires an authenticated account executor")
 }

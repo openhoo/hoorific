@@ -3,6 +3,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"hoorific/internal/core"
@@ -276,11 +277,88 @@ func openAIRealtimePolicy(action string, framing core.Framing) *core.RealtimePol
 	}
 }
 
-// Inspect enforces the operator's operation manifest without interpreting native
-// OpenAI tools, response_format, or stream fields as generic capability flags.
-// Native request validation and stream selection belong to the matching codec.
-func (c *Connector) Inspect(ctx context.Context, target core.Target, op core.Operation, _ []byte) error {
-	return c.Connector.Inspect(ctx, target, op, nil)
+// Inspect enforces the operator's operation manifest and rejects cache
+// directives that belong to OpenRouter/Anthropic wire contracts before a
+// direct OpenAI request can reach the paid upstream.
+func (c *Connector) Inspect(ctx context.Context, target core.Target, op core.Operation, body []byte) error {
+	if err := c.Connector.Inspect(ctx, target, op, nil); err != nil {
+		return err
+	}
+	return rejectForeignCacheDirectives(body)
+}
+
+func rejectForeignCacheDirectives(body []byte) error {
+	var root map[string]json.RawMessage
+	if len(body) == 0 || json.Unmarshal(body, &root) != nil || root == nil {
+		return nil
+	}
+	if _, ok := root["session_id"]; ok {
+		return unsupportedCacheDirective("session_id")
+	}
+	if _, ok := root["cache_control"]; ok {
+		return unsupportedCacheDirective("cache_control")
+	}
+	for _, key := range []string{"messages", "input"} {
+		var items []json.RawMessage
+		if json.Unmarshal(root[key], &items) != nil {
+			continue
+		}
+		for _, item := range items {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(item, &object) != nil {
+				continue
+			}
+			if err := rejectContentCacheDirectives(object["content"]); err != nil {
+				return err
+			}
+		}
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(root["tools"], &tools) == nil {
+		for _, tool := range tools {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(tool, &object) != nil {
+				continue
+			}
+			if _, ok := object["cache_control"]; ok {
+				return unsupportedCacheDirective("cache_control")
+			}
+		}
+	}
+	return nil
+}
+
+func rejectContentCacheDirectives(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		if _, ok := object["cache_control"]; ok {
+			return unsupportedCacheDirective("cache_control")
+		}
+		return nil
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	for _, part := range parts {
+		if err := rejectContentCacheDirectives(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func unsupportedCacheDirective(param string) error {
+	return core.GatewayError{
+		Code:       "unsupported_feature",
+		HTTPStatus: 400,
+		Param:      param,
+		Message:    "cache directive is not supported by the direct OpenAI provider: " + param,
+		Origin:     "gateway",
+	}
 }
 
 func unsupported(message string) error {

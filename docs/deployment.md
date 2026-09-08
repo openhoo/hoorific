@@ -10,6 +10,7 @@ The Dockerfile produces one statically linked gateway image with two executable 
 The final image is based on `scratch`. It contains only the gateway, the CA trust bundle, full timezone data, minimal user/group records, and the required directories. It runs as UID/GID `10001`; there is no shell, package manager, or debugging utility. Writable state is confined to the mounted data directory and `/tmp`, so a read-only root filesystem still needs writable mounts for both.
 
 All paths beginning with `.artifacts/` in this document are private operator-local output paths. They are not shipped proof files or public repository assets.
+Once the runtime is configured, use the [Console guide](console.md) for the embedded operator workflow, including model collection and editing, routing setup, and the playground. Its screenshots use isolated synthetic fixtures rather than live-provider data.
 
 ## Configuration
 
@@ -67,6 +68,141 @@ The ordinary startup sequence is migration followed by serving:
 ./hoorific migrate --config /path/to/config.json
 ./hoorific serve --config /path/to/config.json
 ```
+`schema_version` in the configuration remains `1`; the durable database has
+its own version and is currently at version `3`. Run `migrate` before
+`serve` for an existing database as well as a new one. The version-3
+migration adds the encrypted idempotency-record table and its expiry index;
+it is additive and does not replace the database or the operator keyring.
+
+## Cost, caching, and replay safety
+
+Provider prompt caching is not gateway response caching. Prompt-cache
+directives affect upstream token accounting; Hoorific has no general-purpose
+response cache. The only response replay is opt-in through `Idempotency-Key`
+and replays one authenticated request's stored terminal response. Hoorific
+does not invent implicit controls or writes; it may translate explicit caller
+controls into protocol markers, and it does not promise a cache hit or saving.
+It forwards only caller-supplied controls that the selected wire protocol can represent.
+
+### Prompt-cache controls
+
+The accepted native controls are:
+
+| Wire protocol | Representable controls and limits |
+| --- | --- |
+| OpenAI Chat and Responses | `prompt_cache_key`; `prompt_cache_retention` of `in_memory` or `24h`; `prompt_cache_options.mode` of `implicit` or `explicit`; `prompt_cache_options.ttl` of `5m`, `30m`, `1h`, or `24h`; and text-only `prompt_cache_breakpoint` with mode `explicit`. |
+| Anthropic Messages | Top-level, content-block, and tool `cache_control` with type `ephemeral` and optional TTL `5m` or `1h`. |
+| Gemini content | An existing `cachedContent` resource name in the form `cachedContents/{id}` or `projects/{project}/locations/{location}/cachedContents/{id}`. No portable TTL or cache-control directive is synthesized. |
+| Bedrock Converse | `cachePoint` with type `default` and optional TTL `5m` or `1h`, placed after cacheable content (or as a tool cache point). OpenAI keys and Gemini references are not Bedrock controls. |
+OpenRouter is the OpenAI-shaped exception for per-content/tool
+`cache_control` and `session_id`; direct OpenAI Chat and Responses reject
+those foreign controls. Do not assume that a JSON shape accepted by one
+OpenAI-compatible connector is portable to another connector.
+
+Gemini cached-content references are connection-bound: a request carrying one
+must resolve to one connection, account, project, and region rather than
+fan-out across route targets. Hoorific forwards the reference but does not
+create or manage the Gemini cached-content resource; create it through the
+provider's separately authenticated API/control plane and then use its
+provider resource name.
+
+A directive with no equivalent for the selected codec is rejected before
+upstream dispatch instead of being silently dropped. Native same-protocol
+payloads retain their supported semantics; translation is limited to
+equivalent forms (for example, an Anthropic cache-control form can represent
+a Bedrock default cache point, but an OpenAI cache key cannot).
+See the primary provider references for [OpenAI prompt
+caching](https://platform.openai.com/docs/guides/prompt-caching),
+[Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching),
+[Gemini context caching](https://ai.google.dev/gemini-api/docs/caching), and
+[Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
+
+### Price and usage configuration
+
+Model prices are integer USD nanodollars per million tokens. The four
+independent cache-rate JSON fields are:
+
+- `cached_input_per_million` — cache-read input;
+- `cache_write_input_per_million` — aggregate cache writes;
+- `cache_write_5m_per_million` — the 5-minute write subset; and
+- `cache_write_1h_per_million` — the 1-hour write subset.
+
+`cache_write_5m_per_million` and `cache_write_1h_per_million` are subsets of
+the aggregate write rate, not additional usage categories. A missing or
+`null` rate means unknown; an explicit `0` means the configured category is
+zero-cost. If a nonzero provider-reported category needs a missing rate, the
+actual cost remains unknown rather than becoming zero or a base-rate guess.
+When a TTL-specific write rate is absent, an explicitly configured aggregate
+write rate may price that write subset.
+
+Provider usage is normalized inclusively: `Usage.Input` already includes
+ordinary, cache-read, and cache-write input tokens. `CachedInput`,
+`CacheWriteInput`, `CacheWrite5mInput`, and `CacheWrite1hInput` are provider
+detail/subset fields and must not be added to `Input` again. `Output` includes
+reasoning output; `ToolInput` is informational provider metadata and does not
+automatically add a second charge.
+
+Automatic-caching rates are an operator responsibility. Configure a price
+revision only from the current provider/model/account terms you have
+verified; Hoorific does not fetch pricing or assume that caching is free,
+automatic, or beneficial. `maximum_unit_cost` (nanodollars per its declared
+`unit_operation`) and a token-derived `MaximumCost` are conservative
+admission bounds/reservations, not actual spend. Token reservations use the
+highest configured relevant input rate across ordinary, cache-read, and
+cache-write categories.
+
+If required usage or pricing evidence is missing, settlement keeps a
+reconcilable unknown outcome/hold instead of fabricating a charge. Reconcile
+with provider evidence through the management API. If observed actual spend
+exceeds a configured maximum, settlement records the incurred amount and
+increments accounting atomically; it does not clamp or roll back real spend.
+Subsequent admission is blocked by the now-exhausted allowance.
+
+### Idempotency keys
+
+`Idempotency-Key` is opt-in; requests without it are not replay-captured.
+The namespace is tenant plus the authenticated session/key subject (the raw
+credential is never the subject), and the fingerprint covers the method,
+path/query, body, and semantic request headers while excluding credentials,
+the idempotency key, and the gateway request ID. A completed terminal response
+is retained for 24 hours from completion, with a 32 MiB maximum captured
+response body. Captured response bytes are encrypted with a purpose-separated
+key derived from the operator's JSON AES-256-GCM keyring.
+
+Keep old key IDs available while encrypted idempotency records can still be
+replayed; rotate the JSON keyring through the same retained-key procedure as
+other encrypted records and never overwrite the key file in place. Pending,
+partial, failed, oversized, or otherwise unreplayable records return a
+conflict (normally `409` with `idempotency_in_progress`) and are durable
+negative state, not permission to dispatch again after expiry or restart.
+Fingerprint conflicts are also `409`. Hoorific never blindly forwards
+`Idempotency-Key` upstream to obtain provider-side HTTP retry behavior.
+
+### Provider-specific controls and cancellation
+
+- Replicate's `Prefer` and `Cancel-After` headers are accepted only on the
+  prediction-creation operations (`predictions.create`,
+  `models.predictions.create`, and `deployments.predictions.create`). One
+  `Prefer` value must be `wait` or `wait=N` for `N` from 1 through 60.
+  One `Cancel-After` value must be a provider-supported duration from 5
+  seconds through 24 hours. They are not global controls for get, list, or
+  cancel operations. See the [Replicate HTTP
+  reference](https://replicate.com/docs/reference/http#predictions.create).
+- A valid upstream `Retry-After` is preserved on portable and native
+  rejection responses. It is timing information, not evidence that a retry
+  is safe or that the prior request was free.
+- Cohere embed-job cancellation can return the documented empty JSON object
+  `{}` as a cancellation receipt. That receipt carries no usage or cost and
+  does not by itself prove that every provider execution stopped. Hoorific
+  reconciles the job's declared terminal status; it does not invent zero cost
+  or mark every successful cancel response terminal. See the [Cohere embed-job
+  reference](https://docs.cohere.com/reference/create-embed-job).
+- For portable OpenAI Chat streaming, Hoorific requests upstream
+  `stream_options.include_usage=true` so accounting can observe a terminal
+  usage event. It exposes that usage event to the client only when the
+  request included `stream_options.include_usage:true`; omitting the option
+  hides usage in the client stream but does not disable internal accounting.
+  Native requests follow their native wire contract.
 
 ## Master-key handling
 

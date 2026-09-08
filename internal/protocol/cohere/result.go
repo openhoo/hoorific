@@ -118,10 +118,17 @@ func (c *Codec) EncodeResult(ctx context.Context, p core.ResultPayload, w io.Wri
 		}
 	}
 	if r.Usage != nil {
-		if r.Usage.Total != nil {
-			if r.Usage.Input == nil || r.Usage.Output == nil || *r.Usage.Total != *r.Usage.Input+*r.Usage.Output {
-				return unsupported("usage.total")
+		for _, n := range []*int64{
+			r.Usage.Input, r.Usage.Output, r.Usage.Total, r.Usage.CachedInput,
+			r.Usage.CacheWriteInput, r.Usage.CacheWrite5mInput, r.Usage.CacheWrite1hInput,
+			r.Usage.ReasoningOutput, r.Usage.ToolInput,
+		} {
+			if n != nil && *n < 0 {
+				return invalid("usage", "counts must be non-negative")
 			}
+		}
+		if r.Usage.Input != nil && r.Usage.Output != nil && r.Usage.Total != nil && *r.Usage.Total != *r.Usage.Input+*r.Usage.Output {
+			return invalid("usage.total", "does not match input plus output")
 		}
 		x.Usage = &wireUsage{Tokens: &wireTokenUsage{}}
 		if r.Usage.Input != nil {

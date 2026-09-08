@@ -73,7 +73,7 @@ func (s *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 		if e != nil {
 			return nil, e
 		}
-		return core.Usage{Input: u.Input, Output: u.Output, Total: u.Total, Source: "provider"}, nil
+		return *u, nil
 	}
 	if s.finished {
 		return nil, io.ErrUnexpectedEOF
@@ -164,11 +164,8 @@ func (e *streamEncoder) Write(ctx context.Context, ev core.Event) error {
 		}
 		return e.chunk(v.Text, nil, nil)
 	case core.Usage:
-		if v.Source != "" && v.Source != "provider" {
-			return unsupported("usage.source")
-		}
-		u := &wireUsage{Input: v.Input, Output: v.Output, Total: v.Total}
-		if _, er := u.core(); er != nil {
+		u, er := usage(&v)
+		if er != nil {
 			return er
 		}
 		return e.chunk("", nil, u)

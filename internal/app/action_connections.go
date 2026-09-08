@@ -179,15 +179,25 @@ func joinConnectionURL(base, path string) (string, error) {
 		return "", actionError("configuration_stale", 503, "Connection endpoint is not configured")
 	}
 	u, e := url.Parse(base)
-	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if e != nil || u.Host == "" || u.User != nil || (u.Scheme != "https" && u.Scheme != "http") || u.RawQuery != "" || u.Fragment != "" {
 		return "", actionError("configuration_stale", 503, "Connection endpoint is invalid")
 	}
-	p, e := url.Parse(path)
-	if e != nil || p.IsAbs() || p.Host != "" || strings.HasPrefix(path, "/") || p.Fragment != "" {
+	if strings.Contains(path, "://") || strings.HasPrefix(path, "//") || strings.Contains(path, "#") {
 		return "", actionError("unsupported_operation", 400, "Endpoint path is not relative")
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(p.Path, "/")
-	u.RawPath = ""
-	u.RawQuery = p.RawQuery
+	v, e := url.Parse("./" + strings.TrimPrefix(path, "/"))
+	if e != nil || v.Host != "" {
+		return "", actionError("unsupported_operation", 400, "Endpoint path is not relative")
+	}
+	decoded := strings.TrimPrefix(v.Path, "./")
+	for _, part := range strings.Split(decoded, "/") {
+		if part == ".." || part == "." {
+			return "", actionError("unsupported_operation", 400, "Endpoint path is not relative")
+		}
+	}
+	escaped := strings.TrimSuffix(u.EscapedPath(), "/") + "/" + strings.TrimPrefix(strings.TrimPrefix(v.EscapedPath(), "./"), "/")
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/" + strings.TrimPrefix(decoded, "/")
+	u.RawPath = escaped
+	u.RawQuery = v.RawQuery
 	return u.String(), nil
 }

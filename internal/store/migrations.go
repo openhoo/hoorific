@@ -114,10 +114,51 @@ func (s *Store) upgradeSchema(ctx context.Context, tx *sql.Tx) error {
 			return fmt.Errorf("schema migration 2: %w", err)
 		}
 		result, err := tx.ExecContext(ctx, "UPDATE schema_version SET version=2 WHERE id=1 AND version=1")
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		changed, err := result.RowsAffected()
-		if err != nil { return err }
-		if changed != 1 { return fmt.Errorf("schema version changed during migration 2") }
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return fmt.Errorf("schema version changed during migration 2")
+		}
+		version = 2
+	}
+	if version == 2 {
+		if _, err := tx.ExecContext(ctx, `
+			CREATE TABLE IF NOT EXISTS idempotency_records (
+				tenant_id TEXT NOT NULL,
+				subject_id TEXT NOT NULL,
+				key_hash TEXT NOT NULL,
+				fingerprint_hash TEXT NOT NULL,
+				owner_id TEXT NOT NULL,
+				state TEXT NOT NULL CHECK (state IN ('pending','complete','unreplayable')),
+				expires_at BIGINT NOT NULL,
+				key_id TEXT NOT NULL,
+				nonce BYTEA NOT NULL,
+				ciphertext BYTEA NOT NULL,
+				created_at BIGINT NOT NULL,
+				updated_at BIGINT NOT NULL,
+				PRIMARY KEY (tenant_id, subject_id, key_hash)
+			)`); err != nil {
+			return fmt.Errorf("schema migration 3: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idempotency_records_expiry ON idempotency_records(state,expires_at)"); err != nil {
+			return fmt.Errorf("schema migration 3 index: %w", err)
+		}
+		result, err := tx.ExecContext(ctx, "UPDATE schema_version SET version=3 WHERE id=1 AND version=2")
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return fmt.Errorf("schema version changed during migration 3")
+		}
 	}
 	return nil
 }

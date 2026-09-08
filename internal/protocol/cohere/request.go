@@ -163,6 +163,12 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 	if !ok {
 		return invalid("request", "expected core.Conversation")
 	}
+	if conv.Cache != nil {
+		return unsupported("cache")
+	}
+	if conv.StreamIncludeUsage != nil {
+		return unsupported("stream_include_usage")
+	}
 	if conv.StructuredOutput != nil || conv.StructuredOutputName != "" || conv.StructuredOutputDescription != "" || conv.StructuredOutputMode != "" || conv.StructuredOutputStrict != nil {
 		return unsupported("structured_output")
 	}
@@ -185,6 +191,9 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 		x.Messages = append(x.Messages, wm)
 	}
 	for i, t := range conv.Tools {
+		if t.CacheControl != nil || t.CacheBreakpoint {
+			return unsupported(at("tools", i) + ".cache_control")
+		}
 		if t.Name == "" {
 			return invalid(at("tools", i)+".name", "is required")
 		}

@@ -94,6 +94,9 @@ func (s *Store) RunMaintenance(ctx context.Context) error {
 		if _, e = tx.ExecContext(ctx, s.Query("DELETE FROM audit_events WHERE created_at<?"), now-auditRetentionSeconds); e != nil {
 			return e
 		}
+		if e = s.cleanupIdempotencyTx(ctx, tx, now); e != nil {
+			return e
+		}
 		return nil
 	})
 }

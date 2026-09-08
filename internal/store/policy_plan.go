@@ -167,6 +167,267 @@ func (s *Store) PlanAttempt(ctx context.Context, p core.Principal, snap core.Run
 func (s *Store) derivePlan(ctx context.Context, p core.AttemptPlan) (core.AttemptPlan, error) {
 	return p, nil
 }
+
+type cachePricingRequirements struct {
+	read        bool
+	write       bool
+	breakpoints int
+	ttl         map[string]bool
+	otherTTL    bool
+	openAITTL   string
+}
+
+func (r *cachePricingRequirements) addWriteTTL(ttl string) {
+	r.write = true
+	if ttl == "" {
+		return
+	}
+	if r.ttl == nil {
+		r.ttl = map[string]bool{}
+	}
+	switch ttl {
+	case "5m", "1h":
+		r.ttl[ttl] = true
+	default:
+		r.otherTTL = true
+	}
+}
+
+func cacheStringField(m map[string]any, key string) string {
+	value, ok := m[key]
+	if !ok {
+		return ""
+	}
+	var out string
+	if json.Unmarshal(mustJSON(value), &out) != nil {
+		return ""
+	}
+	return out
+}
+
+func mustJSON(value any) []byte {
+	data, _ := json.Marshal(value)
+	return data
+}
+
+// inspectCacheBlocks follows only content-block containers. Cache-looking
+// fields in text, tool arguments, schemas, or other opaque properties are not
+// request directives and must not change billing admission.
+func inspectCacheBlocks(value any, req *cachePricingRequirements, breakpoints bool) {
+	switch value := value.(type) {
+	case []any:
+		for _, item := range value {
+			inspectCacheBlocks(item, req, breakpoints)
+		}
+	case map[string]any:
+		kind, hasKind := value["type"].(string)
+		_, hasPoint := value["cachePoint"]
+		semantic := hasPoint
+		if hasKind {
+			switch kind {
+			case "text", "thinking", "image", "document", "tool_use", "tool_result",
+				"input_text", "input_image", "input_file":
+				semantic = true
+			}
+		}
+		if !semantic {
+			return
+		}
+		if control, ok := value["cache_control"]; ok {
+			if object, ok := control.(map[string]any); ok {
+				req.addWriteTTL(cacheStringField(object, "ttl"))
+			} else {
+				req.addWriteTTL("")
+			}
+		}
+		if point, ok := value["cachePoint"]; ok {
+			if object, ok := point.(map[string]any); ok {
+				req.addWriteTTL(cacheStringField(object, "ttl"))
+			} else {
+				req.addWriteTTL("")
+			}
+		}
+		if breakpoints && (kind == "text" || kind == "input_text") {
+			if _, ok := value["prompt_cache_breakpoint"]; ok {
+				req.breakpoints++
+			}
+		}
+		// Only the validated Anthropic tool-result block has a nested
+		// semantic content container. Do not recurse arbitrary content maps.
+		if kind == "tool_result" {
+			if child, ok := value["content"]; ok {
+				inspectCacheBlocks(child, req, breakpoints)
+			}
+		}
+	}
+}
+
+// inspectCacheContainers follows message/content containers but not their
+// arbitrary properties. This keeps detection semantic-path based while
+// supporting OpenAI input/messages and Gemini contents/systemInstruction.
+func inspectCacheContainers(value any, req *cachePricingRequirements) {
+	switch value := value.(type) {
+	case []any:
+		for _, item := range value {
+			inspectCacheContainers(item, req)
+		}
+	case map[string]any:
+		if child, ok := value["content"]; ok {
+			inspectCacheBlocks(child, req, true)
+		}
+		if child, ok := value["parts"]; ok {
+			inspectCacheBlocks(child, req, false)
+		}
+	}
+}
+
+func inspectCacheSystem(value any, req *cachePricingRequirements) {
+	if object, ok := value.(map[string]any); ok {
+		if child, ok := object["parts"]; ok {
+			inspectCacheBlocks(child, req, false)
+			return
+		}
+	}
+	// Anthropic's top-level system is itself a block list.
+	inspectCacheBlocks(value, req, true)
+}
+
+func inspectCacheTools(value any, req *cachePricingRequirements) {
+	switch value := value.(type) {
+	case []any:
+		for _, item := range value {
+			inspectCacheTools(item, req)
+		}
+	case map[string]any:
+		if control, ok := value["cache_control"]; ok {
+			if object, ok := control.(map[string]any); ok {
+				req.addWriteTTL(cacheStringField(object, "ttl"))
+			} else {
+				req.addWriteTTL("")
+			}
+		}
+		if point, ok := value["cachePoint"]; ok {
+			if object, ok := point.(map[string]any); ok {
+				req.addWriteTTL(cacheStringField(object, "ttl"))
+			} else {
+				req.addWriteTTL("")
+			}
+		}
+	}
+}
+
+func inspectCacheJSON(value any, req *cachePricingRequirements, root bool) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	if !root {
+		inspectCacheContainers(object, req)
+		return
+	}
+	// These are root-owned cache identities/options. Do not search for them
+	// recursively: an arbitrary property named cachedContent is just data.
+	if name, ok := object["cachedContent"].(string); ok && name != "" {
+		req.read = true
+	}
+	if control, ok := object["cache_control"]; ok {
+		if object, ok := control.(map[string]any); ok {
+			req.addWriteTTL(cacheStringField(object, "ttl"))
+		} else {
+			req.addWriteTTL("")
+		}
+	}
+	if key, ok := object["prompt_cache_key"].(string); ok && key != "" {
+		req.read = true
+	}
+	if retention, ok := object["prompt_cache_retention"].(string); ok && retention != "" {
+		req.read = true
+	}
+	if options, ok := object["prompt_cache_options"].(map[string]any); ok {
+		mode := cacheStringField(options, "mode")
+		ttl := cacheStringField(options, "ttl")
+		if mode != "" {
+			req.read = true
+		}
+		// An explicit mode/TTL asks the provider to create or retain a
+		// cache, so it needs a write rate rather than a guessed base rate.
+		if mode == "explicit" || ttl != "" {
+			req.addWriteTTL(ttl)
+		}
+		if ttl != "" {
+			req.openAITTL = ttl
+		}
+	}
+	for _, key := range []string{"messages", "input", "contents"} {
+		if child, ok := object[key]; ok {
+			inspectCacheContainers(child, req)
+		}
+	}
+	for _, key := range []string{"system", "systemInstruction"} {
+		if child, ok := object[key]; ok {
+			inspectCacheSystem(child, req)
+		}
+	}
+	if child, ok := object["content"]; ok {
+		inspectCacheBlocks(child, req, true)
+	}
+	if child, ok := object["tools"]; ok {
+		inspectCacheTools(child, req)
+	}
+	if config, ok := object["toolConfig"].(map[string]any); ok {
+		if child, ok := config["tools"]; ok {
+			inspectCacheTools(child, req)
+		}
+	}
+	if req.breakpoints > 0 {
+		req.addWriteTTL(req.openAITTL)
+	}
+}
+
+func cachePricingRequired(body []byte) cachePricingRequirements {
+	var value any
+	if len(body) == 0 || json.Unmarshal(body, &value) != nil {
+		return cachePricingRequirements{}
+	}
+	req := cachePricingRequirements{}
+	inspectCacheJSON(value, &req, true)
+	return req
+}
+
+func cachePricingAvailable(price *core.PriceSchedule, req cachePricingRequirements) bool {
+	if !req.read && !req.write {
+		return true
+	}
+	if price == nil {
+		return false
+	}
+	if req.read && price.CachedInputPerMillion == nil {
+		return false
+	}
+	if !req.write {
+		return true
+	}
+	if req.otherTTL && price.CacheWriteInputPerMillion == nil {
+		return false
+	}
+	if len(req.ttl) == 0 {
+		return price.CacheWriteInputPerMillion != nil
+	}
+	for ttl := range req.ttl {
+		switch ttl {
+		case "5m":
+			if price.CacheWrite5mPerMillion == nil && price.CacheWriteInputPerMillion == nil {
+				return false
+			}
+		case "1h":
+			if price.CacheWrite1hPerMillion == nil && price.CacheWriteInputPerMillion == nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func boundModel(out *core.AttemptPlan, m core.Model, body []byte) error {
 	var meta struct {
 		// Caller token counts are observations, not trustworthy admission bounds.
@@ -200,22 +461,49 @@ func boundModel(out *core.AttemptPlan, m core.Model, body []byte) error {
 		out.OutputBound = &v
 	}
 	// These are independent conservative maxima, not an exact token count.
-	// Reserve the full approved input context plus bounded output; never
-	// subtract output from context without an explicit combined-window contract.
+	// Input is inclusive of ordinary, cache-read and cache-write tokens. The
+	// bound uses the highest configured input rate so cache writes cannot exceed
+	// a base-only reservation. Explicit cache directives must first have a
+	// usable category rate; otherwise the cost bound stays unknown instead of
+	// falling back to a base or unit rate.
+	cacheReq := cachePricingRequired(body)
+	cacheRatesAvailable := cachePricingAvailable(m.Price, cacheReq)
 	if m.Price != nil {
 		out.PriceVersion = m.Price.Version
-		if input != nil && output != nil && m.Price.InputPerMillion != nil && m.Price.OutputPerMillion != nil {
-			cost, err := policy.EstimateCost(*input, *output, *m.Price.InputPerMillion, *m.Price.OutputPerMillion, 1000000)
-			if err != nil {
+		if cacheRatesAvailable && input != nil && output != nil {
+			cost, err := policy.EstimateBound(*input, *output, m.Price)
+			if err == nil {
+				out.MaximumCost = &cost
+			} else if !errors.Is(err, policy.ErrUnknownCost) {
 				return problem("unsupported_policy", 400, "cost bound is not representable")
 			}
-			out.MaximumCost = &cost
-		} else if m.Price.MaximumUnitCost != nil && m.Price.UnitOperation == out.Operation {
+		}
+		if cacheRatesAvailable && out.MaximumCost == nil && m.Price.MaximumUnitCost != nil && m.Price.UnitOperation == out.Operation {
 			v := *m.Price.MaximumUnitCost
 			out.MaximumCost = &v
 		}
 	}
 	return nil
+}
+
+func planMaximumCost(input, output *int64, price *core.PriceSchedule, operation core.Operation) (*int64, error) {
+	if price == nil {
+		return nil, nil
+	}
+	if input != nil && output != nil {
+		cost, err := policy.EstimateBound(*input, *output, price)
+		if err == nil {
+			return &cost, nil
+		}
+		if !errors.Is(err, policy.ErrUnknownCost) {
+			return nil, err
+		}
+	}
+	if price.MaximumUnitCost != nil && price.UnitOperation == operation {
+		v := *price.MaximumUnitCost
+		return &v, nil
+	}
+	return nil, nil
 }
 
 func (s *Store) derivePlanTx(ctx context.Context, tx *sql.Tx, p core.AttemptPlan) (core.AttemptPlan, error) {
@@ -305,14 +593,26 @@ func (s *Store) derivePlanTx(ctx context.Context, tx *sql.Tx, p core.AttemptPlan
 		if p.OutputBound != nil && (caps.OutputLimit == nil || *caps.OutputLimit < 0 || *p.OutputBound < 0 || *p.OutputBound > *caps.OutputLimit) {
 			return core.AttemptPlan{}, problem("configuration_stale", 409, "approved output bound changed")
 		}
-		if caps.Price != nil && caps.Price.InputPerMillion != nil && caps.Price.OutputPerMillion != nil && p.InputBound != nil && p.OutputBound != nil {
-			want, e := policy.EstimateCost(*p.InputBound, *p.OutputBound, *caps.Price.InputPerMillion, *caps.Price.OutputPerMillion, 1000000)
-			if e != nil || p.MaximumCost == nil || *p.MaximumCost != want || caps.Price.Version != p.PriceVersion {
-				return core.AttemptPlan{}, problem("configuration_stale", 409, "cost bound changed")
+		if caps.Price != nil {
+			if caps.Price.Version != p.PriceVersion {
+				return core.AttemptPlan{}, problem("configuration_stale", 409, "price version changed")
 			}
-		}
-		if (p.InputBound == nil || p.OutputBound == nil) && (caps.Price == nil || caps.Price.MaximumUnitCost == nil || caps.Price.UnitOperation != p.Operation) {
-			p.MaximumCost = nil
+			// A nil maximum is an intentional unknown bound (for example,
+			// an explicit cache directive whose category rate is not
+			// configured). There is no request body at this authoritative
+			// transaction boundary, so do not recompute a base/unit fallback
+			// and resurrect a bound that planning deliberately withheld.
+			if p.MaximumCost != nil {
+				want, e := planMaximumCost(p.InputBound, p.OutputBound, caps.Price, p.Operation)
+				if e != nil {
+					return core.AttemptPlan{}, problem("invalid_configuration", 500, "stored price is invalid")
+				}
+				if want == nil || *p.MaximumCost != *want {
+					return core.AttemptPlan{}, problem("configuration_stale", 409, "cost bound changed")
+				}
+			}
+		} else if p.MaximumCost != nil || p.PriceVersion != "" {
+			return core.AttemptPlan{}, problem("configuration_stale", 409, "price bound changed")
 		}
 	}
 	return s.resolveAllowances(ctx, tx, p, now, true)
@@ -375,7 +675,11 @@ func (s *Store) resolveAllowances(ctx context.Context, tx *sql.Tx, p core.Attemp
 				if p.InputBound == nil || p.OutputBound == nil {
 					return core.AttemptPlan{}, problem("unsupported_policy", 400, "token policy requires bounded input and output")
 				}
-				required = *p.InputBound + *p.OutputBound
+				var e error
+				required, e = policy.CheckedAdd(*p.InputBound, *p.OutputBound)
+				if e != nil {
+					return core.AttemptPlan{}, problem("unsupported_policy", 400, "token bound is not representable")
+				}
 			case "cost":
 				if p.MaximumCost == nil {
 					return core.AttemptPlan{}, problem("unsupported_policy", 400, "cost policy requires bounded price")

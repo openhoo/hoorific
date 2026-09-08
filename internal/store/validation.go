@@ -50,10 +50,14 @@ type AccountData struct {
 	AccountIDs []string `json:"account_ids,omitempty"`
 }
 type PriceData struct {
-	ModelID          string `json:"model_id"`
-	Currency         string `json:"currency"`
-	InputPerMillion  int64  `json:"input_per_million"`
-	OutputPerMillion int64  `json:"output_per_million"`
+	ModelID                   string `json:"model_id"`
+	Currency                  string `json:"currency"`
+	InputPerMillion           int64  `json:"input_per_million"`
+	OutputPerMillion          int64  `json:"output_per_million"`
+	CachedInputPerMillion     *int64 `json:"cached_input_per_million,omitempty"`
+	CacheWriteInputPerMillion *int64 `json:"cache_write_input_per_million,omitempty"`
+	CacheWrite5mPerMillion    *int64 `json:"cache_write_5m_per_million,omitempty"`
+	CacheWrite1hPerMillion    *int64 `json:"cache_write_1h_per_million,omitempty"`
 }
 type ConnectionData struct {
 	Connector string            `json:"connector"`
@@ -254,6 +258,21 @@ func validKeyOperations(xs []core.Operation) bool {
 	}
 	return true
 }
+func validPriceRate(rate *int64) bool {
+	return rate == nil || *rate >= 0
+}
+
+func validPriceSchedule(price *core.PriceSchedule) bool {
+	return price != nil &&
+		validRef(price.Version) &&
+		validPriceRate(price.InputPerMillion) &&
+		validPriceRate(price.OutputPerMillion) &&
+		validPriceRate(price.CachedInputPerMillion) &&
+		validPriceRate(price.CacheWriteInputPerMillion) &&
+		validPriceRate(price.CacheWrite5mPerMillion) &&
+		validPriceRate(price.CacheWrite1hPerMillion) &&
+		validPriceRate(price.MaximumUnitCost)
+}
 func validateResource(kind string, data json.RawMessage) (json.RawMessage, error) {
 	bad := func() (json.RawMessage, error) {
 		return nil, problem("invalid_resource", 400, "invalid "+kind+" resource")
@@ -283,7 +302,7 @@ func validateResource(kind string, data json.RawMessage) (json.RawMessage, error
 			}
 		}
 		if x.Price != nil {
-			if !validRef(x.Price.Version) || x.Price.InputPerMillion != nil && *x.Price.InputPerMillion < 0 || x.Price.OutputPerMillion != nil && *x.Price.OutputPerMillion < 0 || x.Price.MaximumUnitCost != nil && *x.Price.MaximumUnitCost < 0 {
+			if !validPriceSchedule(x.Price) {
 				return bad()
 			}
 		}
@@ -313,7 +332,8 @@ func validateResource(kind string, data json.RawMessage) (json.RawMessage, error
 		v = x
 	case "prices":
 		var x PriceData
-		if strictDecode(data, &x) != nil || !validRef(x.ModelID) || len(x.Currency) != 3 || strings.ToUpper(x.Currency) != x.Currency || x.InputPerMillion < 0 || x.OutputPerMillion < 0 {
+		if strictDecode(data, &x) != nil || !validRef(x.ModelID) || len(x.Currency) != 3 || strings.ToUpper(x.Currency) != x.Currency || x.InputPerMillion < 0 || x.OutputPerMillion < 0 ||
+			!validPriceRate(x.CachedInputPerMillion) || !validPriceRate(x.CacheWriteInputPerMillion) || !validPriceRate(x.CacheWrite5mPerMillion) || !validPriceRate(x.CacheWrite1hPerMillion) {
 			return bad()
 		}
 		for _, r := range x.Currency {

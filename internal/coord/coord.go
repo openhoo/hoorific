@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"hoorific/internal/core"
+	"strconv"
 	"sync"
 	"time"
 )
 
 var ErrNotFound = errors.New("coordination hint not found")
+var ErrScopeRequired = errors.New("coordination hint scope is required")
 
 const (
 	MinHintTTL           = time.Second
@@ -49,25 +51,45 @@ type Local struct {
 func NewLocal() *Local {
 	return &Local{hints: make(map[string]hint), affinity: make(map[string]affinityHint)}
 }
-func (l *Local) Set(ctx context.Context, target core.RouteTarget, healthy bool, ttl time.Duration) error {
+
+func validTarget(t core.RouteTarget) bool {
+	return t.ConnectionID != "" && t.ModelID != ""
+}
+func scopedHealthKey(scope core.HealthScope, target core.RouteTarget) string {
+	return scope.TenantID + "\x00" + strconv.FormatInt(scope.Revision, 10) + "\x00" + key(target)
+}
+func scopedAffinityKey(scope core.HealthScope, affinity string) string {
+	return scope.TenantID + "\x00" + strconv.FormatInt(scope.Revision, 10) + "\x00" + affinity
+}
+
+func (l *Local) SetScoped(ctx context.Context, scope core.HealthScope, target core.RouteTarget, healthy bool, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if !scope.Valid() {
+		return ErrScopeRequired
+	}
+	if !validTarget(target) {
+		return fmt.Errorf("target identity is required")
 	}
 	ttl, err := boundTTL(ttl)
 	if err != nil {
 		return err
 	}
 	l.mu.Lock()
-	l.hints[key(target)] = hint{healthy: healthy, expires: time.Now().Add(ttl)}
+	l.hints[scopedHealthKey(scope, target)] = hint{healthy: healthy, expires: time.Now().Add(ttl)}
 	l.mu.Unlock()
 	return nil
 }
-func (l *Local) Healthy(ctx context.Context, target core.RouteTarget) (bool, error) {
+func (l *Local) HealthyScoped(ctx context.Context, scope core.HealthScope, target core.RouteTarget) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if !scope.Valid() || !validTarget(target) {
+		return true, nil
+	}
 	now := time.Now()
-	k := key(target)
+	k := scopedHealthKey(scope, target)
 	l.mu.Lock()
 	h, ok := l.hints[k]
 	if ok && !now.Before(h.expires) {
@@ -80,18 +102,19 @@ func (l *Local) Healthy(ctx context.Context, target core.RouteTarget) (bool, err
 	}
 	return h.healthy, nil
 }
-func (l *Local) GetAffinity(ctx context.Context, key string) (core.RouteTarget, bool, error) {
+func (l *Local) GetAffinityScoped(ctx context.Context, scope core.HealthScope, affinity string) (core.RouteTarget, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return core.RouteTarget{}, false, err
 	}
-	if key == "" {
+	if !scope.Valid() || affinity == "" {
 		return core.RouteTarget{}, false, nil
 	}
 	now := time.Now()
+	k := scopedAffinityKey(scope, affinity)
 	l.mu.Lock()
-	v, ok := l.affinity[key]
+	v, ok := l.affinity[k]
 	if ok && !now.Before(v.expires) {
-		delete(l.affinity, key)
+		delete(l.affinity, k)
 		ok = false
 	}
 	l.mu.Unlock()
@@ -100,19 +123,25 @@ func (l *Local) GetAffinity(ctx context.Context, key string) (core.RouteTarget, 
 	}
 	return v.target, true, nil
 }
-func (l *Local) SetAffinity(ctx context.Context, key string, target core.RouteTarget, ttl time.Duration) error {
+func (l *Local) SetAffinityScoped(ctx context.Context, scope core.HealthScope, affinity string, target core.RouteTarget, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if key == "" {
+	if !scope.Valid() {
+		return ErrScopeRequired
+	}
+	if affinity == "" {
 		return fmt.Errorf("affinity key is required")
+	}
+	if !validTarget(target) {
+		return fmt.Errorf("target identity is required")
 	}
 	ttl, err := boundTTL(ttl)
 	if err != nil {
 		return err
 	}
 	l.mu.Lock()
-	l.affinity[key] = affinityHint{target: target, expires: time.Now().Add(ttl)}
+	l.affinity[scopedAffinityKey(scope, affinity)] = affinityHint{target: target, expires: time.Now().Add(ttl)}
 	l.mu.Unlock()
 	return nil
 }
@@ -131,27 +160,41 @@ type Remote struct {
 	Prefix, Channel string
 }
 
-func (r Remote) Set(ctx context.Context, target core.RouteTarget, healthy bool, ttl time.Duration) error {
-	if r.Backend == nil {
-		return fmt.Errorf("coordination backend is required")
-	}
+type healthPayload struct {
+	TenantID     string `json:"tenant_id"`
+	Revision     int64  `json:"config_revision"`
+	ConnectionID string `json:"connection_id"`
+	ModelID      string `json:"model_id"`
+	Region       string `json:"region"`
+	Healthy      bool   `json:"healthy"`
+}
+
+func (r Remote) SetScoped(ctx context.Context, scope core.HealthScope, target core.RouteTarget, healthy bool, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if !scope.Valid() {
+		return ErrScopeRequired
+	}
+	if !validTarget(target) {
+		return fmt.Errorf("target identity is required")
 	}
 	ttl, err := boundTTL(ttl)
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(struct {
-		ConnectionID string `json:"connection_id"`
-		ModelID      string `json:"model_id"`
-		Region       string `json:"region"`
-		Healthy      bool   `json:"healthy"`
-	}{target.ConnectionID, target.ModelID, target.Region, healthy})
+	if r.Backend == nil {
+		return fmt.Errorf("coordination backend is required")
+	}
+	payload, err := json.Marshal(healthPayload{
+		TenantID: scope.TenantID, Revision: scope.Revision,
+		ConnectionID: target.ConnectionID, ModelID: target.ModelID, Region: target.Region,
+		Healthy: healthy,
+	})
 	if err != nil {
 		return err
 	}
-	if err = r.Backend.Set(ctx, r.Prefix+"health/"+key(target), payload, ttl); err != nil {
+	if err = r.Backend.Set(ctx, r.Prefix+"health/"+scopedHealthKey(scope, target), payload, ttl); err != nil {
 		return fmt.Errorf("store health hint: %w", err)
 	}
 	if r.Channel != "" {
@@ -161,71 +204,77 @@ func (r Remote) Set(ctx context.Context, target core.RouteTarget, healthy bool, 
 	}
 	return nil
 }
-func (r Remote) Healthy(ctx context.Context, target core.RouteTarget) (bool, error) {
+func (r Remote) HealthyScoped(ctx context.Context, scope core.HealthScope, target core.RouteTarget) (bool, error) {
 	if r.Backend == nil {
 		return true, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	payload, err := r.Backend.Get(ctx, r.Prefix+"health/"+key(target))
-	if errors.Is(err, ErrNotFound) {
+	if !scope.Valid() || !validTarget(target) {
 		return true, nil
 	}
-	if err != nil {
+	payload, err := r.Backend.Get(ctx, r.Prefix+"health/"+scopedHealthKey(scope, target))
+	if errors.Is(err, ErrNotFound) || err != nil {
 		return true, nil
 	}
-	var v struct {
-		ConnectionID *string `json:"connection_id"`
-		ModelID      *string `json:"model_id"`
-		Region       *string `json:"region"`
-		Healthy      *bool   `json:"healthy"`
-	}
-	if json.Unmarshal(payload, &v) != nil || v.ConnectionID == nil || v.ModelID == nil || v.Region == nil || v.Healthy == nil || *v.ConnectionID != target.ConnectionID || *v.ModelID != target.ModelID || *v.Region != target.Region {
+	var v healthPayload
+	if json.Unmarshal(payload, &v) != nil ||
+		v.TenantID != scope.TenantID || v.Revision != scope.Revision ||
+		v.ConnectionID != target.ConnectionID || v.ModelID != target.ModelID || v.Region != target.Region {
 		return true, nil
 	}
-	return *v.Healthy, nil
+	return v.Healthy, nil
 }
-func (r Remote) GetAffinity(ctx context.Context, key string) (core.RouteTarget, bool, error) {
+
+type affinityPayload struct {
+	TenantID string           `json:"tenant_id"`
+	Revision int64            `json:"config_revision"`
+	Target   core.RouteTarget `json:"target"`
+}
+
+func (r Remote) GetAffinityScoped(ctx context.Context, scope core.HealthScope, affinity string) (core.RouteTarget, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return core.RouteTarget{}, false, err
 	}
-	if key == "" || r.Backend == nil {
+	if !scope.Valid() || affinity == "" || r.Backend == nil {
 		return core.RouteTarget{}, false, nil
 	}
-	payload, err := r.Backend.Get(ctx, r.Prefix+"affinity/"+key)
+	payload, err := r.Backend.Get(ctx, r.Prefix+"affinity/"+scopedAffinityKey(scope, affinity))
 	if err != nil {
 		return core.RouteTarget{}, false, nil
 	}
-	var v struct {
-		Target core.RouteTarget `json:"target"`
-	}
-	if json.Unmarshal(payload, &v) != nil || v.Target.ConnectionID == "" || v.Target.ModelID == "" {
+	var v affinityPayload
+	if json.Unmarshal(payload, &v) != nil || v.TenantID != scope.TenantID || v.Revision != scope.Revision || !validTarget(v.Target) {
 		return core.RouteTarget{}, false, nil
 	}
 	return v.Target, true, nil
 }
-func (r Remote) SetAffinity(ctx context.Context, key string, target core.RouteTarget, ttl time.Duration) error {
-	if r.Backend == nil {
-		return nil
-	}
+func (r Remote) SetAffinityScoped(ctx context.Context, scope core.HealthScope, affinity string, target core.RouteTarget, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if key == "" {
+	if !scope.Valid() {
+		return ErrScopeRequired
+	}
+	if affinity == "" {
 		return fmt.Errorf("affinity key is required")
+	}
+	if !validTarget(target) {
+		return fmt.Errorf("target identity is required")
 	}
 	ttl, err := boundTTL(ttl)
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(struct {
-		Target core.RouteTarget `json:"target"`
-	}{target})
+	if r.Backend == nil {
+		return fmt.Errorf("coordination backend is required")
+	}
+	payload, err := json.Marshal(affinityPayload{TenantID: scope.TenantID, Revision: scope.Revision, Target: target})
 	if err != nil {
 		return err
 	}
-	return r.Backend.Set(ctx, r.Prefix+"affinity/"+key, payload, ttl)
+	return r.Backend.Set(ctx, r.Prefix+"affinity/"+scopedAffinityKey(scope, affinity), payload, ttl)
 }
 func (r Remote) Subscribe(ctx context.Context) (<-chan []byte, error) {
 	s, ok := r.Backend.(Subscriber)
@@ -261,9 +310,10 @@ func (h *Hybrid) timeout() time.Duration {
 	}
 	return h.Timeout
 }
-func (h *Hybrid) Healthy(ctx context.Context, target core.RouteTarget) (bool, error) {
+
+func (h *Hybrid) HealthyScoped(ctx context.Context, scope core.HealthScope, target core.RouteTarget) (bool, error) {
 	if h.Local != nil {
-		healthy, err := h.Local.Healthy(ctx, target)
+		healthy, err := h.Local.HealthyScoped(ctx, scope, target)
 		if err != nil {
 			return false, err
 		}
@@ -276,29 +326,32 @@ func (h *Hybrid) Healthy(ctx context.Context, target core.RouteTarget) (bool, er
 	}
 	rctx, cancel := context.WithTimeout(ctx, h.timeout())
 	defer cancel()
-	healthy, err := h.Remote.Healthy(rctx, target)
+	healthy, err := h.Remote.HealthyScoped(rctx, scope, target)
 	if err != nil {
 		return true, nil
 	}
 	return healthy, nil
 }
-func (h *Hybrid) Set(ctx context.Context, target core.RouteTarget, healthy bool, ttl time.Duration) error {
+func (h *Hybrid) SetScoped(ctx context.Context, scope core.HealthScope, target core.RouteTarget, healthy bool, ttl time.Duration) error {
+	if !scope.Valid() {
+		return ErrScopeRequired
+	}
 	if h.Local == nil {
 		return fmt.Errorf("local hint store is required")
 	}
-	if err := h.Local.Set(ctx, target, healthy, ttl); err != nil {
+	if err := h.Local.SetScoped(ctx, scope, target, healthy, ttl); err != nil {
 		return err
 	}
 	if h.Remote != nil {
 		rctx, cancel := context.WithTimeout(ctx, h.timeout())
 		defer cancel()
-		_ = h.Remote.Set(rctx, target, healthy, ttl)
+		_ = h.Remote.SetScoped(rctx, scope, target, healthy, ttl)
 	}
 	return nil
 }
-func (h *Hybrid) GetAffinity(ctx context.Context, key string) (core.RouteTarget, bool, error) {
+func (h *Hybrid) GetAffinityScoped(ctx context.Context, scope core.HealthScope, affinity string) (core.RouteTarget, bool, error) {
 	if h.Local != nil {
-		target, ok, err := h.Local.GetAffinity(ctx, key)
+		target, ok, err := h.Local.GetAffinityScoped(ctx, scope, affinity)
 		if err != nil {
 			return core.RouteTarget{}, false, err
 		}
@@ -311,36 +364,30 @@ func (h *Hybrid) GetAffinity(ctx context.Context, key string) (core.RouteTarget,
 	}
 	rctx, cancel := context.WithTimeout(ctx, h.timeout())
 	defer cancel()
-	target, ok, err := h.Remote.GetAffinity(rctx, key)
+	target, ok, err := h.Remote.GetAffinityScoped(rctx, scope, affinity)
 	if err != nil {
 		return core.RouteTarget{}, false, nil
 	}
 	return target, ok, nil
 }
-func (h *Hybrid) SetAffinity(ctx context.Context, key string, target core.RouteTarget, ttl time.Duration) error {
+func (h *Hybrid) SetAffinityScoped(ctx context.Context, scope core.HealthScope, affinity string, target core.RouteTarget, ttl time.Duration) error {
+	if !scope.Valid() {
+		return ErrScopeRequired
+	}
 	if h.Local == nil {
 		return fmt.Errorf("local hint store is required")
 	}
-	if err := h.Local.SetAffinity(ctx, key, target, ttl); err != nil {
+	if err := h.Local.SetAffinityScoped(ctx, scope, affinity, target, ttl); err != nil {
 		return err
 	}
 	if h.Remote != nil {
 		rctx, cancel := context.WithTimeout(ctx, h.timeout())
 		defer cancel()
-		_ = h.Remote.SetAffinity(rctx, key, target, ttl)
+		_ = h.Remote.SetAffinityScoped(rctx, scope, affinity, target, ttl)
 	}
 	return nil
 }
 
-var _ interface {
-	Healthy(context.Context, core.RouteTarget) (bool, error)
-	Set(context.Context, core.RouteTarget, bool, time.Duration) error
-	GetAffinity(context.Context, string) (core.RouteTarget, bool, error)
-	SetAffinity(context.Context, string, core.RouteTarget, time.Duration) error
-} = (*Local)(nil)
-var _ interface {
-	Healthy(context.Context, core.RouteTarget) (bool, error)
-	Set(context.Context, core.RouteTarget, bool, time.Duration) error
-	GetAffinity(context.Context, string) (core.RouteTarget, bool, error)
-	SetAffinity(context.Context, string, core.RouteTarget, time.Duration) error
-} = (*Hybrid)(nil)
+var _ core.ScopedRoutingHints = (*Local)(nil)
+var _ core.ScopedRoutingHints = (*Remote)(nil)
+var _ core.ScopedRoutingHints = (*Hybrid)(nil)

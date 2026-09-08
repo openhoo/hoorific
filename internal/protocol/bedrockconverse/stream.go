@@ -66,7 +66,8 @@ func messageType(m es.Message) (string, error) {
 	}
 	return string(s), nil
 }
-func decodeJSON(b []byte, v any) error { return strict(b, v) }
+func decodeJSON(b []byte, v any) error         { return strict(b, v) }
+func decodeResponseJSON(b []byte, v any) error { return tolerant(b, v) }
 func appendArg(b *bytes.Buffer, s string) error {
 	if b == nil || b.Len()+len(s) > maxJSON {
 		return invalid("tool.input")
@@ -293,7 +294,7 @@ func (d *decoder) Next(ctx context.Context) (core.Event, error) {
 			return nil, order("metadata")
 		}
 		var x streamMeta
-		if e = decodeJSON(m.Payload, &x); e != nil {
+		if e = decodeResponseJSON(m.Payload, &x); e != nil {
 			return nil, e
 		}
 		d.metadata = true

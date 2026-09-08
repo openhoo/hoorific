@@ -592,7 +592,7 @@ def main() -> int:
             stream = openai_gemini.chat.completions.create(model=openai_gemini_alias, messages=[{"role": "user", "content": "Call weather"}],
                 tools=[{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}},
                         {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {"timezone": {"type": "string"}}}}}],
-                max_tokens=64, stream=True)
+                max_tokens=64, stream=True, stream_options={"include_usage": True})
             text = ""
             names: dict[int, str] = {}
             arguments: dict[int, str] = {}

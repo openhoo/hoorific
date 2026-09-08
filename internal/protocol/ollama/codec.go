@@ -266,12 +266,15 @@ type requestWire struct {
 	Model    string          `json:"model"`
 	Messages []messageWire   `json:"messages"`
 	Tools    []toolWire      `json:"tools,omitempty"`
-	Stream   bool            `json:"stream,omitempty"`
+	Stream   bool            `json:"stream"`
 	Options  *optionsWire    `json:"options,omitempty"`
 	Format   json.RawMessage `json:"format,omitempty"`
 }
 
 func encodeBlock(b core.ContentBlock) (text, image string, call *toolCallWire, e error) {
+	if b.CacheControl != nil || b.CacheBreakpoint {
+		return "", "", nil, unsupported("content cache control")
+	}
 	switch b.Kind {
 	case "text":
 		if b.URL != "" || b.MIMEType != "" || b.ID != "" || b.Name != "" || b.Arguments != "" || len(b.Data) > 0 {
@@ -302,8 +305,14 @@ func encodeBlock(b core.ContentBlock) (text, image string, call *toolCallWire, e
 }
 func encodeMessages(c core.Conversation) ([]messageWire, error) {
 	// tool results use Ollama's tool role; the protocol has no call-id member.
-	out := make([]messageWire, 0, len(c.Messages))
-	for _, m := range c.Messages {
+	messages := c.Messages
+	if len(c.System) > 0 {
+		messages = make([]core.Message, 1, len(c.Messages)+1)
+		messages[0] = core.Message{Role: "system", Content: c.System}
+		messages = append(messages, c.Messages...)
+	}
+	out := make([]messageWire, 0, len(messages))
+	for _, m := range messages {
 		if m.Role == "" {
 			return nil, invalid("messages.role")
 		}
@@ -363,7 +372,13 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 			return nil, e
 		}
 	}
-	var cvt = core.Conversation{Model: q.Model, Stream: q.Stream}
+	stream := true
+	if _, ok := top["stream"]; ok {
+		if e = rawValue(top, "stream", &stream); e != nil {
+			return nil, e
+		}
+	}
+	var cvt = core.Conversation{Model: q.Model, Stream: stream}
 	for i, m := range q.Messages {
 		if m.Role == "" {
 			return nil, invalid(fmt.Sprintf("messages[%d].role", i))
@@ -475,7 +490,6 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 	}
 	return cvt, nil
 }
-
 func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.Writer) error {
 	q, ok := p.(core.Conversation)
 	if e := ctx.Err(); e != nil {
@@ -484,7 +498,13 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 	if !ok {
 		return unsupported("payload")
 	}
-	if q.Model == "" || len(q.Messages) == 0 {
+	if q.Cache != nil {
+		return unsupported("cache")
+	}
+	if q.StreamIncludeUsage != nil {
+		return unsupported("stream_include_usage")
+	}
+	if q.Model == "" || (len(q.Messages) == 0 && len(q.System) == 0) {
 		return invalid("request")
 	}
 	if q.MaxOutputTokens != nil && *q.MaxOutputTokens < 0 {
@@ -496,6 +516,9 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 	}
 	o := requestWire{Model: q.Model, Messages: msgs, Stream: q.Stream}
 	for _, t := range q.Tools {
+		if t.CacheControl != nil || t.CacheBreakpoint {
+			return unsupported("tool cache control")
+		}
 		if t.Name == "" || len(t.Schema) == 0 {
 			return invalid("tools")
 		}
@@ -628,6 +651,23 @@ func (c *Codec) DecodeResult(ctx context.Context, r io.Reader) (core.ResultPaylo
 	}
 	return responseResult(v)
 }
+func validateUsage(u *core.Usage) error {
+	if u == nil {
+		return nil
+	}
+	for _, n := range []*int64{
+		u.Input, u.Output, u.Total, u.CachedInput, u.CacheWriteInput,
+		u.CacheWrite5mInput, u.CacheWrite1hInput, u.ReasoningOutput, u.ToolInput,
+	} {
+		if n != nil && *n < 0 {
+			return invalid("usage")
+		}
+	}
+	if u.Input != nil && u.Output != nil && u.Total != nil && *u.Total != *u.Input+*u.Output {
+		return invalid("usage.total")
+	}
+	return nil
+}
 func (c *Codec) EncodeResult(ctx context.Context, p core.ResultPayload, w io.Writer) error {
 	if e := ctx.Err(); e != nil {
 		return e
@@ -675,10 +715,10 @@ func (c *Codec) EncodeResult(ctx context.Context, p core.ResultPayload, w io.Wri
 			return unsupported("content")
 		}
 	}
+	if e = validateUsage(v.Usage); e != nil {
+		return e
+	}
 	if v.Usage != nil {
-		if v.Usage.Total != nil && (v.Usage.Input == nil || v.Usage.Output == nil) {
-			return unsupported("usage.total")
-		}
 		o.PromptEvalCount, o.EvalCount = v.Usage.Input, v.Usage.Output
 	}
 	return emit(ctx, w, o)
@@ -865,14 +905,8 @@ func (e *streamEncoder) Write(ctx context.Context, ev core.Event) error {
 			return er
 		}
 	case core.Usage:
-		if v.Source != "" && v.Source != "provider" {
-			return unsupported("usage.source")
-		}
-		if v.Total != nil && (v.Input == nil || v.Output == nil) {
-			return unsupported("usage.total")
-		}
-		if v.Input != nil && *v.Input < 0 || v.Output != nil && *v.Output < 0 {
-			return invalid("usage")
+		if er := validateUsage(&v); er != nil {
+			return er
 		}
 		return emit(ctx, e.w, responseWire{PromptEvalCount: v.Input, EvalCount: v.Output, Message: messageWire{Role: "assistant"}})
 	case core.StreamError:

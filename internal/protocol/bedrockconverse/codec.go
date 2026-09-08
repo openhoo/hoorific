@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"hoorific/internal/core"
@@ -71,7 +72,7 @@ func unique(d *json.Decoder, depth int) error {
 	_, e = d.Token()
 	return e
 }
-func strict(b []byte, v any) error {
+func validateJSON(b []byte) error {
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.UseNumber()
 	if e := unique(d, 0); e != nil {
@@ -80,12 +81,27 @@ func strict(b []byte, v any) error {
 	if _, e := d.Token(); e != io.EOF {
 		return invalid("json")
 	}
-	d = json.NewDecoder(bytes.NewReader(b))
+	return nil
+}
+func strict(b []byte, v any) error {
+	if e := validateJSON(b); e != nil {
+		return e
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
 	if e := d.Decode(v); e != nil {
 		if strings.HasPrefix(e.Error(), "json: unknown field ") {
 			return unsupported(strings.Trim(strings.TrimPrefix(e.Error(), "json: unknown field "), "`\""))
 		}
+		return invalid("json")
+	}
+	return nil
+}
+func tolerant(b []byte, v any) error {
+	if e := validateJSON(b); e != nil {
+		return e
+	}
+	if e := json.Unmarshal(b, v); e != nil {
 		return invalid("json")
 	}
 	return nil
@@ -102,6 +118,19 @@ func load(ctx context.Context, r io.Reader, v any) error {
 		return invalid("body")
 	}
 	return strict(b, v)
+}
+func loadResponse(ctx context.Context, r io.Reader, v any) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	b, e := io.ReadAll(io.LimitReader(r, maxJSON+1))
+	if e != nil {
+		return e
+	}
+	if len(b) > maxJSON {
+		return invalid("body")
+	}
+	return tolerant(b, v)
 }
 func save(ctx context.Context, w io.Writer, v any) error {
 	if e := ctx.Err(); e != nil {
@@ -120,6 +149,10 @@ func object(b []byte) error {
 	return nil
 }
 
+type cachePoint struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
+}
 type imageContent struct {
 	Format string `json:"format"`
 	Source struct {
@@ -139,6 +172,7 @@ type block struct {
 	Document   *documentContent `json:"document,omitempty"`
 	ToolUse    *toolUse         `json:"toolUse,omitempty"`
 	ToolResult *toolResult      `json:"toolResult,omitempty"`
+	CachePoint *cachePoint      `json:"cachePoint,omitempty"`
 }
 type toolUse struct {
 	ID    string          `json:"toolUseId"`
@@ -165,7 +199,8 @@ type specification struct {
 	} `json:"inputSchema"`
 }
 type tool struct {
-	Spec specification `json:"toolSpec"`
+	Spec       specification `json:"toolSpec"`
+	CachePoint *cachePoint   `json:"cachePoint,omitempty"`
 }
 type toolConfig struct {
 	Tools []tool `json:"tools"`
@@ -180,10 +215,17 @@ type request struct {
 	Tools     *toolConfig `json:"toolConfig,omitempty"`
 	Inference *inference  `json:"inferenceConfig,omitempty"`
 }
+type cacheDetail struct {
+	InputTokens *int64 `json:"inputTokens"`
+	TTL         string `json:"ttl"`
+}
 type usage struct {
-	Input  *int64 `json:"inputTokens,omitempty"`
-	Output *int64 `json:"outputTokens,omitempty"`
-	Total  *int64 `json:"totalTokens,omitempty"`
+	Input           *int64        `json:"inputTokens,omitempty"`
+	Output          *int64        `json:"outputTokens,omitempty"`
+	Total           *int64        `json:"totalTokens,omitempty"`
+	CachedInput     *int64        `json:"cacheReadInputTokens,omitempty"`
+	CacheWriteInput *int64        `json:"cacheWriteInputTokens,omitempty"`
+	CacheDetails    []cacheDetail `json:"cacheDetails,omitempty"`
 }
 type metrics struct {
 	Latency *int64 `json:"latencyMs,omitempty"`
@@ -195,6 +237,13 @@ type response struct {
 	Stop    string   `json:"stopReason"`
 	Usage   *usage   `json:"usage,omitempty"`
 	Metrics *metrics `json:"metrics,omitempty"`
+}
+
+func validateCachePoint(cp *cachePoint, path string) error {
+	if cp == nil || cp.Type != "default" || cp.TTL != "" && cp.TTL != "5m" && cp.TTL != "1h" {
+		return invalid(path)
+	}
+	return nil
 }
 
 func decodeBlocks(bs []block, role string) ([]core.ContentBlock, error) {
@@ -214,6 +263,9 @@ func decodeBlocks(bs []block, role string) ([]core.ContentBlock, error) {
 			n++
 		}
 		if b.ToolResult != nil {
+			n++
+		}
+		if b.CachePoint != nil {
 			n++
 		}
 		if n != 1 {
@@ -265,15 +317,40 @@ func decodeBlocks(bs []block, role string) ([]core.ContentBlock, error) {
 				return nil, unsupported("toolResult.content.json")
 			}
 			out = append(out, core.ContentBlock{Kind: "tool_result", ID: t.ID, Text: *c.Text})
+		case b.CachePoint != nil:
+			if len(out) == 0 {
+				return nil, invalid("cachePoint.position")
+			}
+			if err := validateCachePoint(b.CachePoint, "cachePoint"); err != nil {
+				return nil, err
+			}
+			out = append(out, core.ContentBlock{Kind: "cache_point", CacheControl: &core.CacheControl{Type: "default", TTL: b.CachePoint.TTL}})
 		}
 	}
 	return out, nil
 }
 func encodeBlocks(bs []core.ContentBlock, role string) ([]block, error) {
 	out := make([]block, 0, len(bs))
-	for _, b := range bs {
-		if b.URL != "" {
-			return nil, unsupported("content.url")
+	for i, b := range bs {
+		if b.CacheBreakpoint {
+			return nil, unsupported(fmt.Sprintf("content[%d].cache_breakpoint", i))
+		}
+		if b.Kind == "cache_point" {
+			if b.Text != "" || b.URL != "" || b.MIMEType != "" || b.ID != "" || b.Name != "" || b.Arguments != "" || len(b.Data) != 0 {
+				return nil, unsupported("cache_point")
+			}
+			cp := &cachePoint{Type: "default"}
+			if b.CacheControl != nil {
+				if b.CacheControl.Type != "default" {
+					return nil, unsupported("cache_point.type")
+				}
+				cp.TTL = b.CacheControl.TTL
+			}
+			if err := validateCachePoint(cp, "cachePoint"); err != nil {
+				return nil, err
+			}
+			out = append(out, block{CachePoint: cp})
+			continue
 		}
 		switch b.Kind {
 		case "text":
@@ -327,6 +404,9 @@ func encodeBlocks(bs []core.ContentBlock, role string) ([]block, error) {
 		default:
 			return nil, unsupported("content." + b.Kind)
 		}
+		if b.CacheControl != nil {
+			return nil, unsupported(fmt.Sprintf("content[%d].cache_control", i))
+		}
 	}
 	return out, nil
 }
@@ -365,6 +445,16 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 	}
 	if n.Tools != nil {
 		for _, t := range n.Tools.Tools {
+			if t.CachePoint != nil {
+				if t.Spec.Name != "" || len(v.Tools) == 0 {
+					return nil, invalid("tool.cachePoint.position")
+				}
+				if err := validateCachePoint(t.CachePoint, "tool.cachePoint"); err != nil {
+					return nil, err
+				}
+				v.Tools[len(v.Tools)-1].CacheControl = &core.CacheControl{Type: "default", TTL: t.CachePoint.TTL}
+				continue
+			}
 			s := t.Spec
 			if s.Name == "" {
 				return nil, invalid("toolSpec.name")
@@ -375,8 +465,37 @@ func (c *Codec) DecodeRequest(ctx context.Context, r io.Reader) (core.RequestPay
 			v.Tools = append(v.Tools, core.Tool{Name: s.Name, Description: s.Description, Schema: s.InputSchema.JSON})
 		}
 	}
+	if conversationHasCache(&v) {
+		v.Cache = &core.PromptCache{Protocol: core.Protocol("bedrock-converse")}
+	}
 	return v, nil
 }
+
+func conversationHasCache(v *core.Conversation) bool {
+	has := func(bs []core.ContentBlock) bool {
+		for _, b := range bs {
+			if b.Kind == "cache_point" {
+				return true
+			}
+		}
+		return false
+	}
+	if has(v.System) {
+		return true
+	}
+	for _, m := range v.Messages {
+		if has(m.Content) {
+			return true
+		}
+	}
+	for _, t := range v.Tools {
+		if t.CacheControl != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.Writer) error {
 	v, ok := p.(core.Conversation)
 	if !ok {
@@ -425,9 +544,12 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 	}
 	if len(v.Tools) > 0 {
 		n.Tools = &toolConfig{}
-		for _, t := range v.Tools {
+		for i, t := range v.Tools {
 			if t.Name == "" {
 				return invalid("tool.name")
+			}
+			if t.CacheBreakpoint {
+				return unsupported(fmt.Sprintf("tools[%d].cache_breakpoint", i))
 			}
 			if e := object(t.Schema); e != nil {
 				return e
@@ -435,6 +557,37 @@ func (c *Codec) EncodeRequest(ctx context.Context, p core.RequestPayload, w io.W
 			s := specification{Name: t.Name, Description: t.Description}
 			s.InputSchema.JSON = t.Schema
 			n.Tools.Tools = append(n.Tools.Tools, tool{Spec: s})
+			if t.CacheControl != nil {
+				if t.CacheControl.Type != "default" {
+					return unsupported(fmt.Sprintf("tools[%d].cache_control.type", i))
+				}
+				cp := &cachePoint{Type: "default", TTL: t.CacheControl.TTL}
+				if err := validateCachePoint(cp, "tool.cachePoint"); err != nil {
+					return err
+				}
+				n.Tools.Tools = append(n.Tools.Tools, tool{CachePoint: cp})
+			}
+		}
+	}
+	if v.Cache != nil {
+		if v.Cache.Protocol != "" && v.Cache.Protocol != core.Protocol("bedrock-converse") && v.Cache.Protocol != core.Protocol("anthropic-messages") {
+			return unsupported("cache.protocol")
+		}
+		if v.Cache.Key != "" || v.Cache.Retention != "" || v.Cache.Mode != "" || v.Cache.CachedContent != "" || v.Cache.SessionID != "" || v.Cache.TTL != "" && v.Cache.Control == nil {
+			return unsupported("cache")
+		}
+		if v.Cache.Control != nil {
+			if v.Cache.Control.Type != "default" {
+				return unsupported("cache.control.type")
+			}
+			cp := &cachePoint{Type: "default", TTL: v.Cache.Control.TTL}
+			if err := validateCachePoint(cp, "cachePoint"); err != nil {
+				return err
+			}
+			if len(n.Messages) == 0 || len(n.Messages[len(n.Messages)-1].Content) == 0 {
+				return invalid("cache.control.position")
+			}
+			n.Messages[len(n.Messages)-1].Content = append(n.Messages[len(n.Messages)-1].Content, block{CachePoint: cp})
 		}
 	}
 	return save(ctx, w, n)
@@ -497,28 +650,174 @@ func stop(f core.Finish) (string, error) {
 	}
 	return "", unsupported("finish")
 }
+func addUsage(a, b int64) (int64, error) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, invalid("usage")
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, invalid("usage")
+	}
+	return a + b, nil
+}
+
+func usageValue(n *int64) error {
+	if n != nil && *n < 0 {
+		return invalid("usage")
+	}
+	return nil
+}
+
 func decodeUsage(u *usage) (*core.Usage, error) {
 	if u == nil {
 		return nil, nil
 	}
-	for _, n := range []*int64{u.Input, u.Output, u.Total} {
-		if n != nil && *n < 0 {
-			return nil, invalid("usage")
+	for _, n := range []*int64{u.Input, u.Output, u.Total, u.CachedInput, u.CacheWriteInput} {
+		if err := usageValue(n); err != nil {
+			return nil, err
 		}
 	}
-	return &core.Usage{Input: u.Input, Output: u.Output, Total: u.Total, Source: "provider"}, nil
+	write := u.CacheWriteInput
+	var write5, write1 *int64
+	var detailTotal int64
+	var detailKnown bool
+	for _, d := range u.CacheDetails {
+		if err := usageValue(d.InputTokens); err != nil {
+			return nil, err
+		}
+		if d.InputTokens == nil {
+			continue
+		}
+		detailKnown = true
+		var err error
+		detailTotal, err = addUsage(detailTotal, *d.InputTokens)
+		if err != nil {
+			return nil, err
+		}
+		switch d.TTL {
+		case "5m":
+			if write5 == nil {
+				v := int64(0)
+				write5 = &v
+			}
+			*write5, err = addUsage(*write5, *d.InputTokens)
+			if err != nil {
+				return nil, err
+			}
+		case "1h":
+			if write1 == nil {
+				v := int64(0)
+				write1 = &v
+			}
+			*write1, err = addUsage(*write1, *d.InputTokens)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if write == nil && detailKnown {
+		write = &detailTotal
+	}
+	var input *int64
+	if u.Input != nil || u.CachedInput != nil || write != nil {
+		v := int64(0)
+		var err error
+		if u.Input != nil {
+			v, err = addUsage(v, *u.Input)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if u.CachedInput != nil {
+			v, err = addUsage(v, *u.CachedInput)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if write != nil {
+			v, err = addUsage(v, *write)
+			if err != nil {
+				return nil, err
+			}
+		}
+		input = &v
+	}
+	total := u.Total
+	if input != nil && u.Output != nil {
+		v, err := addUsage(*input, *u.Output)
+		if err != nil {
+			return nil, err
+		}
+		total = &v
+	}
+	return &core.Usage{Input: input, Output: u.Output, Total: total, CachedInput: u.CachedInput, CacheWriteInput: write, CacheWrite5mInput: write5, CacheWrite1hInput: write1, Source: "provider"}, nil
 }
+
 func encodeUsage(u *core.Usage) (*usage, error) {
 	if u == nil {
 		return nil, nil
 	}
-	n := &usage{Input: u.Input, Output: u.Output, Total: u.Total}
-	_, e := decodeUsage(n)
-	return n, e
+	for _, n := range []*int64{u.Input, u.Output, u.Total, u.CachedInput, u.CacheWriteInput, u.CacheWrite5mInput, u.CacheWrite1hInput} {
+		if err := usageValue(n); err != nil {
+			return nil, err
+		}
+	}
+	var cached, write int64
+	if u.CachedInput != nil {
+		cached = *u.CachedInput
+	}
+	var detailWrite int64
+	if u.CacheWrite5mInput != nil {
+		var err error
+		detailWrite, err = addUsage(detailWrite, *u.CacheWrite5mInput)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if u.CacheWrite1hInput != nil {
+		var err error
+		detailWrite, err = addUsage(detailWrite, *u.CacheWrite1hInput)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if u.CacheWriteInput != nil {
+		write = *u.CacheWriteInput
+	} else {
+		write = detailWrite
+	}
+	var ordinary *int64
+	if u.Input != nil {
+		v := *u.Input
+		if cached >= v {
+			v = 0
+		} else {
+			v -= cached
+		}
+		if write >= v {
+			v = 0
+		} else {
+			v -= write
+		}
+		ordinary = &v
+	}
+	n := &usage{Input: ordinary, Output: u.Output, Total: u.Total}
+	if u.CachedInput != nil {
+		n.CachedInput = u.CachedInput
+	}
+	if u.CacheWriteInput != nil || u.CacheWrite5mInput != nil || u.CacheWrite1hInput != nil {
+		n.CacheWriteInput = &write
+	}
+	if u.CacheWrite5mInput != nil {
+		n.CacheDetails = append(n.CacheDetails, cacheDetail{InputTokens: u.CacheWrite5mInput, TTL: "5m"})
+	}
+	if u.CacheWrite1hInput != nil {
+		n.CacheDetails = append(n.CacheDetails, cacheDetail{InputTokens: u.CacheWrite1hInput, TTL: "1h"})
+	}
+	return n, nil
 }
 func (c *Codec) DecodeResult(ctx context.Context, r io.Reader) (core.ResultPayload, error) {
 	var n response
-	if e := load(ctx, r, &n); e != nil {
+	if e := loadResponse(ctx, r, &n); e != nil {
 		return nil, e
 	}
 	if n.Output.Message.Role != "assistant" {

@@ -19,6 +19,7 @@ type attemptEnvelope struct {
 	Outcome             *core.AttemptOutcome `json:"outcome,omitempty"`
 	Held                []int64              `json:"held,omitempty"`
 	ChargedCost         int64                `json:"charged_cost,omitempty"`
+	ChargedCostKnown    bool                 `json:"charged_cost_known,omitempty"`
 	Reconciled          bool                 `json:"reconciled,omitempty"`
 	AcceptedEvidence    string               `json:"accepted_evidence,omitempty"`
 	UpdatedAt           int64                `json:"updated_at,omitempty"`
@@ -131,10 +132,11 @@ func (s *Store) BeginAttempt(ctx context.Context, p core.AttemptPlan) (permit co
 				if p.InputBound == nil || p.OutputBound == nil {
 					return problem("unsupported_policy", 400, "token policy requires bounded input and output")
 				}
-				if *p.InputBound < 0 || *p.OutputBound < 0 || *p.InputBound > int64(^uint64(0)>>1)-*p.OutputBound {
+				var sumErr error
+				amount, sumErr = policy.CheckedAdd(*p.InputBound, *p.OutputBound)
+				if sumErr != nil {
 					return problem("unsupported_policy", 400, "token bound is not representable")
 				}
-				amount = *p.InputBound + *p.OutputBound
 			} else if a.Kind == "requests" || a.Kind == "concurrency" || a.Kind == "jobs" {
 				amount = 1
 			}
@@ -213,6 +215,9 @@ func (s *Store) loadAttempt(ctx context.Context, tx *sql.Tx, tenant, id string) 
 	if err = json.Unmarshal([]byte(data), &env); err != nil {
 		return env, "", 0, err
 	}
+	if !env.ChargedCostKnown && (env.ChargedCost != 0 || env.Outcome != nil && env.Outcome.ActualCost != nil) {
+		env.ChargedCostKnown = true
+	}
 	// Settlement belongs to the immutable admission, even if its key or
 	// operator has since been revoked. Never use payload coordinates to
 	// redirect ledger or hold mutations to another admission.
@@ -247,6 +252,18 @@ func (s *Store) saveAttempt(ctx context.Context, tx *sql.Tx, env attemptEnvelope
 }
 
 func (s *Store) adjustHold(ctx context.Context, tx *sql.Tx, env *attemptEnvelope, index int, target int64) error {
+	return s.adjustHoldMode(ctx, tx, env, index, target, false)
+}
+
+// adjustIncurredHold records observed spend or usage even when it exceeds the
+// configured policy maximum. The overrun is real accounting evidence; future
+// admissions will fail the normal maximum guard while the counter remains
+// truthful.
+func (s *Store) adjustIncurredHold(ctx context.Context, tx *sql.Tx, env *attemptEnvelope, index int, target int64) error {
+	return s.adjustHoldMode(ctx, tx, env, index, target, true)
+}
+
+func (s *Store) adjustHoldMode(ctx context.Context, tx *sql.Tx, env *attemptEnvelope, index int, target int64, allowOverrun bool) error {
 	if index < 0 || index >= len(env.Plan.Allowances) || target < 0 {
 		return errors.New("invalid hold adjustment")
 	}
@@ -255,24 +272,82 @@ func (s *Store) adjustHold(ctx context.Context, tx *sql.Tx, env *attemptEnvelope
 		return nil
 	}
 	a := env.Plan.Allowances[index]
-	delta := target - current
-	if delta < 0 {
-		_, err := tx.ExecContext(ctx, s.Query("UPDATE allowances SET reserved=CASE WHEN reserved>=? THEN reserved-? ELSE 0 END,version=version+1 WHERE tenant_id=? AND scope_kind=? AND scope_id=? AND window_id=? AND kind=?"), -delta, -delta, env.Plan.TenantID, a.ScopeKind, a.ScopeID, a.WindowID, a.Kind)
-		if err != nil {
-			return err
-		}
-	} else {
-		r, err := tx.ExecContext(ctx, s.Query("UPDATE allowances SET reserved=reserved+?,version=version+1 WHERE tenant_id=? AND scope_kind=? AND scope_id=? AND window_id=? AND kind=? AND reserved+?<=?"), delta, env.Plan.TenantID, a.ScopeKind, a.ScopeID, a.WindowID, a.Kind, delta, a.Maximum)
+	if target < current {
+		delta := current - target
+		// The row is shared by every concurrent attempt. Subtract only this
+		// admission's prior hold, and require the row to contain that amount;
+		// clamping to zero could erase another attempt's reservation.
+		r, err := tx.ExecContext(ctx, s.Query("UPDATE allowances SET reserved=reserved-?,version=version+1 WHERE tenant_id=? AND scope_kind=? AND scope_id=? AND window_id=? AND kind=? AND reserved>=?"), delta, env.Plan.TenantID, a.ScopeKind, a.ScopeID, a.WindowID, a.Kind, delta)
 		if err != nil {
 			return err
 		}
 		n, _ := r.RowsAffected()
 		if n != 1 {
-			return problem("quota_exceeded", 429, "allowance adjustment exceeded")
+			return errors.New("allowance changed during settlement")
+		}
+	} else {
+		delta := target - current
+		if allowOverrun {
+			// Actual spend is shared accounting state. Add this admission's
+			// overrun instead of assigning an absolute total, otherwise a
+			// concurrent hold would be silently discarded. The predicate
+			// avoids overflowing the signed SQL integer before the update.
+			maxInt := int64(^uint64(0) >> 1)
+			r, err := tx.ExecContext(ctx, s.Query("UPDATE allowances SET reserved=reserved+?,version=version+1 WHERE tenant_id=? AND scope_kind=? AND scope_id=? AND window_id=? AND kind=? AND reserved<=?"), delta, env.Plan.TenantID, a.ScopeKind, a.ScopeID, a.WindowID, a.Kind, maxInt-delta)
+			if err != nil {
+				return err
+			}
+			n, _ := r.RowsAffected()
+			if n != 1 {
+				return errors.New("allowance changed or overflows during settlement")
+			}
+		} else {
+			// Admission-time adjustments remain bounded by the configured
+			// maximum, while using a subtraction predicate to avoid SQL
+			// integer overflow in reserved+delta.
+			if a.Maximum < delta {
+				return problem("quota_exceeded", 429, "allowance adjustment exceeded")
+			}
+			r, err := tx.ExecContext(ctx, s.Query("UPDATE allowances SET reserved=reserved+?,version=version+1 WHERE tenant_id=? AND scope_kind=? AND scope_id=? AND window_id=? AND kind=? AND reserved<=?"), delta, env.Plan.TenantID, a.ScopeKind, a.ScopeID, a.WindowID, a.Kind, a.Maximum-delta)
+			if err != nil {
+				return err
+			}
+			n, _ := r.RowsAffected()
+			if n != 1 {
+				return problem("quota_exceeded", 429, "allowance adjustment exceeded")
+			}
 		}
 	}
 	env.Held[index] = target
 	return nil
+}
+func normalizeUsage(input *core.Usage) (usage *core.Usage, valid, totalKnown bool) {
+	if input == nil {
+		return nil, true, false
+	}
+	copy := *input
+	for _, value := range []*int64{
+		copy.Input, copy.Output, copy.Total, copy.CachedInput,
+		copy.CacheWriteInput, copy.CacheWrite5mInput, copy.CacheWrite1hInput,
+		copy.ReasoningOutput, copy.ToolInput,
+	} {
+		if value != nil && *value < 0 {
+			return nil, false, false
+		}
+	}
+	totalKnown = copy.Total != nil
+	if copy.Input != nil && copy.Output != nil {
+		total, err := policy.CheckedAdd(*copy.Input, *copy.Output)
+		if err != nil {
+			totalKnown = false
+		} else if copy.Total == nil {
+			copy.Total = &total
+			totalKnown = true
+		} else {
+			totalKnown = *copy.Total == total
+		}
+	}
+	return &copy, true, totalKnown
 }
 
 func (s *Store) FinalizeAttempt(ctx context.Context, o core.AttemptOutcome) error {
@@ -316,54 +391,78 @@ func (s *Store) FinalizeAttempt(ctx context.Context, o core.AttemptOutcome) erro
 		default:
 			return errors.New("invalid attempt state")
 		}
-		if next == "settled" {
-			if o.ActualCost != nil && *o.ActualCost < 0 {
-				return errors.New("negative actual cost")
+
+		usage, usageValid, totalKnown := normalizeUsage(o.Usage)
+		o.Usage = usage
+		if !usageValid {
+			o.Usage = nil
+		}
+		if o.ActualCost != nil && *o.ActualCost < 0 {
+			o.ActualCost = nil
+			if next == "settled" {
+				next = "outcome_unknown"
 			}
-			if o.Usage != nil {
-				for _, n := range []*int64{o.Usage.Input, o.Usage.Output, o.Usage.Total} {
-					if n != nil && *n < 0 {
-						return errors.New("negative usage")
-					}
-				}
-				if o.ActualCost == nil && env.Price != nil && o.Usage.Input != nil && o.Usage.Output != nil && env.Price.InputPerMillion != nil && env.Price.OutputPerMillion != nil {
-					cost, e := policy.EstimateCost(*o.Usage.Input, *o.Usage.Output, *env.Price.InputPerMillion, *env.Price.OutputPerMillion, 1000000)
-					if e != nil {
-						return e
-					}
-					o.ActualCost = &cost
-				}
+		}
+		if next == "settled" && o.ActualCost == nil && usageValid {
+			if cost, e := policy.EstimateUsageCost(o.Usage, env.Price); e == nil {
+				o.ActualCost = &cost
 			}
+		}
+		costKnown := next != "not_executed" && o.ActualCost != nil
+		needsCost, needsTokens := false, false
+		for _, a := range env.Plan.Allowances {
+			switch a.Kind {
+			case "cost":
+				needsCost = true
+			case "tokens":
+				needsTokens = true
+			}
+		}
+		// A successful response without the evidence required by its held
+		// dimensions remains reconcilable. Control-only requests can settle
+		// without fabricated usage or cost.
+		if next == "settled" && (needsCost && !costKnown || needsTokens && !totalKnown) {
+			next = "outcome_unknown"
+		}
+		if next == "not_executed" {
+			costKnown = false
 		}
 		for i, a := range env.Plan.Allowances {
 			target := env.Held[i]
 			switch {
 			case next == "not_executed":
 				target = 0
-			case a.Kind == "concurrency":
-				if next == "settled" || next == "job_pending" {
-					target = 0
-				}
+			case a.Kind == "concurrency" && (next == "settled" || next == "job_pending"):
+				target = 0
 			case a.Kind == "jobs" && next == "settled":
 				target = 0
-			case a.Kind == "tokens" && next == "settled" && o.Usage != nil && o.Usage.Total != nil && *o.Usage.Total >= 0 && target > *o.Usage.Total:
+			case a.Kind == "tokens" && (next == "settled" || next == "outcome_unknown") && usageValid && totalKnown && o.Usage != nil && o.Usage.Total != nil:
 				target = *o.Usage.Total
-			case a.Kind == "cost" && next == "settled" && o.ActualCost != nil && *o.ActualCost >= 0 && target > *o.ActualCost:
+			case a.Kind == "cost" && (next == "settled" || next == "outcome_unknown") && costKnown:
 				target = *o.ActualCost
 			}
-			if err = s.adjustHold(ctx, tx, &env, i, target); err != nil {
-				return err
+			if target > env.Held[i] {
+				err = s.adjustIncurredHold(ctx, tx, &env, i, target)
+			} else {
+				err = s.adjustHold(ctx, tx, &env, i, target)
 			}
-		}
-		if next == "settled" && o.ActualCost != nil && !env.Reconciled {
-			effect := o.AttemptID + ":charge"
-			payload, _ := json.Marshal(o)
-			_, err = tx.ExecContext(ctx, s.Query("INSERT INTO usage_ledger(tenant_id,effect_id,attempt_id,effect_kind,amount,data,created_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT (tenant_id,effect_id) DO NOTHING"), o.TenantID, effect, o.AttemptID, "charge", *o.ActualCost, string(payload), time.Now().Unix())
 			if err != nil {
 				return err
 			}
-			env.ChargedCost = *o.ActualCost
 		}
+		if (next == "settled" || next == "outcome_unknown") && costKnown && !env.ChargedCostKnown {
+			effect := o.AttemptID + ":charge"
+			payload, e := json.Marshal(o)
+			if e != nil {
+				return e
+			}
+			if _, err = tx.ExecContext(ctx, s.Query("INSERT INTO usage_ledger(tenant_id,effect_id,attempt_id,effect_kind,amount,data,created_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT (tenant_id,effect_id) DO NOTHING"), o.TenantID, effect, o.AttemptID, "charge", *o.ActualCost, string(payload), time.Now().Unix()); err != nil {
+				return err
+			}
+			env.ChargedCost = *o.ActualCost
+			env.ChargedCostKnown = true
+		}
+		o.State = next
 		env.Outcome = &o
 		env.UpdatedAt = time.Now().Unix()
 		return s.saveAttempt(ctx, tx, env, next, version)

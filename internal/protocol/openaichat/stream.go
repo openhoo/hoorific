@@ -162,13 +162,14 @@ func (d *streamDecoder) Next(ctx context.Context) (core.Event, error) {
 			}
 		}
 		if x.Usage != nil {
-			if x.Usage.PromptTokens != nil && *x.Usage.PromptTokens < 0 || x.Usage.CompletionTokens != nil && *x.Usage.CompletionTokens < 0 || x.Usage.TotalTokens != nil && *x.Usage.TotalTokens < 0 {
-				return nil, unsupported("usage")
+			u, err := decodeUsage(x.Usage)
+			if err != nil {
+				return nil, err
 			}
 			if !d.finished {
 				return nil, unsupported("usage.before_finish")
 			}
-			d.pending = append(d.pending, core.Usage{Input: x.Usage.PromptTokens, Output: x.Usage.CompletionTokens, Total: x.Usage.TotalTokens, Source: "provider"})
+			d.pending = append(d.pending, *u)
 			if d.finishPending != nil && !d.finishEmitted {
 				d.pending = append(d.pending, *d.finishPending)
 				d.finishEmitted = true
@@ -366,7 +367,11 @@ func (e *streamEncoder) Write(ctx context.Context, v core.Event) error {
 			return err
 		}
 		if e.pendingUsage != nil {
-			if err := e.emit(ctx, chunk{ID: e.id, Object: "chat.completion.chunk", Model: e.model, Choices: []chunkChoice{}, Usage: &wireUsage{PromptTokens: e.pendingUsage.Input, CompletionTokens: e.pendingUsage.Output, TotalTokens: e.pendingUsage.Total}}); err != nil {
+			usage, err := encodeUsage(e.pendingUsage)
+			if err != nil {
+				return err
+			}
+			if err := e.emit(ctx, chunk{ID: e.id, Object: "chat.completion.chunk", Model: e.model, Choices: []chunkChoice{}, Usage: usage}); err != nil {
 				return err
 			}
 			e.pendingUsage = nil

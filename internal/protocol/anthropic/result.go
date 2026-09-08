@@ -15,10 +15,6 @@ type resultWire struct {
 	StopSequence *string           `json:"stop_sequence"`
 	Usage        *usageWire        `json:"usage,omitempty"`
 }
-type usageWire struct {
-	Input  *int64 `json:"input_tokens"`
-	Output *int64 `json:"output_tokens"`
-}
 
 func resultFromWire(a resultWire) (core.ResultPayload, error) {
 	if err := required(a.ID, "id"); err != nil {
@@ -38,7 +34,7 @@ func resultFromWire(a resultWire) (core.ResultPayload, error) {
 	}
 	g := core.GenerationResult{ID: a.ID, Model: a.Model}
 	for i, r := range a.Content {
-		b, e := blockFromRaw(r, field("content", i))
+		b, e := responseBlockFromRaw(r, field("content", i))
 		if e != nil {
 			return nil, e
 		}
@@ -60,6 +56,11 @@ func resultFromWire(a resultWire) (core.ResultPayload, error) {
 	case "max_tokens":
 		canonical = "length"
 		status = "incomplete"
+	case "pause_turn", "refusal":
+		canonical = reason
+	case "model_context_window_exceeded":
+		canonical = "context_length_exceeded"
+		status = "incomplete"
 	default:
 		return nil, unsupported("stop_reason")
 	}
@@ -72,15 +73,11 @@ func resultFromWire(a resultWire) (core.ResultPayload, error) {
 		g.Finish.Reason = "stop_sequence"
 	}
 	if a.Usage != nil {
-		if a.Usage.Input != nil && *a.Usage.Input < 0 || a.Usage.Output != nil && *a.Usage.Output < 0 {
-			return nil, unsupported("usage")
+		u, err := usageFromWire(a.Usage)
+		if err != nil {
+			return nil, err
 		}
-		var total *int64
-		if a.Usage.Input != nil && a.Usage.Output != nil {
-			v := *a.Usage.Input + *a.Usage.Output
-			total = &v
-		}
-		g.Usage = &core.Usage{Input: a.Usage.Input, Output: a.Usage.Output, Total: total, Source: "anthropic"}
+		g.Usage = u
 	}
 	return g, nil
 }
@@ -127,24 +124,30 @@ func resultToWire(g core.GenerationResult) (resultWire, error) {
 		wireReason = "tool_use"
 	case "length":
 		wireReason = "max_tokens"
+	case "pause_turn", "refusal":
+		wireReason = reason
+	case "context_length_exceeded":
+		wireReason = "model_context_window_exceeded"
 	default:
 		return a, unsupported("finish.reason")
 	}
-	if reason == "length" && g.Finish.Status != "incomplete" {
+	if (reason == "length" || reason == "context_length_exceeded") && g.Finish.Status != "incomplete" {
 		return a, unsupported("finish.status")
 	}
-	if reason != "length" && g.Finish.Status != "completed" {
+	if reason != "length" && reason != "context_length_exceeded" && g.Finish.Status != "completed" {
 		return a, unsupported("finish.status")
 	}
 	a.StopReason = &wireReason
 	if g.Usage != nil {
-		if g.Usage.Input != nil && *g.Usage.Input < 0 || g.Usage.Output != nil && *g.Usage.Output < 0 {
-			return a, unsupported("usage")
+		u, err := usageToWire(g.Usage)
+		if err != nil {
+			return a, err
 		}
-		a.Usage = &usageWire{Input: g.Usage.Input, Output: g.Usage.Output}
+		a.Usage = u
 	}
 	return a, nil
 }
+
 func reasonFromWire(reason string) (string, string, error) {
 	switch reason {
 	case "end_turn":
@@ -155,10 +158,15 @@ func reasonFromWire(reason string) (string, string, error) {
 		return "tool_calls", "completed", nil
 	case "max_tokens":
 		return "length", "incomplete", nil
+	case "pause_turn", "refusal":
+		return reason, "completed", nil
+	case "model_context_window_exceeded":
+		return "context_length_exceeded", "incomplete", nil
 	default:
 		return "", "", unsupported("stop_reason")
 	}
 }
+
 func reasonToWire(reason string) (string, string, error) {
 	switch reason {
 	case "stop":
@@ -169,6 +177,10 @@ func reasonToWire(reason string) (string, string, error) {
 		return "tool_use", "completed", nil
 	case "length":
 		return "max_tokens", "incomplete", nil
+	case "pause_turn", "refusal":
+		return reason, "completed", nil
+	case "context_length_exceeded":
+		return "model_context_window_exceeded", "incomplete", nil
 	default:
 		return "", "", unsupported("finish.reason")
 	}

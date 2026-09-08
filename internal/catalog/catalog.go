@@ -73,8 +73,18 @@ func Compile(s core.RuntimeSnapshot) (*Catalog, error) {
 			if value.Price.Version == "" {
 				return nil, fmt.Errorf("model %q has invalid price version", key)
 			}
-			if value.Price.InputPerMillion != nil && *value.Price.InputPerMillion < 0 || value.Price.OutputPerMillion != nil && *value.Price.OutputPerMillion < 0 || value.Price.MaximumUnitCost != nil && *value.Price.MaximumUnitCost < 0 {
-				return nil, fmt.Errorf("model %q has negative price bound", key)
+			for _, rate := range []*int64{
+				value.Price.InputPerMillion,
+				value.Price.OutputPerMillion,
+				value.Price.CachedInputPerMillion,
+				value.Price.CacheWriteInputPerMillion,
+				value.Price.CacheWrite5mPerMillion,
+				value.Price.CacheWrite1hPerMillion,
+				value.Price.MaximumUnitCost,
+			} {
+				if rate != nil && *rate < 0 {
+					return nil, fmt.Errorf("model %q has negative price bound", key)
+				}
 			}
 		}
 		model := cloneModel(value)
@@ -246,23 +256,43 @@ func cloneModel(v core.Model) core.Model {
 		x := *v.OutputLimit
 		v.OutputLimit = &x
 	}
-	if v.Price != nil {
-		p := *v.Price
-		if p.InputPerMillion != nil {
-			x := *p.InputPerMillion
-			p.InputPerMillion = &x
-		}
-		if p.OutputPerMillion != nil {
-			x := *p.OutputPerMillion
-			p.OutputPerMillion = &x
-		}
-		if p.MaximumUnitCost != nil {
-			x := *p.MaximumUnitCost
-			p.MaximumUnitCost = &x
-		}
-		v.Price = &p
-	}
+	v.Price = clonePrice(v.Price)
 	return v
+}
+func clonePrice(src *core.PriceSchedule) *core.PriceSchedule {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	if src.InputPerMillion != nil {
+		x := *src.InputPerMillion
+		dst.InputPerMillion = &x
+	}
+	if src.OutputPerMillion != nil {
+		x := *src.OutputPerMillion
+		dst.OutputPerMillion = &x
+	}
+	if src.CachedInputPerMillion != nil {
+		x := *src.CachedInputPerMillion
+		dst.CachedInputPerMillion = &x
+	}
+	if src.CacheWriteInputPerMillion != nil {
+		x := *src.CacheWriteInputPerMillion
+		dst.CacheWriteInputPerMillion = &x
+	}
+	if src.CacheWrite5mPerMillion != nil {
+		x := *src.CacheWrite5mPerMillion
+		dst.CacheWrite5mPerMillion = &x
+	}
+	if src.CacheWrite1hPerMillion != nil {
+		x := *src.CacheWrite1hPerMillion
+		dst.CacheWrite1hPerMillion = &x
+	}
+	if src.MaximumUnitCost != nil {
+		x := *src.MaximumUnitCost
+		dst.MaximumUnitCost = &x
+	}
+	return &dst
 }
 func copyStrings(m map[string]string) map[string]string {
 	if m == nil {

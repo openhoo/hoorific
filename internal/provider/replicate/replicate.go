@@ -3,7 +3,10 @@ package replicate
 
 import (
 	"context"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"hoorific/internal/core"
 	"hoorific/internal/provider/endpoint"
@@ -61,6 +64,11 @@ func inventory() []endpoint.Route {
 	for i := range routes {
 		routes[i].Variant = "native"
 		routes[i].Response = responsePolicy(routes[i].Action)
+		switch routes[i].Action {
+		case "predictions.create", "models.predictions.create", "deployments.predictions.create":
+			routes[i].AllowedRequestHeaders = []string{"Prefer", "Cancel-After"}
+			routes[i].ValidateRequestHeaders = validateCreateHeaders
+		}
 	}
 	return routes
 }
@@ -72,6 +80,7 @@ func responsePolicy(action string) core.NativeResponsePolicy {
 			IDField: "id", StatusField: "status",
 			PollAction: "predictions.get", PollOperation: PredictionGet,
 			PollEndpoint: "v1/predictions/{id}", PollMethod: "GET",
+			ResultAction: "predictions.get", CancelAction: "predictions.cancel",
 			Async:               true,
 			ContinuationFields:  []string{"urls.get", "urls.cancel", "urls.stream"},
 			ContinuationMethods: map[string]string{"urls.get": "GET", "urls.cancel": "POST", "urls.stream": "GET"},
@@ -83,6 +92,7 @@ func responsePolicy(action string) core.NativeResponsePolicy {
 	case "predictions.get":
 		return core.NativeResponsePolicy{
 			IDField: "id", StatusField: "status",
+			ResultAction:        "predictions.get",
 			ContinuationFields:  []string{"urls.get", "urls.cancel", "urls.stream"},
 			ContinuationMethods: map[string]string{"urls.get": "GET", "urls.cancel": "POST", "urls.stream": "GET"},
 			ContinuationActions: map[string]string{"urls.get": "predictions.get", "urls.cancel": "predictions.cancel", "urls.stream": "stream.open"},
@@ -95,6 +105,94 @@ func responsePolicy(action string) core.NativeResponsePolicy {
 	default:
 		return core.NativeResponsePolicy{}
 	}
+}
+
+func validateCreateHeaders(headers http.Header) error {
+	if values := headers.Values("Prefer"); len(values) > 1 {
+		return invalidHeader("Prefer", "Replicate accepts one Prefer value")
+	} else if len(values) == 1 {
+		value := values[0]
+		if value != strings.TrimSpace(value) {
+			return invalidHeader("Prefer", "Replicate Prefer must not contain surrounding whitespace")
+		}
+		if value != "wait" {
+			if !strings.HasPrefix(value, "wait=") {
+				return invalidHeader("Prefer", "Replicate Prefer must be wait or wait=N")
+			}
+			rawWait := strings.TrimPrefix(value, "wait=")
+			if rawWait == "" || strings.IndexFunc(rawWait, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+				return invalidHeader("Prefer", "Replicate Prefer wait must be a decimal number")
+			}
+			n, err := strconv.Atoi(rawWait)
+			if err != nil || n < 1 || n > 60 {
+				return invalidHeader("Prefer", "Replicate Prefer wait must be between 1 and 60 seconds")
+			}
+		}
+	}
+	if values := headers.Values("Cancel-After"); len(values) > 1 {
+		return invalidHeader("Cancel-After", "Replicate accepts one Cancel-After value")
+	} else if len(values) == 1 {
+		value := values[0]
+		if value != strings.TrimSpace(value) {
+			return invalidHeader("Cancel-After", "Replicate Cancel-After must not contain surrounding whitespace")
+		}
+		if !validCancelAfter(value) {
+			return invalidHeader("Cancel-After", "Replicate Cancel-After must be a duration from 5 seconds through 24 hours")
+		}
+	}
+	return nil
+}
+
+func invalidHeader(name, message string) error {
+	return core.GatewayError{Code: "invalid_request", HTTPStatus: 400, Message: message, Param: name, Origin: "gateway"}
+}
+
+func validCancelAfter(value string) bool {
+	if value == "" {
+		return false
+	}
+	hasUnit := false
+	lastOrder := 4
+	seen := map[byte]bool{}
+	for i := 0; i < len(value); {
+		start := i
+		for i < len(value) && value[i] >= '0' && value[i] <= '9' {
+			i++
+		}
+		if start == i {
+			return false
+		}
+		if i == len(value) {
+			if hasUnit {
+				return false
+			}
+			break
+		}
+		unit := value[i]
+		i++
+		order := 0
+		switch unit {
+		case 'h':
+			order = 3
+		case 'm':
+			order = 2
+		case 's':
+			order = 1
+		default:
+			return false
+		}
+		if seen[unit] || order >= lastOrder {
+			return false
+		}
+		seen[unit] = true
+		hasUnit = true
+		lastOrder = order
+	}
+	if !hasUnit {
+		value += "s"
+	}
+	duration, err := time.ParseDuration(value)
+	return err == nil && duration >= 5*time.Second && duration <= 24*time.Hour
 }
 
 func invalid(message string) error {
