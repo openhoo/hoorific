@@ -1,5 +1,15 @@
 # hoorific Changelog
 
+## 0.3.0 (2026-09-09)
+
+### Features
+
+- **profiles:** add client identities and native Codex wire emulation (a949b35)
+
+### Other Changes
+
+- refresh console screenshots (063bc3d)
+
 ## 0.2.0 (2026-09-09)
 
 ### Features
