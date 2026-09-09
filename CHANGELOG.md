@@ -1,5 +1,15 @@
 # hoorific Changelog
 
+## 0.3.1 (2026-09-09)
+
+### Bug Fixes
+
+- **deps:** remediate Go gRPC and Rust OpenSSL (73c4e16)
+
+### Other Changes
+
+- refresh console screenshots (d388145)
+
 ## 0.3.0 (2026-09-09)
 
 ### Features
