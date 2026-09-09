@@ -1,0 +1,10 @@
+branches:
+  - main
+tagFormat: v${version}
+packages:
+  - name: hoorific
+    path: .
+    type: version-file
+    manifest: VERSION
+github:
+  releases: true

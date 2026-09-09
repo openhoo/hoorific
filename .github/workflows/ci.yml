@@ -11,7 +11,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep a main publication run alive while a screenshot-refresh push queues
+  # the next CI run. PR and non-publication runs may still be superseded.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   GOTOOLCHAIN: local
@@ -367,3 +369,252 @@ jobs:
           auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 --wrap=0)"
           git -c "http.extraheader=AUTHORIZATION: basic $auth" \
             push origin HEAD:refs/heads/main
+
+  publish-image:
+    name: Publish GHCR image
+    needs:
+      - verify
+      - publish-console-screenshots
+    if: >-
+      ${{
+        needs.verify.result == 'success' &&
+        needs.publish-console-screenshots.result == 'success' &&
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/main' &&
+        github.repository == 'openhoo/hoorific'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    concurrency:
+      group: publish-image-main
+      cancel-in-progress: false
+    steps:
+      - name: Check out CI-validated source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate current main and select source
+        id: source
+        env:
+          CI_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CI_SHA"
+          git fetch --force --no-tags origin main
+          current="$(git rev-parse refs/remotes/origin/main)"
+
+          validate_screenshot_delta() {
+            local base="$1"
+            local head="$2"
+            if ! git merge-base --is-ancestor "$base" "$head"; then
+              return 1
+            fi
+            while IFS=$'\t' read -r status path; do
+              [ -n "$status" ] || continue
+              if [ "$status" != M ]; then
+                return 1
+              fi
+              case "$path" in
+                docs/assets/console.webp|\
+                docs/assets/console-login.webp|\
+                docs/assets/console-models.webp|\
+                docs/assets/console-model-editor.webp|\
+                docs/assets/console-playground.webp|\
+                docs/assets/console-mobile.webp)
+                  ;;
+                *)
+                  return 1
+                  ;;
+              esac
+            done < <(git diff --name-status --no-renames "$base" "$head")
+          }
+
+          validate_release_delta() {
+            local base="$1"
+            local head="$2"
+            local version_seen=false
+            local changelog_seen=false
+            local count=0
+            while IFS=$'\t' read -r status path; do
+              [ -n "$status" ] || continue
+              count=$((count + 1))
+              case "$status:$path" in
+                M:VERSION)
+                  if [ "$version_seen" = true ]; then
+                    return 1
+                  fi
+                  version_seen=true
+                  ;;
+                A:CHANGELOG.md|M:CHANGELOG.md)
+                  if [ "$changelog_seen" = true ]; then
+                    return 1
+                  fi
+                  changelog_seen=true
+                  ;;
+                *)
+                  return 1
+                  ;;
+              esac
+            done < <(git diff --name-status --no-renames "$base" "$head")
+            [ "$count" -eq 2 ] &&
+              [ "$version_seen" = true ] &&
+              [ "$changelog_seen" = true ]
+          }
+
+          source="$current"
+          if [ "$current" != "$CI_SHA" ] &&
+            ! validate_screenshot_delta "$CI_SHA" "$current"; then
+            parent="$(git rev-parse --verify "${current}^" 2>/dev/null || true)"
+            if [ -z "$parent" ] ||
+              ! validate_screenshot_delta "$CI_SHA" "$parent"; then
+              echo "::error::main advanced beyond the CI SHA with changes outside the validated screenshot set." >&2
+              exit 1
+            fi
+            if ! validate_release_delta "$parent" "$current"; then
+              echo "::error::release retry commit changes paths outside VERSION and CHANGELOG.md." >&2
+              exit 1
+            fi
+
+            version="$(git show "$current:VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+][0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::main advanced to an unrecognized release commit; refusing publication." >&2
+              exit 1
+            fi
+            tag="v${version}"
+            subject="$(git log -1 --format=%s "$current")"
+            if [ "$subject" != "chore(release): hoorific ${version}" ]; then
+              echo "::error::release retry commit subject does not match VERSION." >&2
+              exit 1
+            fi
+            if ! git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"; then
+              echo "::error::release retry tag ${tag} is not available on origin." >&2
+              exit 1
+            fi
+            tag_commit="$(git rev-parse --verify "${tag}^{commit}" 2>/dev/null || true)"
+            if [ "$tag_commit" != "$current" ]; then
+              echo "::error::release retry tag ${tag} does not point at current main." >&2
+              exit 1
+            fi
+            echo "::notice::resuming the verified Hooversion release at ${current}"
+          fi
+
+          echo "source_sha=$source" >> "$GITHUB_OUTPUT"
+
+
+      - name: Check out selected main source
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git checkout --force -B main "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain)"
+
+      - name: Run Hooversion release
+        id: release
+        uses: openhoo/hooversion/actions/release@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
+        with:
+          version: "1.1.1"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          push: true
+          github: true
+
+      - name: Resolve release metadata and image tags
+        id: image-metadata
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HOOVERSION_PUBLISHED: ${{ steps.release.outputs.published }}
+          HOOVERSION_VERSION: ${{ steps.release.outputs.version }}
+          HOOVERSION_TAG: ${{ steps.release.outputs.tag }}
+          HOOVERSION_RELEASES_JSON: ${{ steps.release.outputs['releases-json'] }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          short_sha="${commit:0:7}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          release_count="$(jq -er 'if type == "array" then length else error("releases-json must be an array") end' <<<"$HOOVERSION_RELEASES_JSON")"
+
+          case "$HOOVERSION_PUBLISHED" in
+            false)
+              test "$release_count" -eq 0
+              test -z "$HOOVERSION_VERSION"
+              test -z "$HOOVERSION_TAG"
+              ;;
+            true)
+              test "$release_count" -eq 1
+              version="$HOOVERSION_VERSION"
+              tag="$HOOVERSION_TAG"
+              if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+][0-9A-Za-z.-]+)?$ ]]; then
+                echo "::error::Hooversion returned an invalid version." >&2
+                exit 1
+              fi
+              test "$tag" = "v${version}"
+              test "$(tr -d '[:space:]' < VERSION)" = "$version"
+              test "$(jq -er '.[0].version' <<<"$HOOVERSION_RELEASES_JSON")" = "$version"
+              test "$(jq -er '.[0].tag' <<<"$HOOVERSION_RELEASES_JSON")" = "$tag"
+              test "$(git rev-parse --verify "${tag}^{commit}")" = "$commit"
+              test "$(git log -1 --format=%s "$commit")" = "chore(release): hoorific ${version}"
+              minor="${version%.*}"
+              if [[ ! "$minor" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                echo "::error::cannot derive a safe minor image tag." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::unexpected Hooversion published output: ${HOOVERSION_PUBLISHED}" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "commit=$commit"
+            echo "short_sha=$short_sha"
+            echo "published=$HOOVERSION_PUBLISHED"
+            echo "version=${HOOVERSION_VERSION:-}"
+            echo "tag=${HOOVERSION_TAG:-}"
+            echo "tags<<EOF"
+            echo "${image}:sha-${short_sha}"
+            echo "${image}:latest"
+            if [ "$HOOVERSION_PUBLISHED" = true ]; then
+              echo "${image}:${HOOVERSION_VERSION}"
+              echo "${image}:${minor}"
+            fi
+            echo "EOF"
+            echo "labels<<EOF"
+            echo "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.revision=${commit}"
+            if [ "$HOOVERSION_PUBLISHED" = true ]; then
+              echo "org.opencontainers.image.version=${HOOVERSION_VERSION}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push GHCR image
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image-metadata.outputs.tags }}
+          labels: ${{ steps.image-metadata.outputs.labels }}
+          provenance: false
+          sbom: false

@@ -1,6 +1,11 @@
 # Deployment
 
-Hoorific is distributed here as source and build recipes. The repository does not publish a container image or release artifact yet; build `hoorific:local` or provide an image from a registry you control before using the Helm chart.
+Hoorific is distributed as source and build recipes. The `publish-image` job in
+`.github/workflows/ci.yml` is configured to publish
+`ghcr.io/openhoo/hoorific` after `verify` and
+`publish-console-screenshots` succeed for a push to `main`; pull requests,
+forks, manual runs, and non-`main` pushes do not publish. Local `hoorific:local`
+Docker and Podman builds remain supported.
 
 The Dockerfile produces one statically linked gateway image with two executable entrypoints:
 
@@ -11,6 +16,32 @@ The final image is based on `scratch`. It contains only the gateway, the CA trus
 
 All paths beginning with `.artifacts/` in this document are private operator-local output paths. They are not shipped proof files or public repository assets.
 Once the runtime is configured, use the [Console guide](console.md) for the embedded operator workflow, including model collection and editing, routing setup, and the playground. Its screenshots use isolated synthetic fixtures rather than live-provider data.
+## Published image and releases
+
+The CI workflow's `publish-image` job runs after its `verify` and
+`publish-console-screenshots` jobs succeed for a push to `main`. Pull requests,
+forks, manual runs, and non-`main` pushes do not publish. Hooversion reads the
+root `VERSION` file and follows Conventional Commits: `feat` makes a minor
+release, `fix` and `perf` make patch releases, and `!` or a `BREAKING CHANGE:`
+footer makes a major release. Release commits and merge/revert noise are
+ignored.
+
+The workflow uses the repository-default `GITHUB_TOKEN`; no PAT is needed when
+repository policy permits the required Actions permissions. The initial GHCR
+package may be private. Set its visibility to Public in the GitHub package
+settings when anonymous pulls are required; private packages need registry
+authentication.
+
+When Hooversion reports a release, the job creates a `v<version>` Git tag and
+GitHub Release and publishes the corresponding image at
+`ghcr.io/openhoo/hoorific` with unprefixed `<version>` and `<major>.<minor>`
+semver tags, plus `latest` and `sha-<7-char-commit>`. When no release is due,
+`VERSION` stays unchanged and publication emits only `latest` and the actual
+commit's `sha-<7-char-commit>` tag; no semver tag is invented. Prefer a full
+semver or SHA tag for reproducible deployments; `latest` is mutable.
+
+To use a published image in the chart, select the repository and a pinned tag
+or digest explicitly as shown below.
 
 ## Configuration
 
@@ -330,14 +361,16 @@ For a local authenticated console, use the native loopback flow in the README. F
 
 The chart is a cluster-mode template around external PostgreSQL and mandatory external Redis coordination. It expects externally created Secrets and does not generate or own the PostgreSQL DSN, Redis URL, OIDC client secret, or master key. Provision the referenced Secret names and keys first, then supply cluster configuration through values. The migration Job runs as a Helm pre-install/pre-upgrade hook; the serve Deployment is separate. The chart also creates separate inference and management Services, probes, a PodDisruptionBudget, anti-affinity, and configurable NetworkPolicies.
 
-The checked-in `values.yaml` image (`ghcr.io/example/hoorific:0.1.0`) is deliberately a placeholder, not a published image. Build and publish an image you control, then override the repository and pin a tag or digest:
+The checked-in `values.yaml` image (`ghcr.io/example/hoorific:0.1.0`) is
+deliberately a placeholder. For the published image, set the repository to
+`ghcr.io/openhoo/hoorific` and pin a full semver or SHA tag (or a digest):
 
 ```sh
 helm upgrade --install hoorific ./charts/hoorific \
   --namespace hoorific --create-namespace \
   --values deploy/hoorific-values.yaml \
-  --set image.repository=registry.example/your-team/hoorific \
-  --set image.tag=operator-chosen-tag \
+  --set image.repository=ghcr.io/openhoo/hoorific \
+  --set image.tag=1.2.3 \
   --set config.coordination.redis.enabled=true \
   --set existingSecrets.redis.secretName=hoorific-redis \
   --set existingSecrets.redis.key=url

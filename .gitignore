@@ -75,6 +75,9 @@ Thumbs.db
 *.test
 *.prof
 *.out
+# Hooversion release output
+/.hooversion/
+/.release-version
 
 # Generated console sources and assets (rebuilt from schema and web sources)
 /internal/console/assets/

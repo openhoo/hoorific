@@ -18,7 +18,13 @@ Route compatible inference requests through explicit connections, credentials, p
 
 Hoorific is a Go gateway for teams that need a small, inspectable control plane in front of model providers and compatible endpoints. The inference listener and management listener are separate; the management API and same-origin React console configure the resources that the gateway is allowed to use.
 
-> **Publication status**  Hoorific is published as source. This repository does not currently publish a container image or a release artifact. Build the image locally, or publish it to a registry you control before using the Helm chart.
+> **Publication status** The `publish-image` job in `.github/workflows/ci.yml`
+> is configured to publish `ghcr.io/openhoo/hoorific` after `verify` and
+> `publish-console-screenshots` succeed for a push to `main`; pull requests,
+> forks, manual runs, and non-`main` pushes do not publish. The initial GHCR
+> package may be private; make it public in GitHub package settings for
+> anonymous pulls. See [Releases and image tags](#releases-and-image-tags);
+> local Docker and Podman builds remain supported.
 
 ## What it provides
 
@@ -207,8 +213,27 @@ change the peer address; do not weaken the guard. Use the native quickstart for
 a local bootstrap flow, or configure OIDC and an intentional network/TLS design
 for a container deployment.
 
-No container image is published by this repository. Build locally or provide
-an image from a registry you control before using the Helm chart.
+### Releases and image tags
+
+The CI workflow's `publish-image` job runs after `verify` and
+`publish-console-screenshots` succeed for a push to `main`. Hooversion reads
+`VERSION` and uses Conventional Commits: `feat` makes a minor release, `fix`
+and `perf` make patch releases, and `!` or a `BREAKING CHANGE:` footer makes a
+major release. Release commits and merge/revert noise are ignored. The
+workflow uses the repository-default `GITHUB_TOKEN`; no PAT is needed when
+repository policy permits the required Actions permissions.
+
+The initial GHCR package may be private. Set its visibility to Public in the
+GitHub package settings when anonymous pulls are required; private packages
+need registry authentication.
+
+When Hooversion reports a release, the job creates a `v<version>` Git tag and
+GitHub Release and publishes the corresponding image at
+`ghcr.io/openhoo/hoorific` with unprefixed `<version>` and `<major>.<minor>`
+semver tags, plus `latest` and `sha-<7-char-commit>`. A successful CI run with
+no release publishes only `latest` and `sha-<7-char-commit>`; it leaves
+`VERSION` unchanged and does not invent a semver tag. Use a full semver or SHA
+tag for reproducible deployments; `latest` is mutable.
 
 ## Build from source
 
@@ -282,7 +307,7 @@ For a repeatable traffic measurement against a provisioned gateway and determini
 
 - **Provider access is explicit.** Subscription connectors and default cloud credential chains require opt-in. The verifier does not discover ambient host or CLI credentials. Live qualification requires operator-supplied authenticated files and enforces a spend ceiling before dispatch.
 - **Kubernetes is a template, not a claim of deployment.** The Helm chart requires an image you build or publish plus externally managed PostgreSQL, encryption, and Redis secrets; OIDC is optional. The default chart uses external PostgreSQL and ephemeral `emptyDir` data; choose persistence and network policy deliberately.
-- **No image or release is implied.** Until a release workflow and registry are intentionally configured, use locally built images or your own registry coordinates.
+- **Published image and release are CI-gated.** Successful `main` CI publication targets `ghcr.io/openhoo/hoorific`; pin a full version or SHA tag for deployments, or build locally with Docker/Podman.
 - **Management exposure is deliberate.** Keep the management listener on a private network or loopback unless you have configured TLS, trusted origins, authentication, and network controls for your environment.
 
 ## Documentation and project links
