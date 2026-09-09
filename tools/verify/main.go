@@ -46,7 +46,7 @@ type report struct {
 func main() {
 	binary := flag.String("binary", "", "built gateway executable (required)")
 	mode := flag.String("mode", "standalone", "standalone or cluster")
-	scenario := flag.String("scenario", "all", "all, smoke, protocol, docs-capture, sdk, browser, security, streaming, resources, governance, cluster/governance, credentials, credential-lifecycle, realtime, realtime/bedrock, operations, operations/fal, cost-safety, deep-admin, deep-protocol, packaging, live")
+	scenario := flag.String("scenario", "all", "all, smoke, protocol, docs-capture, sdk, browser, security, streaming, resources, governance, cluster/governance, credentials, credential-lifecycle, realtime, realtime/bedrock, operations, operations/fal, cost-safety, deep-admin, deep-protocol, packaging, telemetry, live")
 	allowPaid := flag.Bool("allow-paid", false, "permit explicitly requested live qualification (still requires credentials)")
 	connections := flag.String("connections", "", "comma-separated configured connection IDs for live qualification")
 	keyFile := flag.String("gateway-key-file", "", "optional gateway key file for routed scenarios")
@@ -100,7 +100,7 @@ func main() {
 		finish(rep, *out)
 		os.Exit(2)
 	}
-	valid := map[string]bool{"all": true, "smoke": true, "protocol": true, "docs-capture": true, "sdk": true, "browser": true, "security": true, "streaming": true, "resources": true, "governance": true, "cluster/governance": true, "credentials": true, "credential-lifecycle": true, "realtime": true, "realtime/bedrock": true, "operations": true, "operations/fal": true, "cost-safety": true, "packaging": true}
+	valid := map[string]bool{"all": true, "smoke": true, "protocol": true, "docs-capture": true, "sdk": true, "browser": true, "security": true, "streaming": true, "resources": true, "governance": true, "cluster/governance": true, "credentials": true, "credential-lifecycle": true, "realtime": true, "realtime/bedrock": true, "operations": true, "operations/fal": true, "cost-safety": true, "packaging": true, "telemetry": true}
 	valid["deep-admin"], valid["deep-protocol"] = true, true
 	valid["browser"] = true
 	if !valid[*scenario] {
@@ -133,7 +133,17 @@ func main() {
 		finish(rep, *out)
 		os.Exit(2)
 	}
-	env, err := newEnvironment(*mode, *config, *fixtureMode)
+	var env *environment
+	var telemetry *telemetryQualification
+	var err error
+	if *scenario == "telemetry" {
+		telemetry, err = newTelemetryQualification(*mode)
+		if err == nil {
+			env = telemetry.env
+		}
+	} else {
+		env, err = newEnvironment(*mode, *config, *fixtureMode)
+	}
 	if err != nil {
 		add(result{"setup", "failed", err.Error(), 0, nil})
 		finish(rep, *out)
@@ -146,6 +156,9 @@ func main() {
 			rep.Diagnostics = diagnostics
 		}
 		env.Close()
+		if telemetry != nil {
+			telemetry.closeCollector()
+		}
 		finish(rep, *out)
 		os.Exit(2)
 	}
@@ -164,7 +177,7 @@ func main() {
 		add(env.authRejection())
 	}
 	if key == "" {
-		for _, name := range []string{"protocol", "sdk", "browser", "security", "streaming", "resources", "governance", "cluster/governance", "credentials", "credential-lifecycle", "realtime", "realtime/bedrock", "operations", "operations/fal", "cost-safety", "deep-admin", "deep-protocol"} {
+		for _, name := range []string{"protocol", "sdk", "browser", "security", "streaming", "resources", "governance", "cluster/governance", "credentials", "credential-lifecycle", "realtime", "realtime/bedrock", "operations", "operations/fal", "cost-safety", "deep-admin", "deep-protocol", "telemetry"} {
 			if *scenario == "all" || *scenario == name {
 				add(result{name, "failed", "required gateway key could not be seeded; scenario cannot execute", 0, nil})
 			}
@@ -217,6 +230,8 @@ func main() {
 			focused = env.extSDK
 		case "cluster/governance":
 			focused = env.clusterScenarios
+		case "telemetry":
+			focused = func() []result { return telemetry.exercise(key) }
 		}
 		if focused != nil {
 			verificationProgress(*scenario, "started", 0)
@@ -274,6 +289,15 @@ func main() {
 		}
 	}
 	env.Close()
+	if telemetry != nil {
+		add(telemetry.shutdownResult())
+		telemetry.closeCollector()
+	}
+	if *scenario == "all" {
+		for _, r := range runTelemetryQualification(*mode, *binary, *out) {
+			add(r)
+		}
+	}
 	finish(rep, *out)
 	if rep.Failed > 0 {
 		os.Exit(1)

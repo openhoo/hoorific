@@ -6,6 +6,7 @@
 
 - publish Hoorific AI gateway (d8b76bb)
 - harden provider cost safety and improve operations console (cbf8b19)
+- add opt-in OTLP telemetry fan-out and Secret-backed Helm exporter headers
 
 ### Bug Fixes
 

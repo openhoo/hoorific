@@ -116,8 +116,25 @@ func (g *Gateway) reconcileNativeJob(ctx context.Context, job resource.Job, s co
 	if job.LeaseOwner != owner || job.Fence <= 0 || !job.LeaseUntil.After(time.Now()) {
 		return false, fmt.Errorf("native job lease expired")
 	}
+	settlementOperation := meta.Binding.Codec.Operation
+	if settlementOperation == "" {
+		settlementOperation = core.Operation(job.Operation)
+	}
+	settle := func() (bool, error) {
+		settled, e := g.settleNativeJob(ctx, job, meta, owner)
+		if e == nil && settled {
+			provider := telemetryProvider(c.Connector)
+			gatewayRecordStandaloneUsage(ctx, telemetryOperation(settlementOperation, meta.Binding.Codec.Protocol), provider, "success", job.Usage)
+		}
+		return settled, e
+	}
 	if job.SettlementPending {
-		return g.settleNativeJob(ctx, job, meta, owner)
+		settled, e := settle()
+		if e == nil && settled {
+			provider := telemetryProvider(c.Connector)
+			slog.InfoContext(ctx, "gateway completion", slog.String(genAIOperationName, telemetryOperation(settlementOperation, meta.Binding.Codec.Protocol)), slog.String(genAIProviderName, provider), slog.String(gatewayOutcomeAttr, "success"), slog.Bool(gatewayReconcileAttr, true))
+		}
+		return settled, e
 	}
 	if meta.Policy.PollEndpoint == "" || meta.Policy.PollAction == "" {
 		return false, nil
@@ -176,20 +193,36 @@ func (g *Gateway) reconcileNativeJob(ctx context.Context, job resource.Job, s co
 	if client == nil {
 		return false, fmt.Errorf("native reconciliation HTTP client unavailable")
 	}
+	pollCtx, pollSpan := gatewayStartReconcile(ctx, operation, c.Connector)
+	pollOutcome := "unknown"
+	var pollErr error
+	defer func() {
+		gatewayEndReconcile(pollCtx, pollSpan, string(operation), telemetryProvider(c.Connector), pollOutcome, pollErr, job.Usage)
+	}()
+	req = req.WithContext(pollCtx)
+	injectGatewayTrace(pollCtx, req)
+	client = gatewayTraceClient(client)
 	resp, err := client.Do(req)
 	if err != nil {
+		pollErr = err
 		return false, nil
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, nativeAckLimit+1))
 	if err != nil || len(data) > nativeAckLimit {
+		pollErr = err
+		if pollErr == nil {
+			pollOutcome = "error"
+		}
 		return false, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		pollOutcome = "rejected"
 		return false, nil
 	}
 	status := nativeStatus(data, meta.Policy.StatusField)
 	if status == "" {
+		pollOutcome = "error"
 		return false, nil
 	}
 	job.Status = status
@@ -197,16 +230,31 @@ func (g *Gateway) reconcileNativeJob(ctx context.Context, job resource.Job, s co
 	job.UpdatedAt = time.Now()
 	job.SettlementPending = nativeTerminal(meta.Policy, status)
 	if !job.SettlementPending {
+		pollOutcome = "job_pending"
 		job.NextPoll = time.Now().Add(2 * time.Second)
 		job.LeaseOwner = ""
 		job.LeaseUntil = time.Time{}
-		return false, g.deps.Resources.UpdateJob(ctx, job, owner, job.Fence)
+		if updateErr := g.deps.Resources.UpdateJob(ctx, job, owner, job.Fence); updateErr != nil {
+			pollErr = updateErr
+			pollOutcome = "error"
+			return false, updateErr
+		}
+		return false, nil
 	}
 	// Persist terminal evidence while keeping SQL settlement claimable across a crash.
 	if err = g.deps.Resources.UpdateJob(ctx, job, owner, job.Fence); err != nil {
+		pollErr = err
+		pollOutcome = "error"
 		return false, err
 	}
-	return g.settleNativeJob(ctx, job, meta, owner)
+	settled, settleErr := settle()
+	if settleErr != nil {
+		pollErr = settleErr
+		pollOutcome = "error"
+		return false, settleErr
+	}
+	pollOutcome = "success"
+	return settled, nil
 }
 
 func (g *Gateway) settleNativeJob(ctx context.Context, job resource.Job, meta nativeJobMetadata, owner string) (bool, error) {

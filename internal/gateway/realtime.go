@@ -87,6 +87,8 @@ func (g *Gateway) executeRealtime(ctx context.Context, w http.ResponseWriter, r 
 	if len(b.Realtime.Subprotocols) > 0 && len(protocols) == 0 {
 		return outcome, failure("unsupported_operation", 400, "no supported realtime subprotocol was offered")
 	}
+	injectGatewayTraceHeaders(sessionCtx, headers)
+	gatewayMarkAttemptIssued(ctx)
 	outcome.State = "outcome_unknown"
 	server, response, err := websocket.Dial(sessionCtx, u.String(), &websocket.DialOptions{HTTPClient: client, HTTPHeader: headers, Subprotocols: protocols, CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
@@ -180,7 +182,8 @@ func (g *Gateway) executeWebRTC(ctx context.Context, w http.ResponseWriter, r *h
 	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/sdp") {
 		return outcome, failure("invalid_request", 400, "WebRTC setup requires application/sdp")
 	}
-	up.Header.Set("Content-Type", r.Header.Get("Content-Type"))
+	gatewayMarkAttemptIssued(ctx)
+	injectGatewayTrace(ctx, up)
 	outcome.State = "outcome_unknown"
 	response, err := client.Do(up)
 	if err != nil {
@@ -385,6 +388,7 @@ func (g *Gateway) executeDuplex(ctx context.Context, w http.ResponseWriter, r *h
 		}
 		return http.NewResponseController(w).Flush()
 	}
+	gatewayMarkAttemptIssued(ctx)
 	outcome.State = "outcome_unknown"
 	err = executor.ExecuteDuplex(runCtx, t.connection, t.model.ID, lease, client, input, output)
 	cancel()

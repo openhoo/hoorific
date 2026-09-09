@@ -57,6 +57,27 @@ config:
   subscriptionConnectors:
     enabled: false
 
+  # Opt-in OpenTelemetry export. Exporter header files are referenced by path
+  # only; each exporter may use an existing Secret through headersSecret below.
+  # The chart never writes header values into either ConfigMap.
+  telemetry:
+    enabled: false
+    serviceName: hoorific
+    serviceVersion: ""
+    environment: ""
+    sampleRatio: 1
+    exporters: []
+    # Example exporter (leave exporters empty to use the runtime's OTEL_* env
+    # defaults when telemetry is enabled):
+    # - name: grafana
+    #   protocol: http/protobuf
+    #   endpoint: https://otlp.example.invalid
+    #   headersFile: /etc/hoorific/secrets/telemetry-grafana-headers.json
+    #   headersSecret:
+    #     secretName: grafana-otlp
+    #     key: headers.json
+    #   insecure: false
+    #   signals: [traces, metrics]
 # The migration command runs before install/upgrade. Adjust only if the image
 # provides a compatible command; the chart does not validate the executable.
 commands:
@@ -145,7 +166,8 @@ networkPolicy:
   enabled: true
   # Empty ingress is default-deny; add `from` peers (for example an ingress controller).
   ingress: []
-  # Egress is default-deny except DNS. Add CIDRs for external PostgreSQL/Redis/OIDC.
+  # Egress is default-deny except DNS. Add external PostgreSQL, Redis, OIDC,
+  # provider, and collector/backend destinations as needed.
   egress:
     - to:
         - namespaceSelector:

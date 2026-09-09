@@ -111,6 +111,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, x.protocol, err)
 		return
 	}
+	ctx, requestTelemetry := gatewayStartRequest(r, x)
+	defer gatewayEndRequest(ctx, requestTelemetry)
+	r = r.WithContext(ctx)
 	w, finishMetrics := g.deps.Metrics.Wrap(w, x.protocol)
 	defer finishMetrics()
 	if g.draining.Load() {
@@ -234,6 +237,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	gatewaySetRequestedModel(ctx, x.model)
 	ctx, x.requirements, err = g.portableRequirements(ctx, x, raw, fields)
 	if err != nil {
 		writeError(w, x.protocol, err)
@@ -274,7 +278,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if replay != nil {
-				_ = writeIdempotencyReplay(w, replay)
+				replayErr := writeIdempotencyReplay(w, replay)
+				if replayErr == nil && replay.Status >= 200 && replay.Status < 300 {
+					gatewayMarkRequestSuccess(ctx)
+				}
 				return
 			}
 			idem.write = newIdempotencyCaptureWriter(w)
@@ -312,7 +319,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if replay != nil {
-			_ = writeIdempotencyReplay(w, replay)
+			replayErr := writeIdempotencyReplay(w, replay)
+			if replayErr == nil && replay.Status >= 200 && replay.Status < 300 {
+				gatewayMarkRequestSuccess(ctx)
+			}
 			return
 		}
 		idem.write = newIdempotencyCaptureWriter(w)
@@ -329,6 +339,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		t := candidates[attempt]
 		if attempt > 0 {
+			gatewayRecordRetry(ctx)
 			g.deps.Metrics.Retry(x.protocol)
 			fresh, e := g.deps.Snapshots.Snapshot(ctx)
 			if e != nil {
@@ -506,7 +517,7 @@ func (g *Gateway) targets(ctx context.Context, s core.RuntimeSnapshot, p core.Pr
 	}
 	return result, nil
 }
-func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Request, p core.Principal, x route, s core.RuntimeSnapshot, t selected, raw []byte, fields map[string]json.RawMessage, id string) (bool, error) {
+func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Request, p core.Principal, x route, s core.RuntimeSnapshot, t selected, raw []byte, fields map[string]json.RawMessage, id string) (retry bool, returnErr error) {
 	var binding core.Binding
 	var err error
 	op := x.operation
@@ -575,6 +586,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 			if payload == nil {
 				return false, failure("invalid_request", 400, "portable request was not decoded")
 			}
+			gatewaySetRequestPayload(ctx, payload)
 			if conversation, ok := payload.(core.Conversation); ok && x.protocol == "openai-chat" {
 				suppressUsage = conversation.StreamIncludeUsage == nil || !*conversation.StreamIncludeUsage
 			}
@@ -718,6 +730,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		client = &isolated
 	}
+	client = gatewayTraceClient(client)
 	deadline, _ := ctx.Deadline()
 	plan := core.AttemptPlan{TenantID: p.TenantID, RequestID: id, AttemptID: requestID(), KeyID: p.KeyID, KeyRevision: p.KeyRevision, ConfigRevision: s.Revision, ConnectionID: t.connection.ID, AccountID: t.connection.AccountID, ModelID: t.model.CatalogID, Deadline: deadline}
 	plan, err = g.deps.Planner.PlanAttempt(ctx, p, s, t.target, op, body, plan)
@@ -728,6 +741,8 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if err != nil {
 		return false, markPreIntentStale(err)
 	}
+	ctx, attemptTelemetry := gatewayStartAttempt(ctx, x, binding, op, t.model.ID, t.connection.Connector, stream, gatewayIsRetry(ctx))
+	req = req.WithContext(ctx)
 	g.deps.Metrics.Attempt(binding.Codec.Protocol, op, t.connection.Connector)
 	outcome := core.AttemptOutcome{TenantID: permit.TenantID, RequestID: permit.RequestID, AttemptID: permit.AttemptID, State: "outcome_unknown"}
 	finalized := false
@@ -737,6 +752,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		}
 	}()
 	defer func() { g.deps.Metrics.Outcome(x.protocol, outcome) }()
+	defer func() { gatewayEndAttempt(ctx, attemptTelemetry, outcome, returnErr) }()
 	if err = ctx.Err(); err != nil {
 		outcome.State = "not_executed"
 		return false, err
@@ -754,6 +770,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return false, failure("unavailable", 503, "upstream authorization failed")
 		}
 	}
+	injectGatewayTrace(ctx, req)
 	if binding.Framing == "h2-eventstream-duplex" {
 		outcome, err = g.executeDuplex(ctx, w, r, p, t, binding, plan, permit, lease, client, id)
 		return false, err
@@ -766,6 +783,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		outcome, err = g.executeRealtime(ctx, w, r, p, t, binding, plan, permit, req, client, id)
 		return false, err
 	}
+	gatewayMarkAttemptIssued(ctx)
 	response, err := client.Do(req)
 	if err != nil {
 		g.recordUnknownNative(ctx, p, t, binding, permit, id)
@@ -900,6 +918,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 				}
 				break
 			}
+			gatewayObserveEvent(ctx, event)
 			if usage, ok := event.(core.Usage); ok {
 				outcome.Usage = &usage
 				if suppressUsage {
@@ -936,6 +955,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		markIdempotency(ctx, "unknown")
 		return false, failure("upstream_outcome_unknown", 502, "upstream result could not be decoded")
 	}
+	gatewayObserveResult(ctx, result)
 	var encoded bytes.Buffer
 	if err = input.Result.EncodeResult(ctx, result, &encoded); err != nil {
 		markIdempotency(ctx, "unknown")
@@ -1124,7 +1144,9 @@ func (g *Gateway) models(w http.ResponseWriter, r *http.Request, p core.Principa
 		for _, item := range items {
 			models = append(models, map[string]any{"name": "models/" + item["id"].(string)})
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"models": models})
+		if err := json.NewEncoder(w).Encode(map[string]any{"models": models}); err == nil {
+			gatewayMarkRequestSuccess(r.Context())
+		}
 		return
 	}
 	if x.protocol == "anthropic-messages" {
@@ -1138,8 +1160,12 @@ func (g *Gateway) models(w http.ResponseWriter, r *http.Request, p core.Principa
 			first = models[0]["id"]
 			last = models[len(models)-1]["id"]
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": models, "has_more": false, "first_id": first, "last_id": last})
+		if err := json.NewEncoder(w).Encode(map[string]any{"data": models, "has_more": false, "first_id": first, "last_id": last}); err == nil {
+			gatewayMarkRequestSuccess(r.Context())
+		}
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": items})
+	if err := json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": items}); err == nil {
+		gatewayMarkRequestSuccess(r.Context())
+	}
 }

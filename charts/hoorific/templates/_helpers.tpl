@@ -68,12 +68,49 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $oidcClientID = .Values.config.oidc.clientId -}}
 {{- $oidcSecretFile = .Values.config.oidc.clientSecretFile -}}
 {{- end -}}
+{{- $telemetry := default (dict) .Values.config.telemetry -}}
+{{- $telemetryEnabled := default false (index $telemetry "enabled") -}}
+{{- $serviceName := "hoorific" -}}
+{{- if hasKey $telemetry "serviceName" }}{{- $serviceName = index $telemetry "serviceName" -}}{{- end -}}
+{{- $serviceVersion := default "" (index $telemetry "serviceVersion") -}}
+{{- $environment := default "" (index $telemetry "environment") -}}
+{{- $sampleRatio := float64 1 -}}
+{{- if hasKey $telemetry "sampleRatio" -}}
+{{- $sampleRatioValue := index $telemetry "sampleRatio" -}}
+{{- if not (or (kindIs "int" $sampleRatioValue) (kindIs "int8" $sampleRatioValue) (kindIs "int16" $sampleRatioValue) (kindIs "int32" $sampleRatioValue) (kindIs "int64" $sampleRatioValue) (kindIs "uint" $sampleRatioValue) (kindIs "uint8" $sampleRatioValue) (kindIs "uint16" $sampleRatioValue) (kindIs "uint32" $sampleRatioValue) (kindIs "uint64" $sampleRatioValue) (kindIs "float32" $sampleRatioValue) (kindIs "float64" $sampleRatioValue)) }}{{ fail "Values.config.telemetry.sampleRatio must be numeric" }}{{ end -}}
+{{- $sampleRatio = float64 $sampleRatioValue -}}
+{{- end -}}
+{{- if or (lt $sampleRatio 0.0) (gt $sampleRatio 1.0) }}{{ fail "Values.config.telemetry.sampleRatio must be between 0 and 1" }}{{ end -}}
+{{- $exporters := default (list) (index $telemetry "exporters") -}}
+{{- $exporterConfigs := list -}}
+{{- $seenExporterNames := dict -}}
+{{- range $index, $exporter := $exporters }}
+{{- $name := required (printf "Values.config.telemetry.exporters[%d].name is required" $index) (index $exporter "name") -}}
+{{- if hasKey $seenExporterNames $name }}{{ fail (printf "Values.config.telemetry.exporters contains duplicate name %q" $name) }}{{ end -}}
+{{- $_ := set $seenExporterNames $name true -}}
+{{- $protocol := required (printf "Values.config.telemetry.exporters[%d].protocol is required" $index) (index $exporter "protocol") -}}
+{{- if and (ne $protocol "http/protobuf") (ne $protocol "grpc") }}{{ fail (printf "Values.config.telemetry.exporters[%d].protocol must be http/protobuf or grpc" $index) }}{{ end -}}
+{{- $endpoint := required (printf "Values.config.telemetry.exporters[%d].endpoint is required" $index) (index $exporter "endpoint") -}}
+{{- $headersFile := default "" (index $exporter "headersFile") -}}
+{{- $headersSecret := default (dict) (index $exporter "headersSecret") -}}
+{{- if $headersFile }}
+{{- if not (index $headersSecret "secretName") }}{{ fail (printf "Values.config.telemetry.exporters[%d].headersSecret.secretName is required when headersFile is set" $index) }}{{ end -}}
+{{- if not (index $headersSecret "key") }}{{ fail (printf "Values.config.telemetry.exporters[%d].headersSecret.key is required when headersFile is set" $index) }}{{ end -}}
+{{- else if or (index $headersSecret "secretName") (index $headersSecret "key") }}{{ fail (printf "Values.config.telemetry.exporters[%d].headersFile is required when headersSecret is set" $index) }}{{ end -}}
+{{- $signals := default (list) (index $exporter "signals") -}}
+{{- range $signal := $signals }}
+{{- if not (has $signal (list "traces" "metrics" "logs")) }}{{ fail (printf "Values.config.telemetry.exporters[%d].signals contains unsupported signal %q" $index $signal) }}{{ end -}}
+{{- end -}}
+{{- $insecure := default false (index $exporter "insecure") -}}
+{{- $exporterConfigs = append $exporterConfigs (dict "name" $name "protocol" $protocol "endpoint" $endpoint "headers_file" $headersFile "insecure" $insecure "signals" $signals) -}}
+{{- end -}}
 {{- $redis := dict "url_file" $redisURLFile -}}
 {{- $oidc := dict "issuer" $oidcIssuer "client_id" $oidcClientID "client_secret_file" $oidcSecretFile -}}
 {{- $storage := dict "postgres" (dict "dsn_file" $dsnFile) -}}
 {{- $coordination := dict "redis" $redis -}}
 {{- $encryption := dict "key_file" $keyFile -}}
 {{- $listeners := dict "inference" $inferenceListener "management" $managementListener -}}
-{{- $cfg := dict "schema_version" .Values.config.schemaVersion "mode" .Values.config.mode "data_dir" $dataDir "listeners" $listeners "storage" $storage "coordination" $coordination "encryption" $encryption "oidc" $oidc "public_urls" .Values.config.publicUrls "subscription_connectors" (dict "enabled" .Values.config.subscriptionConnectors.enabled) -}}
+{{- $telemetryConfig := dict "enabled" $telemetryEnabled "service_name" $serviceName "service_version" $serviceVersion "environment" $environment "sample_ratio" $sampleRatio "exporters" $exporterConfigs -}}
+{{- $cfg := dict "schema_version" .Values.config.schemaVersion "mode" .Values.config.mode "data_dir" $dataDir "listeners" $listeners "storage" $storage "coordination" $coordination "encryption" $encryption "oidc" $oidc "public_urls" .Values.config.publicUrls "subscription_connectors" (dict "enabled" .Values.config.subscriptionConnectors.enabled) "telemetry" $telemetryConfig -}}
 {{- toJson $cfg -}}
 {{- end -}}

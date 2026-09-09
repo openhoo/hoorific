@@ -29,6 +29,7 @@ import (
 	"hoorific/internal/gateway"
 	"hoorific/internal/protocol"
 	"hoorific/internal/store"
+	"hoorific/internal/telemetry"
 	"hoorific/internal/transport"
 )
 
@@ -162,6 +163,15 @@ func run(args []string) error {
 	return serve(cfg, db, keys)
 }
 func serve(cfg core.BootstrapConfig, db *store.Store, keys credential.Keyring) error {
+	telemetryRuntime, err := telemetry.Setup(context.Background(), cfg.Telemetry)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := telemetryRuntime.Shutdown(context.Background()); err != nil {
+			slog.Warn("telemetry shutdown incomplete", "error_type", fmt.Sprintf("%T", err))
+		}
+	}()
 	if err := db.ValidateCredentials(context.Background(), keys); err != nil {
 		return err
 	}
@@ -169,7 +179,7 @@ func serve(cfg core.BootstrapConfig, db *store.Store, keys credential.Keyring) e
 		return err
 	}
 	maintenanceCtx, maintenanceCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := db.RunMaintenance(maintenanceCtx)
+	err = db.RunMaintenance(maintenanceCtx)
 	maintenanceCancel()
 	if err != nil {
 		return err
@@ -256,8 +266,8 @@ func serve(cfg core.BootstrapConfig, db *store.Store, keys credential.Keyring) e
 	defer stop()
 	requests, abort := context.WithCancel(context.Background())
 	defer abort()
-	infer := &http.Server{Addr: cfg.Listeners.Inference, Handler: engine, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10, BaseContext: func(net.Listener) context.Context { return requests }}
-	manage := &http.Server{Addr: cfg.Listeners.Management, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10}
+	infer := &http.Server{Addr: cfg.Listeners.Inference, Handler: telemetryRuntime.HTTPHandler("inference", engine), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10, BaseContext: func(net.Listener) context.Context { return requests }}
+	manage := &http.Server{Addr: cfg.Listeners.Management, Handler: telemetryRuntime.HTTPHandler("management", mux), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10}
 	li, err := net.Listen("tcp", infer.Addr)
 	if err != nil {
 		return err
@@ -315,6 +325,9 @@ func serve(cfg core.BootstrapConfig, db *store.Store, keys credential.Keyring) e
 		}
 	}
 	abort()
+	if err := telemetryRuntime.Shutdown(shutdown); err != nil {
+		slog.Warn("telemetry shutdown incomplete", "error_type", fmt.Sprintf("%T", err))
+	}
 	return nil
 }
 

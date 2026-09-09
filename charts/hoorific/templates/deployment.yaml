@@ -94,6 +94,16 @@ spec:
               subPath: oidc-client-secret
               readOnly: true
 {{ end }}
+{{ if .Values.config.telemetry.enabled }}
+{{ range $index, $exporter := .Values.config.telemetry.exporters }}
+{{ if $exporter.headersFile }}
+            - name: telemetry-headers-{{ $index }}
+              mountPath: {{ $exporter.headersFile | quote }}
+              subPath: headers
+              readOnly: true
+{{ end }}
+{{ end }}
+{{ end }}
       volumes:
         - name: config
           configMap:
@@ -116,6 +126,19 @@ spec:
         - name: data
           emptyDir:
             sizeLimit: {{ .Values.dataVolume.sizeLimit }}
+{{ if .Values.config.telemetry.enabled }}
+{{ range $index, $exporter := .Values.config.telemetry.exporters }}
+{{ if $exporter.headersFile }}
+{{ $headersSecret := default (dict) $exporter.headersSecret }}
+        - name: telemetry-headers-{{ $index }}
+          secret:
+            secretName: {{ required (printf "Values.config.telemetry.exporters[%d].headersSecret.secretName is required" $index) (index $headersSecret "secretName") | quote }}
+            items:
+              - key: {{ required (printf "Values.config.telemetry.exporters[%d].headersSecret.key is required" $index) (index $headersSecret "key") | quote }}
+                path: headers
+{{ end }}
+{{ end }}
+{{ end }}
 {{ if .Values.config.coordination.redis.enabled }}
         - name: redis-secret
           secret:

@@ -75,9 +75,10 @@ HOORIFIC_VERIFY_PYTHON=.artifacts/sdk-venv/bin/python \
 The `all` selector includes the baseline protocol, stream, security, resource,
 governance, credential, and unauthenticated-rejection checks; deep management
 and protocol checks; cost safety; credential refresh admission; SDK checks;
-operation fixtures (including the isolated FAL namespace); and packaging
-checks. It does not include the automated browser scenario. Cluster-specific
-checks are added only when `--mode cluster` is selected.
+operation fixtures (including the isolated FAL namespace); packaging checks;
+and a separate telemetry-enabled child harness. It does not include the
+automated browser scenario. Cluster-specific checks are added only when
+`--mode cluster` is selected.
 
 The runner executes `migrate --config PATH`, starts `serve --config PATH`, probes
 management liveness/readiness, redeems the one-time `admin bootstrap --config
@@ -96,6 +97,32 @@ Fixture fault modes are selected with `--fixture-mode=truncate`, `disconnect`,
 These modes exercise the owned loopback fixture only. Exit status is nonzero
 for setup or observed behavior failures; `not-run` coverage is visible in the
 JSON report and summary counters.
+### OpenTelemetry qualification
+
+Run the focused telemetry proof against a fresh isolated gateway. It starts an
+owned loopback OTLP HTTP/protobuf collector, writes two private header files and
+two path-prefixed destinations into the temporary configuration, then performs
+authenticated normal, streaming, and upstream-429 fixture requests:
+
+```sh
+go run ./tools/verify \
+  --binary .artifacts/hoorific \
+  --mode standalone \
+  --scenario telemetry \
+  --output .artifacts/verify-telemetry.json
+```
+
+The scenario needs no Python, browser, paid provider, or existing service. It
+decodes every received OTLP trace, metric, and log payload after graceful
+gateway shutdown. It fails on missing or corrupt protobuf, missing destination
+auth, missing `service.name`/`service.version`/`deployment.environment.name`,
+span parent links or log correlation, missing `gen_ai.client.operation.duration`,
+`gen_ai.client.token.usage`, or streaming
+`gen_ai.client.operation.time_to_first_chunk`, incorrect fixture token values
+(9 input and 2 output), or any request, credential, header, or canary payload
+appearing in exported data. `--scenario all` runs this proof in a separate
+telemetry-enabled child harness after the ordinary qualification so its
+configuration cannot alter the baseline harness.
 
 ### Cost-safety selector
 

@@ -48,6 +48,7 @@ func observeResponse(ctx context.Context, response *http.Response, entry protoco
 						}
 						break
 					}
+					gatewayObserveEvent(ctx, event)
 					switch v := event.(type) {
 					case core.Usage:
 						u := v
@@ -64,6 +65,7 @@ func observeResponse(ctx context.Context, response *http.Response, entry protoco
 			payload, e := entry.Result.DecodeResult(ctx, io.LimitReader(reader, 32<<20))
 			result.err = e
 			if e == nil {
+				gatewayObserveResult(ctx, payload)
 				result.usage = resultUsage(payload)
 				result.terminal = true
 			}

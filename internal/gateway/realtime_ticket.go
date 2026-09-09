@@ -92,7 +92,9 @@ func (g *Gateway) serveRealtimeTicket(w http.ResponseWriter, r *http.Request, p 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]any{"ticket": token, "expires_in": 30, "connection_id": c.ID, "model": m.ID})
+	if err := json.NewEncoder(w).Encode(map[string]any{"ticket": token, "expires_in": 30, "connection_id": c.ID, "model": m.ID}); err == nil {
+		gatewayMarkRequestSuccess(r.Context())
+	}
 }
 
 func realtimeTicketRoute(r *http.Request, x route) bool {

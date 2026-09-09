@@ -382,6 +382,294 @@ For a digest-pinned deployment, set `image.digest=sha256:...`; the chart renders
 
 The checked-in chart defaults to two stateless replicas, external PostgreSQL, and ephemeral `emptyDir` mounts for `/var/lib/hoorific` and `/tmp`. It is not a standalone SQLite deployment and its data mount is not a persistence claim. Although the checked-in values file leaves `config.coordination.redis.enabled` false, cluster `serve` still requires a non-empty Redis URL file; a default install therefore is not a runnable cluster until Redis is enabled and its Secret/configuration are supplied. OIDC remains optional, but its issuer, client ID, client-secret file, and referenced Secret must be supplied together when enabled. With `networkPolicy.enabled` (the default), empty ingress is deny-all and egress permits DNS only: explicitly allow the management/inference clients and external PostgreSQL, Redis, OIDC, and provider destinations required by the deployment. NetworkPolicy permits traffic but does not make PostgreSQL, Redis, OIDC, or provider transport confidential; configure TLS/authentication in those external services and their DSNs/URLs as required. The readiness probe checks the database readiness and whether the gateway is draining; it is not a provider, Redis, network-policy, or production-qualification check. Migration pods share the chart's base selector labels, so inspect Service EndpointSlices during hooks and do not treat them as serving replicas until migration has completed. The read-only root filesystem needs writable `/tmp` and data mounts. No Kubernetes installation or production qualification is claimed by the local deterministic verifier.
 
+## Telemetry
+
+Telemetry is opt-in and remains disabled in the checked-in chart defaults. The
+existing Prometheus-compatible `/metrics` route is unchanged; enabling OTLP
+does not replace it or expose a new public Service. Telemetry is intended for
+operator-selected traces, metrics, and logs, not for exporting request or
+response content.
+
+The strict bootstrap JSON below shows a complete cluster configuration with
+telemetry enabled. `sample_ratio` applies to traces and is between `0` and `1`;
+`1` is the default. An empty `signals` array means all three signals. An empty
+`exporters` array selects the environment-variable fallback described below.
+
+```json
+{
+  "schema_version": 1,
+  "mode": "cluster",
+  "data_dir": "/var/lib/hoorific",
+  "listeners": {"inference": ":8080", "management": ":8081"},
+  "storage": {
+    "sqlite": {"path": ""},
+    "postgres": {"dsn_file": "/etc/hoorific/secrets/postgres-dsn"}
+  },
+  "coordination": {"redis": {"url_file": "/etc/hoorific/secrets/redis-url"}},
+  "encryption": {"key_file": "/etc/hoorific/secrets/encryption-master-key"},
+  "oidc": {"issuer": "", "client_id": "", "client_secret_file": ""},
+  "public_urls": {},
+  "subscription_connectors": {"enabled": false},
+  "telemetry": {
+    "enabled": true,
+    "service_name": "hoorific",
+    "service_version": "0.1.0",
+    "environment": "production",
+    "sample_ratio": 0.10,
+    "exporters": [
+      {
+        "name": "observability-collector",
+        "protocol": "http/protobuf",
+        "endpoint": "http://otel-collector.observability.svc.cluster.local:4318",
+        "headers_file": "",
+        "insecure": true,
+        "signals": []
+      }
+    ]
+  }
+}
+```
+
+`endpoint` is an OTLP base endpoint, not a signal-specific URL. HTTP
+protobuf exporters append the signal path (`/v1/traces`, `/v1/metrics`, or
+`/v1/logs`); include an upstream base path when the consumer requires one.
+For example, a traces-only HTTP destination whose OTLP base is
+`https://langfuse.example.invalid/api/public/otel` receives a request at
+`.../api/public/otel/v1/traces`. A gRPC exporter uses the collector's gRPC
+endpoint, for example
+`otel-collector.observability.svc.cluster.local:4317`, with
+`"protocol": "grpc"`. An `http://` endpoint is plaintext regardless of the
+`insecure` value; use `https://` for TLS. `insecure: true` is an explicit
+plaintext switch and never disables certificate verification on a TLS endpoint.
+
+Each explicit exporter is an independent destination. The same signal may be
+listed on several exporters for fan-out, and each exporter may select a
+different signal subset. The following is the replacement `telemetry` member
+for the complete object above:
+
+```json
+{
+  "telemetry": {
+    "exporters": [
+      {
+        "name": "tempo",
+        "protocol": "grpc",
+        "endpoint": "tempo.observability.svc.cluster.local:4317",
+        "headers_file": "",
+        "insecure": true,
+        "signals": ["traces"]
+      },
+      {
+        "name": "prometheus-collector",
+        "protocol": "http/protobuf",
+        "endpoint": "http://otel-collector.observability.svc.cluster.local:4318",
+        "headers_file": "",
+        "insecure": true,
+        "signals": ["metrics"]
+      }
+    ]
+  }
+}
+```
+
+### Helm and secret-backed headers
+
+The chart uses camelCase values and renders the strict snake_case JSON above.
+For an exporter that needs headers, set `headersFile` to the file path that
+will be mounted and set its chart-only `headersSecret` reference:
+
+```yaml
+config:
+  telemetry:
+    enabled: true
+    serviceName: hoorific
+    serviceVersion: "0.1.0"
+    environment: production
+    sampleRatio: 0.10
+    exporters:
+      - name: grafana
+        protocol: http/protobuf
+        endpoint: https://grafana.example.invalid/otlp
+        headersFile: /etc/hoorific/secrets/telemetry-grafana-headers.json
+        headersSecret:
+          secretName: grafana-otlp-headers
+          key: headers.json
+        insecure: false
+        signals: [traces, metrics, logs]
+```
+
+The existing Secret key above must contain one JSON object whose keys and
+values are strings, for example an operator-created file at
+`/secure/operator-only/grafana-headers.json` (the file contains the
+backend-required authorization headers). Create the Secret from that
+operator-only file:
+
+```sh
+kubectl create secret generic grafana-otlp-headers \
+  --namespace hoorific \
+  --from-file=headers.json=/secure/operator-only/grafana-headers.json
+```
+
+Do not put header contents in `values.yaml`, a Helm `--set` argument, or either
+ConfigMap. The
+chart mounts the selected key read-only at `headersFile` in both the serving
+Deployment and the migration Job, while the ConfigMaps contain only the path.
+Header rotation therefore requires the normal pod restart procedure when a
+`subPath` mount is used. The chart rejects a missing protocol, endpoint,
+unsupported signal, out-of-range sample ratio, or incomplete
+`headersFile`/`headersSecret` pair.
+
+The default NetworkPolicy allows DNS only. Add an egress rule for the
+collector or OTLP backend (and its port) in `networkPolicy.egress`; the chart
+does not infer safe CIDRs from an endpoint URL. Keep OTLP destinations off the
+inference and management Services.
+
+### Environment fallback
+
+When telemetry is enabled with no explicit exporters, the runtime supports
+this documented subset of the OpenTelemetry environment configuration:
+
+- resource identity: `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION`, and
+  `OTEL_RESOURCE_ATTRIBUTES`;
+- signal selection: `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, and
+  `OTEL_LOGS_EXPORTER`;
+- generic and signal-specific endpoints:
+  `OTEL_EXPORTER_OTLP_ENDPOINT`,
+  `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+  `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, and
+  `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`;
+- generic and signal-specific protocols:
+  `OTEL_EXPORTER_OTLP_PROTOCOL`,
+  `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`,
+  `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, and
+  `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`;
+- generic and signal-specific header maps:
+  `OTEL_EXPORTER_OTLP_HEADERS`,
+  `OTEL_EXPORTER_OTLP_TRACES_HEADERS`,
+  `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, and
+  `OTEL_EXPORTER_OTLP_LOGS_HEADERS`;
+- generic and signal-specific plaintext switches:
+  `OTEL_EXPORTER_OTLP_INSECURE`,
+  `OTEL_EXPORTER_OTLP_TRACES_INSECURE`,
+  `OTEL_EXPORTER_OTLP_METRICS_INSECURE`, and
+  `OTEL_EXPORTER_OTLP_LOGS_INSECURE`;
+- trace sampling: `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`.
+
+The generic values are used as defaults for a signal when a signal-specific
+value is absent. Header environment values use the standard comma-separated
+`key=value` form; prefer a mounted header file for credentials. Once one or
+more explicit exporters are configured, they do not inherit ambient endpoint,
+protocol, header, or insecure settings from these variables. This prevents an
+explicit destination from accidentally receiving another signal's credentials.
+The chart does not claim support for arbitrary `OTEL_*` variables.
+
+### Collector and consumer routing
+
+A Collector is useful when credentials, retries, batching, and backend
+routing should be kept outside the gateway. A minimal routing shape is:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc: {}
+      http: {}
+
+processors:
+  batch: {}
+
+exporters:
+  otlphttp/grafana:
+    endpoint: https://grafana.example.invalid/otlp
+  otlphttp/tempo:
+    endpoint: https://tempo.example.invalid/otlp
+  prometheusremotewrite/prometheus:
+    endpoint: https://prometheus.example.invalid/api/v1/write
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheusremotewrite/prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/grafana]
+```
+
+Configure Collector authentication and TLS through its own secret manager or
+environment mechanism; the example intentionally has no credentials. A
+Grafana OTLP endpoint, Tempo OTLP receiver, and Prometheus remote-write
+endpoint are different consumer contracts. Prometheus can instead scrape
+Hoorific's existing `/metrics`; an OTLP metrics pipeline is a separate path
+and does not make that route authenticated.
+
+Jaeger deployments that enable an OTLP receiver can be reached through an
+OTLP exporter or Collector route; Hoorific does not emit a Jaeger-native
+protocol. AI-oriented OTLP consumers such as Langfuse can be used as
+traces-only destinations when their configured endpoint, authentication, and
+accepted OTLP signal are compatible. Hoorific emits generic OTLP spans and
+does not promise a consumer's vendor-specific LLM semantic conventions,
+prompt/cost schema, or ingestion behavior. In particular, the Langfuse
+base-path example above is a compatibility shape, not live vendor
+verification. Qualify the selected consumer and version in the target
+environment.
+
+### Privacy, cardinality, and lifecycle
+
+Telemetry is disabled by default. Instrumentation does not export prompts,
+completions, API keys, credential material, or arbitrary request headers, and
+this documentation makes no claim of tool-execution telemetry. Model
+identifiers, where useful for a trace, belong on spans rather than metric
+dimensions. Default metric dimensions are deliberately bounded: tenant IDs,
+request IDs, model identifiers, and raw upstream values are not unbounded
+metric labels. Operator-supplied `OTEL_RESOURCE_ATTRIBUTES` can still create
+high-cardinality data, so keep those attributes stable and non-sensitive.
+
+`service_name` and `service_version` provide the configured service/resource
+identity. `environment` is emitted as `deployment.environment.name`.
+`OTEL_RESOURCE_ATTRIBUTES` is merged into resource metadata for every enabled
+setup, including explicit exporters. `sample_ratio` controls trace
+sampling only; metrics and logs are not sampled by that field. A ratio of `0`
+samples no new root traces, while an incoming sampled parent context is
+honored. A ratio of `1` samples every eligible trace subject to the runtime's
+normal parent-context behavior.
+
+### AI signal fields and boundaries
+
+The gateway emits bounded, generic AI-oriented fields rather than a complete
+provider or tool-execution event stream. The exact names and limits are:
+
+| Signal | Exact names and semantics | Boundary |
+| --- | --- | --- |
+| Lifecycle spans | `gateway.request` (INTERNAL), `gateway.attempt` (CLIENT), and `gateway.resource_reconcile.poll` (CLIENT). | An attempt span exists per admitted `BeginAttempt` permit; reconcile spans represent native durable polls. |
+| Request/result span attributes | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.request.stream`, `gen_ai.response.model`, and `error.type`. | Attempt spans record the concrete upstream request model. The request span retains the caller alias separately as `hoorific.gateway.request.model`. The response model is emitted only after a decoded result or stream-start event; model identifiers are span attributes only. |
+| Usage and cache subsets | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`, and `gen_ai.usage.reasoning.output_tokens`. | Only nonnegative known counts are emitted. Cache-read and cache-write values are subsets, not extra input totals. |
+| Cost state | `hoorific.gen_ai.cost.known` and `hoorific.gen_ai.cost.usd`, alongside `hoorific.gen_ai.cache.requested`, `hoorific.gen_ai.cache_read.known`, `hoorific.gen_ai.cache_write.known`, `hoorific.gen_ai.reasoning.known`, `hoorific.gen_ai.input_tokens.known`, `hoorific.gen_ai.output_tokens.known`, and `hoorific.gen_ai.total_tokens.known`. | Observed actual cost stays unknown unless authoritative `ActualCost` evidence exists; the gateway does not infer or fabricate a charge. |
+| Streaming timing | `gen_ai.response.time_to_first_chunk`, `gen_ai.client.operation.time_to_first_chunk`, and `hoorific.gateway.first_useful_content`. | Measures elapsed time from upstream dispatch to the first useful `TextDelta` or tool-call event, not the first byte and not model-inference TTFT. |
+| Metrics | `gen_ai.client.operation.duration` and `gen_ai.client.token.usage` (input/output token types), plus the timing metric above. | Dimensions are limited to operation, provider, outcome, `error.type`, and `gen_ai.token.type`; model and request identifiers are never metric dimensions. |
+| Gateway outcome attributes | `hoorific.gateway.outcome`, `hoorific.gateway.error_type`, `hoorific.gateway.retry_count`, `hoorific.gateway.retry`, `hoorific.gateway.protocol`, `hoorific.gateway.framing`, `hoorific.gateway.native`, `hoorific.gateway.cancellation`, and `hoorific.gateway.resource_reconcile`. | Completion records retain bounded outcome metadata, not prompts, responses, raw errors, URLs, credentials, or arbitrary headers. Cancellation evidence is not proof that remote execution stopped. |
+| Tool and opaque protocol limits | `hoorific.gen_ai.tool_definitions.count` and `hoorific.gen_ai.tool_calls.count`. | These are counts, not tool names, schemas, arguments, or proof of execution. Opaque native WebSocket, duplex, and media paths cannot observe payload, usage, or first-useful-content fields. |
+
+These fields are generic OTLP data and do not claim complete external-provider
+or vendor-specific semantic-convention compatibility. A consumer must qualify
+the signals it understands; the gateway does not claim full tool tracing or
+provider-side model timing.
+
+The runtime initializes telemetry before gateway construction and flushes
+providers during graceful shutdown with bounded export timeouts. Export
+failures are sanitized before local logging and do not change the existing
+request or streaming contract. Keep the chart's
+`terminationGracePeriodSeconds` long enough for the bounded flush (the
+default is 30 seconds); a forced termination can still discard queued
+telemetry. Disabling telemetry leaves externally installed global providers
+untouched and performs no telemetry network export.
+
 ## Backups
 
 ### Standalone SQLite
