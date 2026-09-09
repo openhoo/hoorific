@@ -1,5 +1,11 @@
 # hoorific Changelog
 
+## 0.2.0 (2026-09-09)
+
+### Features
+
+- **telemetry:** add OpenTelemetry export and AI observability (6189087)
+
 ## 0.1.0 (2026-09-09)
 
 ### Features
@@ -24,5 +30,3 @@
 - refresh console screenshots (11a875f)
 - publish GHCR images with Hooversion (2c42fe4)
 - refresh console screenshots (94e3671)
-
-
