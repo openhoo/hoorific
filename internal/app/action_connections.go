@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hoorific/internal/core"
+	"hoorific/internal/transport"
 	"io"
 	"net/http"
 	"net/url"
@@ -137,6 +138,12 @@ func (a *Actions) connectionAction(ctx context.Context, p core.Principal, id, ac
 		for k, values := range bind.Headers {
 			req.Header[k] = append([]string(nil), values...)
 		}
+		if c.ClientProfile != nil {
+			if e = c.ClientProfile.Apply(req.Header); e != nil {
+				return nil, e
+			}
+		}
+		transport.SanitizeRequest(req)
 		if a.deps.Credentials == nil {
 			return nil, actionError("connection_required", 400, "Connection credential source unavailable")
 		}

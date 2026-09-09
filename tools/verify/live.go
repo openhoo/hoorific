@@ -78,14 +78,15 @@ type liveCase struct {
 	Request        json.RawMessage `json:"request"`
 }
 type liveConnectionData struct {
-	Connector string            `json:"connector"`
-	AccountID string            `json:"account_id"`
-	BaseURL   string            `json:"base_url"`
-	Region    string            `json:"region"`
-	Project   string            `json:"project"`
-	Dedicated bool              `json:"dedicated"`
-	Enabled   bool              `json:"enabled"`
-	Settings  map[string]string `json:"settings"`
+	Connector     string              `json:"connector"`
+	AccountID     string              `json:"account_id"`
+	BaseURL       string              `json:"base_url"`
+	Region        string              `json:"region"`
+	Project       string              `json:"project"`
+	Dedicated     bool                `json:"dedicated"`
+	Enabled       bool                `json:"enabled"`
+	Settings      map[string]string   `json:"settings"`
+	ClientProfile *core.ClientProfile `json:"client_profile,omitempty"`
 }
 type liveModelData struct {
 	ConnectionID string              `json:"connection_id"`
@@ -598,7 +599,7 @@ func livePrepare(ctx context.Context, c liveCase, remote liveResource[liveConnec
 	}
 	p.model = m
 	d := remote.Data
-	conn := core.Connection{TenantID: remote.TenantID, ID: remote.ID, Connector: d.Connector, AccountID: d.AccountID, BaseURL: d.BaseURL, Region: d.Region, Project: d.Project, Version: remote.Version, Dedicated: d.Dedicated, Settings: d.Settings}
+	conn := core.Connection{TenantID: remote.TenantID, ID: remote.ID, Connector: d.Connector, AccountID: d.AccountID, BaseURL: d.BaseURL, Region: d.Region, Project: d.Project, Version: remote.Version, Dedicated: d.Dedicated, Settings: d.Settings, ClientProfile: d.ClientProfile.Clone()}
 	var eps []core.NativeEndpoint
 	for _, e := range capabilityEndpoints {
 		eps = append(eps, core.NativeEndpoint{Method: e.Method, Path: e.Path, Action: e.Action, Operation: e.Operation, ModelLocation: e.ModelLocation, Framing: e.Framing, Stateful: e.Stateful, ResourceIDField: e.ResourceIDField})

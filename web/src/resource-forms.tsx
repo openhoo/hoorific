@@ -11,11 +11,13 @@ import { Lock, Plus, Trash2 } from 'lucide-react';
 type DTO = components['schemas'];
 type TenantData = DTO['TenantData'];
 type OperatorData = DTO['OperatorData'];
+type ConnectionData = DTO['ConnectionData'];
+type ClientProfileData = NonNullable<ConnectionData['client_profile']>;
 export type ResourceDataByKind = {
   tenants: TenantData;
   operators: OperatorData;
   role_bindings: DTO['RoleBindingData'];
-  connections: DTO['ConnectionData'];
+  connections: ConnectionData;
   account_pools: DTO['AccountPoolData'];
   models: DTO['ModelData'];
   model_aliases: DTO['AliasData'];
@@ -32,8 +34,7 @@ export function isWritableResourceKind(kind: string): kind is WritableResourceKi
   return writableResourceKinds.some(candidate => candidate === kind);
 }
 
-// These aliases intentionally require regenerated TenantData and OperatorData
-// from internal/admin/resources.go; do not replace stale generated contracts.
+// Generated API remains the source of DTOs.
 export function initialResourceData<K extends WritableResourceKind>(kind: K, tenantID: string): ResourceDataByKind[K];
 export function initialResourceData(kind: string, tenantID: string): ResourceData | undefined;
 export function initialResourceData(kind: string, tenantID: string): ResourceData | undefined {
@@ -77,11 +78,16 @@ function FieldShell({ label, htmlFor, required = false, readOnly = false, descri
     {error && <p id={errorID} role="alert" className="text-xs font-medium leading-relaxed text-destructive">{error}</p>}
   </div>;
 }
-type TextFieldProps = FieldProps<string | undefined> & { required?: boolean; readOnly?: boolean; description?: ReactNode };
-function TextField({ label, value, onChange, required = false, readOnly = false, description }: TextFieldProps) {
+type TextFieldProps = FieldProps<string | undefined> & { required?: boolean; readOnly?: boolean; description?: ReactNode; validate?: (value: string) => string | undefined };
+function TextField({ label, value, onChange, required = false, readOnly = false, description, validate }: TextFieldProps) {
   const id = useId();
-  return <FieldShell label={label} htmlFor={id} required={required} readOnly={readOnly} description={description}>
-    <Input id={id} value={value ?? ''} required={required} readOnly={readOnly} aria-readonly={readOnly || undefined} aria-describedby={description ? `${id}-description` : undefined} onInput={event => onChange(event.currentTarget.value)} />
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const error = validate?.(value ?? '');
+  useEffect(() => {
+    inputRef.current?.setCustomValidity(error ?? '');
+  }, [error]);
+  return <FieldShell label={label} htmlFor={id} required={required} readOnly={readOnly} description={description} error={error}>
+    <Input id={id} ref={inputRef} value={value ?? ''} required={required} readOnly={readOnly} aria-readonly={readOnly || undefined} aria-invalid={Boolean(error)} aria-errormessage={error ? `${id}-error` : undefined} aria-describedby={description ? `${id}-description` : undefined} onInput={event => onChange(event.currentTarget.value)} />
   </FieldShell>;
 }
 function BooleanField({ label, value, onChange, disabled = false, description }: FieldProps<boolean> & { disabled?: boolean; description?: ReactNode }) {
@@ -213,15 +219,23 @@ function StringList({ label, value, onChange, description, itemLabel, minItems =
     <Button type="button" variant="outline" size="sm" className="resource-form-add h-auto min-h-10 w-full justify-start whitespace-normal text-left @min-[28rem]:w-auto" aria-invalid={Boolean(listError)} aria-errormessage={listError ? errorID : undefined} onClick={() => onChange([...rows, ''])}><Plus aria-hidden="true" />Add {itemName} entry</Button>
   </fieldset>;
 }
-function StringMap({ label, value, onChange, features = false }: FieldProps<Record<string, string> | undefined> & { features?: boolean }) {
+type StringMapOptions = {
+  features?: boolean;
+  description?: ReactNode;
+  validate?: (value: Record<string, string>) => string | undefined;
+  requiredError?: string;
+};
+function StringMap({ label, value, onChange, features = false, description: descriptionOverride, validate, requiredError }: FieldProps<Record<string, string> | undefined> & StringMapOptions) {
   const [draft, setDraft] = useState<string>();
   const [error, setError] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const id = useId();
-  const description = features ? 'Feature values must be supported, unsupported, or unknown.' : 'Use {} to clear this map.';
+  const description = descriptionOverride ?? (features ? 'Feature values must be supported, unsupported, or unknown.' : 'Use {} to clear this map.');
+  const valueError = draft === undefined ? (validate?.(value ?? {}) ?? '') : '';
+  const visibleError = error || valueError || requiredError || '';
   useEffect(() => {
-    textareaRef.current?.setCustomValidity(error);
-  }, [error]);
+    textareaRef.current?.setCustomValidity(visibleError);
+  }, [visibleError]);
   const handleInput = (event: FormEvent<HTMLTextAreaElement>) => {
     const raw = event.currentTarget.value;
     setDraft(raw);
@@ -234,6 +248,8 @@ function StringMap({ label, value, onChange, features = false }: FieldProps<Reco
         if (features && !['supported', 'unsupported', 'unknown'].includes(item)) throw new Error('Feature values must be supported, unsupported, or unknown.');
         checked[key] = item;
       }
+      const mapError = validate?.(checked);
+      if (mapError) throw new Error(mapError);
       setError('');
       event.currentTarget.setCustomValidity('');
       onChange(checked);
@@ -243,8 +259,8 @@ function StringMap({ label, value, onChange, features = false }: FieldProps<Reco
       event.currentTarget.setCustomValidity(message);
     }
   };
-  return <FieldShell label={`${label} (JSON object of string values)`} htmlFor={id} error={error} description={description} className="@min-[28rem]:col-span-2">
-    <Textarea id={id} ref={textareaRef} value={draft ?? JSON.stringify(value ?? {}, null, 2)} aria-invalid={Boolean(error)} aria-errormessage={error ? `${id}-error` : undefined} aria-describedby={`${id}-description`} onInput={handleInput} className="min-h-32 resize-y font-mono text-sm" />
+  return <FieldShell label={`${label} (JSON object of string values)`} htmlFor={id} error={visibleError} description={description} className="@min-[28rem]:col-span-2">
+    <Textarea id={id} ref={textareaRef} value={draft ?? JSON.stringify(value ?? {}, null, 2)} aria-invalid={Boolean(visibleError)} aria-errormessage={visibleError ? `${id}-error` : undefined} aria-describedby={`${id}-description`} onInput={handleInput} className="min-h-32 resize-y font-mono text-sm" />
   </FieldShell>;
 }
 
@@ -277,6 +293,168 @@ function FormSection({ title, description, children }: { title: string; descript
     </div>
     <div className="grid min-w-0 gap-x-5 gap-y-4 @min-[28rem]:grid-cols-2">{children}</div>
   </section>;
+}
+const CODEX_EXEC_VERSION = '0.153.4';
+const CLIENT_PROFILE_PRESETS: readonly { value: ClientProfileData['preset']; label: string }[] = [
+  { value: 'custom', label: 'Custom (static headers)' },
+  { value: 'codex-cli', label: 'Codex CLI (static headers)' },
+  { value: 'codex-desktop', label: 'Codex Desktop (static headers)' },
+  { value: 'codex-exec', label: 'Codex exec (native)' },
+  { value: 'codex-passthrough', label: 'Codex passthrough (caller headers)' },
+  { value: 'zcode-desktop', label: 'ZCode Desktop (static headers)' },
+];
+const IDENTITY_HEADER_NAMES = [
+  'User-Agent',
+  'Originator',
+  'Version',
+  'HTTP-Referer',
+  'X-Title',
+  'X-ZCode-App-Version',
+  'X-ZCode-Agent',
+  'Anthropic-Beta',
+  'X-Stainless-Lang',
+  'X-Stainless-Package-Version',
+  'X-Stainless-OS',
+  'X-Stainless-Arch',
+  'X-Stainless-Runtime',
+  'X-Stainless-Runtime-Version',
+] as const;
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+function validateInstallationID(value: string): string | undefined {
+  return UUID_V4_PATTERN.test(value)
+    ? undefined
+    : 'Use a canonical lowercase UUIDv4 (xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx).';
+}
+function secureUUIDv4(): string {
+  const cryptoAPI = globalThis.crypto;
+  if (typeof cryptoAPI.randomUUID === 'function') return cryptoAPI.randomUUID();
+  if (typeof cryptoAPI.getRandomValues !== 'function') {
+    throw new Error('Secure browser randomness is required to create a Codex installation ID.');
+  }
+  const bytes = new Uint8Array(16);
+  cryptoAPI.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+    .replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+}
+function validateIdentityHeaders(value: Record<string, string>): string | undefined {
+  const seen = new Set<string>();
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = key.toLowerCase();
+    if (seen.has(normalized)) return 'Header names must be unique without regard to case.';
+    seen.add(normalized);
+    if (!IDENTITY_HEADER_NAMES.some(name => name.toLowerCase() === normalized)) return `Header "${key}" is not an allowed identity override.`;
+    if (/[\u0000-\u001f\u007f-\u009f]/.test(key) || /[\u0000-\u001f\u007f-\u009f]/.test(item)) return 'Header names and values cannot contain control characters.';
+  }
+  return undefined;
+}
+type ClientProfileFieldsProps = {
+  value: ConnectionData;
+  onChange: (value: ConnectionData) => void;
+};
+function ClientProfileFields({ value, onChange }: ClientProfileFieldsProps) {
+  const profile = value.client_profile;
+  const preset = profile?.preset ?? '';
+  const knownPreset = !preset || CLIENT_PROFILE_PRESETS.some(option => option.value === preset);
+  const presetError = knownPreset ? undefined : 'This profile preset is not supported by this console. Choose a supported preset or Native/default to remove it.';
+  const presetID = useId();
+  const presetRef = useRef<HTMLSelectElement | null>(null);
+  useEffect(() => {
+    presetRef.current?.setCustomValidity(presetError ?? '');
+  }, [presetError]);
+  const normalizeProfile = (next: ClientProfileData): ClientProfileData => {
+    if (next.preset === 'codex-exec') {
+      return { preset: next.preset, version: CODEX_EXEC_VERSION, installation_id: next.installation_id };
+    }
+    if (next.preset === 'codex-passthrough') {
+      return { preset: next.preset };
+    }
+    const withoutInstallationID = { ...next };
+    delete withoutInstallationID.installation_id;
+    return withoutInstallationID;
+  };
+  const updateProfile = (next: ClientProfileData) => onChange({ ...value, client_profile: normalizeProfile(next) });
+  const removeProfile = () => {
+    const withoutProfile = { ...value };
+    delete withoutProfile.client_profile;
+    onChange(withoutProfile);
+  };
+  const profileHeaders = profile?.headers ?? {};
+  const hasHeader = (name: string) => Object.entries(profileHeaders).some(([key, item]) => key.toLowerCase() === name.toLowerCase() && item.trim() !== '');
+  const requiredHeaderError = preset === 'codex-desktop' && (!hasHeader('Originator') || !hasHeader('User-Agent'))
+    ? 'Codex Desktop requires explicit Originator and User-Agent identity overrides.'
+    : preset === 'codex-cli' && !profile?.version?.trim() && !hasHeader('User-Agent')
+      ? 'Codex CLI requires a profile version or an explicit User-Agent override.'
+      : undefined;
+  const versionDescription = preset === 'zcode-desktop'
+    ? 'Required for ZCode Desktop; use the provider-supported release version.'
+    : preset === 'codex-cli'
+      ? 'Optional when an explicit User-Agent override identifies the CLI release.'
+      : preset === 'codex-desktop'
+        ? 'Codex Desktop requires explicit Originator and User-Agent identity overrides.'
+        : 'Optional profile version; the connector remains responsible for protocol behavior.';
+  const headerDescription = `Static/header-only identity overrides: ${IDENTITY_HEADER_NAMES.join(', ')}. Protected authorization, cookie, host, length, forwarding, routing, billing, request, and session headers are not allowed.`;
+  const profileDescription = preset === 'codex-exec'
+    ? 'Native Codex CLI exec wire emulation for the fixed 0.153.4 Linux/Arch Linux Unknown/x86_64/dumb persona (native OpenSSL 3.6.3, HTTP/1.1 without ALPN). It uses the native helper only for supported Responses generation; it does not execute tools or emulate Codex Desktop, OAuth, or billing.'
+    : preset === 'codex-passthrough'
+      ? 'Codex passthrough requires real Codex input and forwards bounded identity and metadata only on native Responses. It is not an emulator and does not reproduce TLS or raw header casing/order.'
+      : 'Static/header-only client identity. These profiles do not rewrite request bodies, create session/request fingerprints, or emulate a complete desktop client. Native/default removes client_profile and preserves legacy connector behavior.';
+  return <FormSection title="Client profile" description={profileDescription}>
+    <FieldShell label="Profile preset" htmlFor={presetID} error={presetError} description="Choose Native/default to remove an existing profile.">
+      <NativeSelect
+        id={presetID}
+        ref={presetRef}
+        value={preset}
+        aria-invalid={Boolean(presetError)}
+        aria-errormessage={presetError ? `${presetID}-error` : undefined}
+        aria-describedby={`${presetID}-description`}
+        onChange={event => {
+          const nextPreset = event.currentTarget.value;
+          if (!nextPreset) {
+            removeProfile();
+            return;
+          }
+          const selectedPreset = CLIENT_PROFILE_PRESETS.find(option => option.value === nextPreset);
+          if (selectedPreset) {
+            if (selectedPreset.value === 'codex-exec') {
+              updateProfile({ preset: selectedPreset.value, version: CODEX_EXEC_VERSION, installation_id: secureUUIDv4() });
+            } else if (selectedPreset.value === 'codex-passthrough') {
+              updateProfile({ preset: selectedPreset.value });
+            } else {
+              const withoutInstallationID = { ...(profile ?? {}) };
+              delete withoutInstallationID.installation_id;
+              updateProfile({ ...withoutInstallationID, preset: selectedPreset.value });
+            }
+          }
+        }}
+      >
+        <option value="">Native/default (remove profile)</option>
+        {!knownPreset && <option value={preset} disabled>{preset} (unsupported)</option>}
+        {CLIENT_PROFILE_PRESETS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </NativeSelect>
+    </FieldShell>
+    {preset === 'codex-exec' && <>
+      <TextField label="Codex exec version" value={profile?.version || CODEX_EXEC_VERSION} required readOnly description="Fixed native persona version; this profile does not accept arbitrary Codex releases." onChange={next => updateProfile({ ...profile!, version: next })} />
+      <TextField
+        label="Codex installation ID (UUIDv4)"
+        value={profile?.installation_id}
+        required
+        validate={validateInstallationID}
+        description="Persistent per-connection installation identity. A new canonical UUIDv4 is generated when Codex exec is selected; replace it only with another valid UUIDv4."
+        onChange={next => updateProfile({ ...profile!, installation_id: next })}
+      />
+    </>}
+    {preset && preset !== 'codex-passthrough' && preset !== 'codex-exec' && <TextField label="Client profile version" value={profile?.version} required={preset === 'zcode-desktop'} description={versionDescription} onChange={next => updateProfile({ ...profile!, version: next || undefined })} />}
+    {preset && preset !== 'codex-passthrough' && preset !== 'codex-exec' && <StringMap
+      label="Identity header overrides (static/header-only)"
+      value={profile?.headers}
+      validate={validateIdentityHeaders}
+      requiredError={requiredHeaderError}
+      description={headerDescription}
+      onChange={next => updateProfile({ ...profile!, headers: next })}
+    />}
+  </FormSection>;
 }
 function PriceFields({ value, onChange }: FieldProps<DTO['PriceSchedule']>) {
   const f = fields(value, onChange);
@@ -418,7 +596,9 @@ export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, 
       </FormLayout>;
     }
     case 'connections': {
-      const f = fields(value as DTO['ConnectionData'], onChange as (value: DTO['ConnectionData']) => void);
+      const connection = value as ConnectionData;
+      const onConnectionChange = onChange as (value: ConnectionData) => void;
+      const f = fields(connection, onConnectionChange);
       return <FormLayout>
         <FormSection title="Connection identity" description="Account ID and Base URL are optional for connectors that provide them at runtime.">
           {f.text('connector', 'Connector', true)}
@@ -432,6 +612,7 @@ export function ResourceForm({ kind, value, onChange, readOnlyIdentity = false, 
           {f.bool('enabled', 'Enabled')}
           {f.map('settings', 'Connection settings')}
         </FormSection>
+        <ClientProfileFields value={connection} onChange={onConnectionChange} />
       </FormLayout>;
     }
     case 'account_pools': {

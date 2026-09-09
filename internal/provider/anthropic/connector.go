@@ -12,6 +12,7 @@ import (
 
 	"hoorific/internal/core"
 	"hoorific/internal/provider/endpoint"
+	"hoorific/internal/transport"
 )
 
 const (
@@ -33,6 +34,9 @@ type Connector struct {
 // Source: https://platform.claude.com/docs/en/api/models/list
 func (c *Connector) Discover(ctx context.Context, conn core.Connection) ([]core.Model, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := conn.ClientProfile.Validate(conn.Connector); err != nil {
 		return nil, err
 	}
 	client := c.DiscoveryClient()
@@ -64,6 +68,13 @@ func (c *Connector) Discover(ctx context.Context, conn core.Connection) ([]core.
 		if err != nil {
 			return nil, err
 		}
+		req.Header.Set("Accept", "application/json")
+		if conn.ClientProfile != nil {
+			if err := conn.ClientProfile.Apply(req.Header); err != nil {
+				return nil, err
+			}
+		}
+		transport.SanitizeRequest(req)
 		lease, err := source.Lease(ctx, conn)
 		if err != nil {
 			return nil, err
@@ -79,7 +90,6 @@ func (c *Connector) Discover(ctx context.Context, conn core.Connection) ([]core.
 		if closeErr != nil {
 			return nil, closeErr
 		}
-		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err

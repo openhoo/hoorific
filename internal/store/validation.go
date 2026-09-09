@@ -60,14 +60,15 @@ type PriceData struct {
 	CacheWrite1hPerMillion    *int64 `json:"cache_write_1h_per_million,omitempty"`
 }
 type ConnectionData struct {
-	Connector string            `json:"connector"`
-	AccountID string            `json:"account_id"`
-	BaseURL   string            `json:"base_url"`
-	Region    string            `json:"region,omitempty"`
-	Project   string            `json:"project,omitempty"`
-	Dedicated bool              `json:"dedicated"`
-	Enabled   bool              `json:"enabled"`
-	Settings  map[string]string `json:"settings,omitempty"`
+	Connector     string              `json:"connector"`
+	AccountID     string              `json:"account_id"`
+	BaseURL       string              `json:"base_url"`
+	Region        string              `json:"region,omitempty"`
+	Project       string              `json:"project,omitempty"`
+	Dedicated     bool                `json:"dedicated"`
+	Enabled       bool                `json:"enabled"`
+	Settings      map[string]string   `json:"settings,omitempty"`
+	ClientProfile *core.ClientProfile `json:"client_profile,omitempty"`
 }
 type ModelData struct {
 	ConnectionID     string              `json:"connection_id"`
@@ -283,6 +284,9 @@ func validateResource(kind string, data json.RawMessage) (json.RawMessage, error
 		var x ConnectionData
 		if strictDecode(data, &x) != nil || !validRef(x.Connector) || x.AccountID != "" && !validRef(x.AccountID) {
 			return bad()
+		}
+		if err := x.ClientProfile.Validate(x.Connector); err != nil {
+			return nil, problem("invalid_resource", 400, err.Error())
 		}
 		if x.BaseURL != "" {
 			u, e := url.Parse(x.BaseURL)

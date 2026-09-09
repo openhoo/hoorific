@@ -40,6 +40,7 @@ func (e *environment) deepAdminScenarios() []result {
 		e.deepAdminCredentialProjection(state),
 		e.deepAdminTenantIsolation(state),
 		e.deepAdminConnectionLifecycle(state),
+		e.clientProfileScenario(),
 		e.deepAdminRouteDryRun(state),
 		e.deepAdminAPIKeyLifecycle(state),
 		e.deepAdminConfigLifecycle(state),

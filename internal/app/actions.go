@@ -109,5 +109,10 @@ func (a *Actions) connector(c core.Connection) (core.Connector, error) {
 			return nil, actionError("consent_required", 403, "Owner consent for this tenant, provider and account is required")
 		}
 	}
+	if c.ClientProfile != nil {
+		if err := c.ClientProfile.Validate(c.Connector); err != nil {
+			return nil, err
+		}
+	}
 	return x, nil
 }

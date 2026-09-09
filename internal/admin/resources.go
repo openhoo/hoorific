@@ -32,14 +32,15 @@ type RoleBindingData struct {
 	Role     string `json:"role"`
 }
 type ConnectionData struct {
-	Connector string            `json:"connector"`
-	AccountID string            `json:"account_id"`
-	BaseURL   string            `json:"base_url"`
-	Region    string            `json:"region,omitempty"`
-	Project   string            `json:"project,omitempty"`
-	Dedicated bool              `json:"dedicated"`
-	Enabled   bool              `json:"enabled"`
-	Settings  map[string]string `json:"settings,omitempty"`
+	Connector     string              `json:"connector"`
+	AccountID     string              `json:"account_id"`
+	BaseURL       string              `json:"base_url"`
+	Region        string              `json:"region,omitempty"`
+	Project       string              `json:"project,omitempty"`
+	Dedicated     bool                `json:"dedicated"`
+	Enabled       bool                `json:"enabled"`
+	Settings      map[string]string   `json:"settings,omitempty"`
+	ClientProfile *core.ClientProfile `json:"client_profile,omitempty"`
 }
 type ModelData struct {
 	ConnectionID     string              `json:"connection_id"`
@@ -188,6 +189,12 @@ func validateResource(kind string, data json.RawMessage) error {
 	}
 	if err := d.Decode(v); err != nil {
 		return err
+	}
+	if kind == "connections" {
+		x := v.(*ConnectionData)
+		if err := x.ClientProfile.Validate(x.Connector); err != nil {
+			return err
+		}
 	}
 	return nil
 }

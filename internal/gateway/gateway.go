@@ -411,6 +411,29 @@ type selected struct {
 	route      core.RouteTarget
 }
 
+func validateClientProfileInvocation(profile *core.ClientProfile, x route, continuation bool, binding core.Binding, op core.Operation) error {
+	if profile == nil {
+		return nil
+	}
+	if profile.EmulatesCodex() {
+		if continuation || strings.HasPrefix(x.path, "continuations/") || binding.Codec.Protocol != "openai-responses" || op != "generate" || !responsesBindingIsStream(binding) {
+			err := failure("unsupported_operation", http.StatusBadRequest, "codex-exec requires a Responses generate request")
+			err.Param = "client_profile.preset"
+			return err
+		}
+		return nil
+	}
+	if !profile.PreservesClientHeaders() {
+		return nil
+	}
+	if !x.native || continuation || strings.HasPrefix(x.path, "continuations/") || binding.Codec.Protocol != "openai-responses" || op != "generate" {
+		err := failure("unsupported_operation", http.StatusBadRequest, "codex passthrough requires a native Responses generate request")
+		err.Param = "client_profile.preset"
+		return err
+	}
+	return nil
+}
+
 func (g *Gateway) targets(ctx context.Context, s core.RuntimeSnapshot, p core.Principal, x route, method string, raw []byte, fields map[string]json.RawMessage) ([]selected, error) {
 	if x.native {
 		c, ok := s.Connections[x.connection]
@@ -439,6 +462,9 @@ func (g *Gateway) targets(ctx context.Context, s core.RuntimeSnapshot, p core.Pr
 			}
 			params, ok := matchEndpoint(ep.Path, x.path)
 			if !ok {
+				continue
+			}
+			if !codexNativeEndpointAllowed(ctx, c, connector, ep, params) {
 				continue
 			}
 			if !contains(p.Operations, ep.Operation) {
@@ -524,6 +550,8 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	var stream bool
 	var streamFieldPresent bool
 	var suppressUsage bool
+	var codexInvocation core.CodexInvocation
+	var codexAggregatedUsage *core.Usage
 	if streamRaw, ok := fields["stream"]; ok {
 		streamFieldPresent = true
 		_ = json.Unmarshal(streamRaw, &stream)
@@ -533,11 +561,17 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		stream = true
 	}
 	continuation, isContinuation := ctx.Value(nativeContinuationKey{}).(nativeContinuationDispatch)
+	codex := codexProfile(t.connection.ClientProfile)
 	if isContinuation {
 		binding = continuation.Binding
 		op = binding.Codec.Operation
 	} else {
-		if t.endpoint != nil {
+		if codex {
+			if t.endpoint != nil {
+				op = t.endpoint.Operation
+			}
+			binding, err = g.bindResponses(ctx, t, op, stream)
+		} else if t.endpoint != nil {
 			op = t.endpoint.Operation
 			if b, ok := t.connector.(core.EndpointBinder); ok {
 				binding, err = b.BindEndpoint(ctx, t.connection, *t.endpoint, t.params)
@@ -549,13 +583,20 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		} else {
 			binding, err = t.connector.Bind(ctx, t.target, op)
 		}
-		if err != nil {
-			return false, err
-		}
+	}
+	if err != nil {
+		return false, err
+	}
+	if !isContinuation {
 		if inspector, ok := t.connector.(core.ScopeInspector); ok {
 			if err = inspector.Inspect(ctx, t.target, op, raw); err != nil {
 				return false, err
 			}
+		}
+	}
+	if profile := t.connection.ClientProfile; profile != nil {
+		if err = profile.Validate(t.connection.Connector); err != nil {
+			return false, err
 		}
 	}
 	if binding.Framing == "ndjson" && (binding.Codec.Protocol != "ollama" || !streamFieldPresent) {
@@ -571,7 +612,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	input, inputOK := g.deps.Codecs[inputKey]
 	output, outputOK := g.deps.Codecs[binding.Codec]
 	body := raw
-	nativeWire := x.native || binding.Codec == inputKey
+	nativeWire := x.native || (!codex && binding.Codec == inputKey)
 	if !x.native {
 		var payload core.RequestPayload
 		if !inputOK || input.Request == nil {
@@ -644,6 +685,12 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if len(body) == 0 && binding.DefaultBody != "" {
 		body = []byte(binding.DefaultBody)
 	}
+	if codex {
+		body, codexInvocation, err = codexRequestBody(t.connection.ClientProfile, body)
+		if err != nil {
+			return false, err
+		}
+	}
 	upstreamURL, err := joinEndpoint(t.connection.BaseURL, binding.Endpoint)
 	if err != nil {
 		return false, err
@@ -663,7 +710,7 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}()
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", r.Header.Get("Accept"))
-	if captured, ok := ctx.Value(requestBodyKey{}).(*capturedBody); ok && binding.Framing != "h2-eventstream-duplex" {
+	if captured, ok := ctx.Value(requestBodyKey{}).(*capturedBody); ok && binding.Framing != "h2-eventstream-duplex" && !codex {
 		if !nativeWire {
 			return false, failure("unsupported_feature", 400, "binary and multipart translation is not representable")
 		}
@@ -684,13 +731,29 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		req.Header.Set("Content-Type", captured.contentType)
 	}
 	if !crossOrigin {
-		for _, h := range binding.AllowedRequestHeaders {
-			for _, v := range r.Header.Values(h) {
-				req.Header.Add(h, v)
+		if !codex && (t.connection.ClientProfile == nil || !t.connection.ClientProfile.PreservesClientHeaders()) {
+			for _, h := range binding.AllowedRequestHeaders {
+				for _, v := range r.Header.Values(h) {
+					req.Header.Add(h, v)
+				}
 			}
 		}
 		for h, values := range binding.Headers {
 			req.Header[h] = append([]string(nil), values...)
+		}
+	}
+	if err = validateClientProfileInvocation(t.connection.ClientProfile, x, isContinuation, binding, op); err != nil {
+		return false, err
+	}
+	if !crossOrigin {
+		if codex {
+			if err = applyCodexInvocationHeaders(req.Header, codexInvocation); err != nil {
+				return false, err
+			}
+		} else if t.connection.ClientProfile != nil {
+			if err = t.connection.ClientProfile.ApplyRequestHeaders(req.Header, r.Header); err != nil {
+				return false, err
+			}
 		}
 	}
 	transport.SanitizeRequest(req)
@@ -730,7 +793,9 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		client = &isolated
 	}
-	client = gatewayTraceClient(client)
+	if !codex && (t.connection.ClientProfile == nil || !t.connection.ClientProfile.PreservesClientHeaders()) {
+		client = gatewayTraceClient(client)
+	}
 	deadline, _ := ctx.Deadline()
 	plan := core.AttemptPlan{TenantID: p.TenantID, RequestID: id, AttemptID: requestID(), KeyID: p.KeyID, KeyRevision: p.KeyRevision, ConfigRevision: s.Revision, ConnectionID: t.connection.ID, AccountID: t.connection.AccountID, ModelID: t.model.CatalogID, Deadline: deadline}
 	plan, err = g.deps.Planner.PlanAttempt(ctx, p, s, t.target, op, body, plan)
@@ -770,7 +835,9 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return false, failure("unavailable", 503, "upstream authorization failed")
 		}
 	}
-	injectGatewayTrace(ctx, req)
+	if !codex && (t.connection.ClientProfile == nil || !t.connection.ClientProfile.PreservesClientHeaders()) {
+		injectGatewayTrace(ctx, req)
+	}
 	if binding.Framing == "h2-eventstream-duplex" {
 		outcome, err = g.executeDuplex(ctx, w, r, p, t, binding, plan, permit, lease, client, id)
 		return false, err
@@ -875,8 +942,15 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		markIdempotency(ctx, "terminal")
 	}
 	if nativeWire {
-		relayResult, seen, relayErr := relayNative(ctx, w, response, output, stream)
-		if relayResult.CancellationRequested {
+		var relayResult transport.RelayResult
+		var seen observation
+		var relayErr error
+		if codex {
+			relayResult, seen, relayErr = relayCodexResponse(ctx, w, response, stream)
+		} else {
+			relayResult, seen, relayErr = relayNative(ctx, w, response, output, stream)
+		}
+		if relayResult.CancellationRequested || (relayErr != nil && ctx.Err() != nil) {
 			outcome.Cancellation = "requested"
 		}
 		outcome.Usage = seen.usage
@@ -886,7 +960,28 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		} else if relayErr != nil || seen.err != nil || relayResult.Truncated {
 			markIdempotency(ctx, "unknown")
 		}
+		if codex && !stream && (relayErr != nil || seen.err != nil) {
+			if outcome.Cancellation != "" {
+				return false, nil
+			}
+			return false, failure("upstream_outcome_unknown", 502, "upstream Responses stream could not be completed")
+		}
 		return false, nil
+	}
+	if codex && !x.native && !stream {
+		aggregated, usage, aggregateErr := aggregateCodexSSE(ctx, response)
+		if aggregateErr != nil {
+			markIdempotency(ctx, "unknown")
+			if ctx.Err() != nil {
+				outcome.Cancellation = "requested"
+				return false, nil
+			}
+			return false, failure("upstream_outcome_unknown", 502, "upstream Responses stream could not be completed")
+		}
+		codexAggregatedUsage = usage
+		response.Body = io.NopCloser(bytes.NewReader(aggregated))
+		response.ContentLength = int64(len(aggregated))
+		response.Header.Set("Content-Length", fmt.Sprint(len(aggregated)))
 	}
 	if stream {
 		response.Body = transport.NewIdleReader(ctx, response.Body, 120*time.Second)
@@ -962,6 +1057,9 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return false, err
 	}
 	outcome.Usage = resultUsage(result)
+	if outcome.Usage == nil {
+		outcome.Usage = codexAggregatedUsage
+	}
 	outcome.State = "settled"
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(response.StatusCode)

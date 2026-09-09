@@ -19,11 +19,18 @@ type NetworkPolicy struct {
 	AllowedHosts                          []string
 	AllowedCIDRs                          []netip.Prefix
 	AllowPrivate, AllowSameOriginRedirect bool
+	DisableCompression                    bool
+	NativeCodex                           bool
+	NativeScope                           string
 }
 type Pool struct {
-	mu              sync.Mutex
-	clients         map[string]*http.Client
-	maxConnsPerHost int
+	mu               sync.Mutex
+	clients          map[string]*http.Client
+	maxConnsPerHost  int
+	nativeEnginePath string
+	nativeMu         sync.Mutex
+	native           *nativeEngine
+	closed           bool
 }
 
 func NewPool() *Pool {
@@ -34,7 +41,7 @@ func NewPoolWithConfig(config core.TransportConfig) (*Pool, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	return &Pool{clients: make(map[string]*http.Client), maxConnsPerHost: config.ConnectionLimit()}, nil
+	return &Pool{clients: make(map[string]*http.Client), maxConnsPerHost: config.ConnectionLimit(), nativeEnginePath: config.NativeEnginePath}, nil
 }
 func (p *Pool) Client(policy NetworkPolicy) (*http.Client, error) {
 	hosts := append([]string(nil), policy.AllowedHosts...)
@@ -54,67 +61,121 @@ func (p *Pool) Client(policy NetworkPolicy) (*http.Client, error) {
 	if policy.AllowSameOriginRedirect {
 		key += "|redirect"
 	}
+	if policy.DisableCompression {
+		key += "|no-compression"
+	}
+	if policy.NativeCodex {
+		if policy.NativeScope == "" {
+			return nil, errors.New("native transport requires an isolated scope")
+		}
+		key += "|native\x00" + policy.NativeScope
+	} else {
+		key += "|portable\x00" + policy.NativeScope
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errors.New("transport pool is closed")
+	}
 	if c := p.clients[key]; c != nil {
+		enginePath := p.nativeEnginePath
+		p.mu.Unlock()
+		if policy.NativeCodex {
+			if _, err := p.ensureNative(enginePath); err != nil {
+				return nil, err
+			}
+		}
 		return c, nil
 	}
+	maxConns := p.maxConnsPerHost
+	enginePath := p.nativeEnginePath
+	p.mu.Unlock()
+
+	var engine *nativeEngine
+	var err error
+	if policy.NativeCodex {
+		engine, err = p.ensureNative(enginePath)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	policy.AllowedHosts = hosts
 	policy.AllowedCIDRs = append([]netip.Prefix(nil), policy.AllowedCIDRs...)
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	t := &http.Transport{Proxy: nil, ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 120 * time.Second, IdleConnTimeout: 90 * time.Second, MaxIdleConns: 256, MaxIdleConnsPerHost: 64, MaxConnsPerHost: p.maxConnsPerHost}
-	t.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-		if len(policy.AllowedHosts) > 0 {
-			ok := false
-			for _, h := range policy.AllowedHosts {
-				if strings.EqualFold(strings.TrimSuffix(host, "."), strings.TrimSuffix(h, ".")) {
-					ok = true
-					break
+	var c *http.Client
+	if policy.NativeCodex {
+		rt := newNativeRoundTripper(engine, policy, key, maxConns)
+		c = &http.Client{Transport: rt, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+	} else {
+		dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		t := &http.Transport{Proxy: nil, ForceAttemptHTTP2: true, DisableCompression: policy.DisableCompression, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 120 * time.Second, IdleConnTimeout: 90 * time.Second, MaxIdleConns: 256, MaxIdleConnsPerHost: 64, MaxConnsPerHost: maxConns}
+		t.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			if len(policy.AllowedHosts) > 0 {
+				ok := false
+				for _, h := range policy.AllowedHosts {
+					if strings.EqualFold(strings.TrimSuffix(host, "."), strings.TrimSuffix(h, ".")) {
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					return nil, errors.New("egress host denied")
 				}
 			}
-			if !ok {
-				return nil, errors.New("egress host denied")
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
 			}
-		}
-		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-		if err != nil {
-			return nil, err
-		}
-		if len(ips) == 0 {
-			return nil, errors.New("egress DNS returned no addresses")
-		}
-		// Reject the entire mixed DNS answer, rather than fail over to a forbidden address.
-		for _, ip := range ips {
-			if !AllowedAddress(ip, policy) {
-				return nil, errors.New("egress address denied")
+			if len(ips) == 0 {
+				return nil, errors.New("egress DNS returned no addresses")
 			}
-		}
-		var last error
-		for _, ip := range ips {
-			c, e := dialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
-			if e == nil {
-				return c, nil
+			// Reject the entire mixed DNS answer, rather than fail over to a forbidden address.
+			for _, ip := range ips {
+				if !AllowedAddress(ip, policy) {
+					return nil, errors.New("egress address denied")
+				}
 			}
-			last = e
+			var last error
+			for _, ip := range ips {
+				c, e := dialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+				if e == nil {
+					return c, nil
+				}
+				last = e
+			}
+			return nil, last
 		}
-		return nil, last
+		c = &http.Client{Transport: t, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !policy.AllowSameOriginRedirect || len(via) == 0 {
+				return http.ErrUseLastResponse
+			}
+			if len(via) >= 5 {
+				return errors.New("redirect limit exceeded")
+			}
+			if !SameOrigin(req.URL, via[0].URL) {
+				return errors.New("cross-origin redirect denied")
+			}
+			return nil
+		}}
 	}
-	c := &http.Client{Transport: t, CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if !policy.AllowSameOriginRedirect || len(via) == 0 {
-			return http.ErrUseLastResponse
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		if policy.NativeCodex {
+			_ = engine.Close()
 		}
-		if len(via) >= 5 {
-			return errors.New("redirect limit exceeded")
-		}
-		if !SameOrigin(req.URL, via[0].URL) {
-			return errors.New("cross-origin redirect denied")
-		}
-		return nil
-	}}
+		return nil, errors.New("transport pool is closed")
+	}
+	if existing := p.clients[key]; existing != nil {
+		return existing, nil
+	}
 	p.clients[key] = c
 	return c, nil
 }
@@ -148,6 +209,32 @@ func (p *Pool) CloseIdleConnections() {
 	for _, c := range p.clients {
 		c.CloseIdleConnections()
 	}
+}
+
+// Close prevents new clients, closes idle and active native work, and
+// supervises the native helper until it exits.
+func (p *Pool) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	clients := make([]*http.Client, 0, len(p.clients))
+	for _, c := range p.clients {
+		clients = append(clients, c)
+	}
+	p.mu.Unlock()
+	for _, c := range clients {
+		c.CloseIdleConnections()
+	}
+	p.nativeMu.Lock()
+	engine := p.native
+	p.nativeMu.Unlock()
+	if engine == nil {
+		return nil
+	}
+	return engine.Close()
 }
 func stripHop(h http.Header) {
 	for _, line := range h.Values("Connection") {

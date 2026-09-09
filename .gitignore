@@ -60,6 +60,7 @@ Thumbs.db
 # Go and application build output
 /.artifacts/
 /build/
+/native/codex-wire/target/
 /dist/
 /coverage/
 /hoorific

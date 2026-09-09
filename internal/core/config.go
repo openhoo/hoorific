@@ -230,12 +230,16 @@ const MaximumMaxConnsPerHost = 65536
 // TransportConfig bounds upstream connections per host within each isolated
 // network-policy client. Zero inherits the safe default, never unlimited.
 type TransportConfig struct {
-	MaxConnsPerHost int `json:"max_conns_per_host,omitempty"`
+	MaxConnsPerHost  int    `json:"max_conns_per_host,omitempty"`
+	NativeEnginePath string `json:"native_engine_path,omitempty"`
 }
 
 func (c TransportConfig) Validate() error {
 	if c.MaxConnsPerHost < 0 || c.MaxConnsPerHost > MaximumMaxConnsPerHost {
 		return fmt.Errorf("transport.max_conns_per_host must be between 1 and %d, or 0 for the default", MaximumMaxConnsPerHost)
+	}
+	if len(c.NativeEnginePath) > 4096 || strings.IndexByte(c.NativeEnginePath, 0) >= 0 {
+		return fmt.Errorf("transport.native_engine_path is invalid")
 	}
 	return nil
 }

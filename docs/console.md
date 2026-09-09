@@ -13,6 +13,7 @@ The Hoorific console is the embedded React operator UI at `/admin/`. It is a wor
 - [Collection workflow](#collection-workflow)
 - [Recommended setup order](#recommended-setup-order)
 - [Connections and credentials](#connections-and-credentials)
+- [Client profiles](#client-profiles)
 - [Models, aliases, routes, and limits](#models-aliases-routes-and-limits)
 - [API keys](#api-keys)
 - [Playground](#playground)
@@ -114,6 +115,21 @@ Use this as a recommended order for a new tenant; adapt it when a connector supp
 ## Connections and credentials
 
 Select a connection and choose **View actions** to scroll to and focus its action controls. Depending on permissions, the actions include **Test**, **Discover models**, and **Disable**; **Delete** is in the resource editor. A connection form uses **Connector**, **Account ID**, **Base URL**, **Region**, **Project**, **Dedicated**, **Enabled**, and **Connection settings (JSON object of string values)**. **Disable** refreshes the selected resource version; **Test** and **Discover models** return their action results without replacing the open editor. A clean editor follows a refreshed server state; an unsaved draft is retained with an explicit refresh notice and remains protected by version checks.
+
+### Client profiles
+
+The optional **Client profile** section sets client identity behavior on one connection. **Native/default** removes `client_profile` and preserves the connector's existing behavior. **Custom**, **Codex CLI**, **Codex Desktop**, and **ZCode Desktop** are static/header-only profiles: they can supply bounded identity headers, but do not rewrite request bodies, create session/request fingerprints, or emulate a complete desktop client.
+
+**Codex passthrough (caller headers)** is not an emulator. It requires real Codex input and forwards only the bounded identity and metadata headers accepted by the native Responses route. It leaves the caller's request body content intact, does not reproduce TLS or raw header casing/order, and is unavailable on portable routes, other protocols, and continuations. Selecting it clears static version, headers, and any Codex installation ID.
+
+**Codex exec (native)** is the genuine native wire profile for the measured Codex CLI `exec` persona. It is available only with `openai`, `compatible`, and `codex-subscription` connectors. The profile is fixed at version `0.153.4`, has no static identity-header editor, and requires a persistent canonical lowercase UUIDv4 `installation_id`. Selecting this preset generates a fresh ID with secure browser randomness; an operator may replace it with another valid UUIDv4, and the saved ID remains attached to that connection.
+
+Each Codex exec invocation starts an independent isolated session. Hoorific creates fresh UUIDv7 session, thread, request, turn, and context identities for that invocation; it does not borrow a caller's Codex identity, installation ID, or session state. The caller's actual prompt and tool definitions remain request content; workspace facts and tool implementations are not invented. The supported persona is `Linux/Arch Linux Unknown/x86_64/dumb` with native OpenSSL `3.6.3` and HTTP/1.1 without ALPN. Native and existing portable Responses generation preserve the caller's JSON or streaming response mode while using Codex SSE upstream. Existing portable protocol restrictions still apply. The profile does not execute tools or claim Codex Desktop, ZCode, OAuth, subscription entitlement, or provider-billing parity.
+
+For static profiles, **Identity header overrides (static/header-only)** is a JSON object of string values and accepts only the documented identity-header allowlist (including `User-Agent`, `Originator`, `Version`, `HTTP-Referer`, `X-Title`, ZCode identity headers, `Anthropic-Beta`, and the X-Stainless runtime headers). For passthrough, only incoming `Originator`, `User-Agent`, `Session-Id`, `Thread-Id`, `X-Client-Request-Id`, `X-Codex-Window-Id`, `X-Codex-Turn-Metadata`, `X-Codex-Beta-Features`, `Accept`, `Content-Type`, and `Accept-Encoding` are eligible. `Accept-Encoding` may be absent or `identity` only; compressed encodings are rejected because the gateway has no compressed-response decoder. Authentication, cookies, host, content length, forwarding, `X-Hoorific-*`, baggage, account/project/billing routing, and other caller headers are never forwarded. Connector compatibility and all profile invariants remain server-authoritative.
+
+The native helper is packaged beside the gateway in the scratch image. Operators building outside that image may set `transport.native_engine_path` to an explicitly built `hoorific-codex-wire`; the deployment guide describes the pinned musl build and its trust boundary. A profile neither grants provider entitlement nor changes gateway prices. Connections that omit `client_profile` retain missing-profile compatibility.
+
 
 Credentials are deliberately metadata-first. The collection can show status, version, and owning connection metadata, but not the secret value. The selected connection's **Credential lifecycle** panel can refresh encrypted-store metadata and show **Current credential version**. Expand only the flow you need; collapsing a flow does not discard its fields:
 

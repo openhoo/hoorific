@@ -73,7 +73,8 @@ func ClientFactory(pool *transport.Pool) func(core.Connection) (*http.Client, er
 		if err != nil || u.Host == "" || u.User != nil {
 			return nil, fmt.Errorf("connection requires explicit upstream base URL")
 		}
-		p := transport.NetworkPolicy{AllowedHosts: []string{u.Hostname()}, AllowPrivate: c.Settings["allow_private"] == "true", AllowSameOriginRedirect: c.Settings["allow_same_origin_redirect"] == "true"}
+		nativeCodex := c.ClientProfile != nil && c.ClientProfile.EmulatesCodex()
+		p := transport.NetworkPolicy{AllowedHosts: []string{u.Hostname()}, AllowPrivate: c.Settings["allow_private"] == "true", AllowSameOriginRedirect: c.Settings["allow_same_origin_redirect"] == "true", DisableCompression: nativeCodex || (c.ClientProfile != nil && c.ClientProfile.PreservesClientHeaders()), NativeCodex: nativeCodex, NativeScope: c.TenantID + "\x00" + c.ID}
 		for _, v := range strings.Split(c.Settings["allowed_cidrs"], ",") {
 			v = strings.TrimSpace(v)
 			if v == "" {

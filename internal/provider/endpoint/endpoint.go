@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"hoorific/internal/transport"
 )
 
 type Route struct {
@@ -178,6 +180,9 @@ func (c *Connector) Discover(ctx context.Context, conn core.Connection) ([]core.
 // DiscoverPage performs one authenticated page request. Providers that expose
 // cursors must follow the returned cursor with a descriptor-specific path.
 func (c *Connector) DiscoverPage(ctx context.Context, conn core.Connection, path string) (DiscoveryPage, error) {
+	if err := conn.ClientProfile.Validate(conn.Connector); err != nil {
+		return DiscoveryPage{}, err
+	}
 	if c.client == nil {
 		return DiscoveryPage{}, failure("configuration_stale", "Model discovery requires an injected HTTP client")
 	}
@@ -201,6 +206,12 @@ func (c *Connector) DiscoverPage(ctx context.Context, conn core.Connection, path
 	if err != nil {
 		return DiscoveryPage{}, err
 	}
+	if conn.ClientProfile != nil {
+		if err := conn.ClientProfile.Apply(req.Header); err != nil {
+			return DiscoveryPage{}, err
+		}
+	}
+	transport.SanitizeRequest(req)
 	if c.credentials == nil {
 		return DiscoveryPage{}, failure("connection_required", "Model discovery requires an injected credential source")
 	}

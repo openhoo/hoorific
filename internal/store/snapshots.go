@@ -76,7 +76,10 @@ func (s *Store) snapshot(ctx context.Context, p core.Principal, resolve bool) (c
 				if strictDecode([]byte(data), &x) != nil {
 					return problem("invalid_configuration", 500, "connection resource invalid")
 				}
-				c := core.Connection{TenantID: p.TenantID, ID: id, Version: version, Connector: x.Connector, AccountID: x.AccountID, BaseURL: x.BaseURL, Region: x.Region, Project: x.Project, Dedicated: x.Dedicated, Settings: copyStringMap(x.Settings)}
+				if profileErr := x.ClientProfile.Validate(x.Connector); profileErr != nil {
+					return problem("invalid_configuration", 500, profileErr.Error())
+				}
+				c := core.Connection{TenantID: p.TenantID, ID: id, Version: version, Connector: x.Connector, AccountID: x.AccountID, BaseURL: x.BaseURL, Region: x.Region, Project: x.Project, Dedicated: x.Dedicated, Settings: copyStringMap(x.Settings), ClientProfile: x.ClientProfile.Clone()}
 				if !x.Enabled {
 					if c.Settings == nil {
 						c.Settings = map[string]string{}

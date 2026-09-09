@@ -845,7 +845,7 @@ class BrowserCases:
             "connections",
             resource_id,
             lambda form: (
-                form.get_by_label("Connector", exact=True).fill("anthropic"),
+                form.get_by_label("Connector", exact=True).fill("openai"),
                 form.get_by_label("Account ID", exact=True).fill(
                     resource_id + "-account"
                 ),
@@ -857,11 +857,147 @@ class BrowserCases:
                     "Connection settings",
                     {"allow_private": "true", "allowed_cidrs": "127.0.0.1/32"},
                 ),
+                form.get_by_label("Profile preset", exact=True).select_option(
+                    "zcode-desktop"
+                ),
+                form.get_by_label("Client profile version", exact=True).fill(
+                    "3.1.8"
+                ),
+                self.set_json_map(
+                    form,
+                    "Identity header overrides (static/header-only)",
+                    {"X-ZCode-Agent": "glm"},
+                ),
             ),
         )
         self.selected_id = resource_id
+        version_field = editor.get_by_label("Client profile version", exact=True)
+        if version_field.get_attribute("required") is None:
+            raise RuntimeError("ZCode Desktop profile version was not marked required")
+        self.ui.screenshot(self.ui.evidence_dir / "connection-profile.png")
         editor.get_by_label("Region", exact=True).fill("browser-region-updated")
+        self.set_json_map(
+            editor,
+            "Identity header overrides (static/header-only)",
+            {"X-ZCode-Agent": "glm", "X-Title": "Browser profile"},
+        )
         self.save("connections", editor)
+        persisted = self.ui.admin_fetch(
+            "GET",
+            f"/admin/api/v1/connections/{quote(resource_id, safe='')}",
+        )
+        persisted_body = persisted.get("body")
+        persisted_data = (
+            persisted_body.get("data")
+            if isinstance(persisted_body, dict)
+            else None
+        )
+        persisted_profile = (
+            persisted_data.get("client_profile")
+            if isinstance(persisted_data, dict)
+            else None
+        )
+        if (
+            persisted["status"] != 200
+            or not isinstance(persisted_profile, dict)
+            or persisted_profile.get("preset") != "zcode-desktop"
+            or persisted_profile.get("version") != "3.1.8"
+            or persisted_profile.get("headers") != {
+                "X-ZCode-Agent": "glm",
+                "X-Title": "Browser profile",
+            }
+        ):
+            raise RuntimeError(
+                f"connection client profile was not persisted: "
+                f"{persisted['status']} / {redact(persisted_body)}"
+            )
+        editor.get_by_label("Profile preset", exact=True).select_option(
+            "codex-passthrough"
+        )
+        if editor.get_by_label("Client profile version", exact=True).count():
+            raise RuntimeError(
+                "Codex passthrough profile version editor remained visible"
+            )
+        if editor.get_by_label(
+            "Identity header overrides (static/header-only) (JSON object of string values)", exact=True
+        ).count():
+            raise RuntimeError(
+                "Codex passthrough static header editor remained visible"
+            )
+        self.save("connections", editor)
+        passthrough = self.ui.admin_fetch(
+            "GET",
+            f"/admin/api/v1/connections/{quote(resource_id, safe='')}",
+        )
+        passthrough_body = passthrough.get("body")
+        passthrough_data = (
+            passthrough_body.get("data")
+            if isinstance(passthrough_body, dict)
+            else None
+        )
+        passthrough_profile = (
+            passthrough_data.get("client_profile")
+            if isinstance(passthrough_data, dict)
+            else None
+        )
+        if (
+            passthrough["status"] != 200
+            or passthrough_profile != {"preset": "codex-passthrough"}
+        ):
+            raise RuntimeError(
+                f"Codex passthrough profile was not persisted exactly: "
+                f"{passthrough['status']} / {redact(passthrough_body)}"
+            )
+        self.ui.screenshot(self.ui.evidence_dir / "connection-passthrough.png")
+
+        editor.get_by_label("Profile preset", exact=True).select_option("codex-exec")
+        installation = editor.get_by_label("Codex installation ID (UUIDv4)", exact=True)
+        installation_id = installation.input_value()
+        if not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            installation_id,
+        ):
+            raise RuntimeError("Native Codex profile did not generate a canonical UUIDv4")
+        native_version = editor.get_by_label("Codex exec version", exact=True)
+        if native_version.input_value() != "0.153.4" or native_version.get_attribute("readonly") is None:
+            raise RuntimeError("Native Codex profile version is not pinned read-only")
+        installation.fill("invalid-installation-id")
+        if installation.evaluate("(element) => element.checkValidity()"):
+            raise RuntimeError("Native Codex profile accepted an invalid installation ID")
+        installation.fill(installation_id)
+        self.save("connections", editor)
+        native_profile = self.ui.page.evaluate(
+            """async ([id, installationID]) => {
+              const response = await fetch('/admin/api/v1/connections/' + encodeURIComponent(id), {credentials: 'same-origin'});
+              const body = await response.json();
+              const profile = body.data?.client_profile;
+              return response.status === 200 && profile?.preset === 'codex-exec'
+                && profile.version === '0.153.4' && profile.installation_id === installationID
+                && Object.keys(profile).sort().join(',') === 'installation_id,preset,version';
+            }""",
+            [resource_id, installation_id],
+        )
+        if not native_profile:
+            raise RuntimeError("Native Codex profile identity was not persisted exactly")
+        self.ui.screenshot(self.ui.evidence_dir / "connection-codex-native.png")
+
+        editor.get_by_label("Profile preset", exact=True).select_option("")
+        self.save("connections", editor)
+        removed = self.ui.admin_fetch(
+            "GET",
+            f"/admin/api/v1/connections/{quote(resource_id, safe='')}",
+        )
+        removed_body = removed.get("body")
+        removed_data = removed_body.get("data") if isinstance(removed_body, dict) else None
+        if (
+            removed["status"] != 200
+            or not isinstance(removed_data, dict)
+            or "client_profile" in removed_data
+        ):
+            raise RuntimeError(
+                f"connection client profile removal was not persisted: "
+                f"{removed['status']} / {redact(removed_body)}"
+            )
         actions = self.ui.panel("Connection actions")
         disabled = self.ui.expect_response(
             "POST",
@@ -876,6 +1012,12 @@ class BrowserCases:
         return {
             "created": True,
             "updated": True,
+            "profile_persisted": True,
+            "passthrough_persisted": True,
+            "passthrough_static_fields_hidden": True,
+            "native_profile_persisted": True,
+            "native_installation_id_validated": True,
+            "profile_removed": True,
             "disabled_status": disabled["status"],
             "deleted": True,
         }

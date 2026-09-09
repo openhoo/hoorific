@@ -144,6 +144,9 @@ func (g *Gateway) reconcileNativeJob(ctx context.Context, job resource.Job, s co
 	if !ok {
 		return false, nil
 	}
+	if err := c.ClientProfile.Validate(c.Connector); err != nil {
+		return false, err
+	}
 	operation := meta.Policy.PollOperation
 	if operation == "" {
 		operation = meta.Binding.Codec.Operation
@@ -176,6 +179,11 @@ func (g *Gateway) reconcileNativeJob(ctx context.Context, job resource.Job, s co
 		}
 	}
 	req.Header.Set("Accept", "application/json")
+	if c.ClientProfile != nil {
+		if err := c.ClientProfile.Apply(req.Header); err != nil {
+			return false, err
+		}
+	}
 	transportSanitize(req)
 	lease, err := g.deps.Credentials.Lease(ctx, c)
 	if err != nil || lease == nil {

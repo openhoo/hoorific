@@ -7,12 +7,21 @@ Hoorific is distributed as source and build recipes. The `publish-image` job in
 forks, manual runs, and non-`main` pushes do not publish. Local `hoorific:local`
 Docker and Podman builds remain supported.
 
-The Dockerfile produces one statically linked gateway image with two executable entrypoints:
+The Dockerfile produces a `scratch` image containing the statically linked,
+CGO-free gateway and its sibling native `hoorific-codex-wire` helper. The
+gateway exposes two executable commands:
 
 - `hoorific migrate --config /etc/hoorific/config.json` applies pending database migrations and exits.
 - `hoorific serve --config /etc/hoorific/config.json` starts the inference and management listeners.
 
-The final image is based on `scratch`. It contains only the gateway, the CA trust bundle, full timezone data, minimal user/group records, and the required directories. It runs as UID/GID `10001`; there is no shell, package manager, or debugging utility. For the paths used by the supplied Compose and chart examples, writable state is confined to the mounted data directory and `/tmp`; `data_dir`, the SQLite path, and secret paths are configuration inputs and must point to readable locations that are mounted into the container. A read-only root filesystem still needs writable mounts for the data directory and `/tmp`.
+The final image contains only those executables, the CA trust bundle, full
+timezone data, minimal user/group records, and the required directories. It
+runs as UID/GID `10001`; there is no shell, package manager, or debugging
+utility. For the paths used by the supplied Compose and chart examples,
+writable state is confined to the mounted data directory and `/tmp`;
+`data_dir`, the SQLite path, and secret paths are configuration inputs and must
+point to readable locations that are mounted into the container. A read-only
+root filesystem still needs writable mounts for the data directory and `/tmp`.
 
 All paths beginning with `.artifacts/` in this document are private operator-local output paths. They are not shipped proof files or public repository assets.
 Once the runtime is configured, use the [Console guide](console.md) for the embedded operator workflow, including model collection and editing, routing setup, and the playground. Its screenshots use isolated synthetic fixtures rather than live-provider data.
@@ -116,6 +125,177 @@ The gateway serves plain HTTP and does not terminate TLS. Put it behind a truste
 
 `/health/live`, `/health/ready`, and `/metrics` are unauthenticated management routes. Treat their status and metrics as information for a restricted network, not as public authorization or readiness proof.
 The loopback bootstrap guard is based on the peer address seen by the management process and does not trust forwarded headers. A host-published bridge port normally does not preserve a loopback peer; a proxy or sidecar that appears as loopback must be treated as part of the trusted boundary. Do not weaken the guard to make a port-forwarded bootstrap work.
+
+## Connection client profiles
+
+The management API accepts an optional `client_profile` on a connection. The
+server validates the preset and connector matrix and rejects unsupported
+combinations instead of silently ignoring profile fields.
+
+| Preset | Compatible connectors | Behavior |
+| --- | --- | --- |
+| `custom` | `openai`, `anthropic`, `compatible`, `codex-subscription` | Static/header-only identity overrides |
+| `codex-cli` | `openai`, `compatible`, `codex-subscription` | Static/header-only Codex CLI identity hint |
+| `codex-desktop` | `openai`, `compatible`, `codex-subscription` | Static/header-only desktop identity hint |
+| `zcode-desktop` | `openai`, `anthropic`, `compatible` | Static/header-only ZCode identity hint |
+| `codex-passthrough` | `openai`, `compatible`, `codex-subscription` | Bounded caller metadata on native Responses |
+| `codex-exec` | `openai`, `compatible`, `codex-subscription` | Native Codex CLI `exec` wire emulation |
+
+Static profiles are header-only identity hints. They do not rewrite request
+bodies, create session/request fingerprints, or emulate a complete desktop
+client. Their default identity behavior is:
+
+| Preset | Default identity headers |
+| --- | --- |
+| `custom` | Only the explicit `headers` map |
+| `codex-cli` | `Originator: codex_cli_rs`; `User-Agent: codex_cli_rs/<version>` when a version is supplied |
+| `codex-desktop` | No guessed defaults; explicit `Originator` and `User-Agent` are required |
+| `zcode-desktop` | `User-Agent: ZCode/<version>`, `X-ZCode-App-Version: <version>`, `HTTP-Referer: https://zcode.z.ai`, `X-Title: Z Code` |
+
+`codex-passthrough` is not an emulator. It requires real Codex input and
+forwards only bounded caller identity and metadata on the native Responses
+route. It leaves the caller's request body content intact, does not reproduce
+TLS or raw header casing/order, and is unavailable on portable routes, other
+protocols, and continuations. It has no static version or header defaults.
+
+### Native Codex exec profile
+
+`codex-exec` is the genuine native wire profile for the measured Codex CLI
+`exec` persona. It is fixed to version `0.153.4`; no other Codex release is
+promised or selected. The profile has no static identity-header map and
+requires a persistent canonical lowercase UUIDv4 `installation_id`. The
+installation ID belongs to the connection and must not be reused on another
+profile. Omitting the version or sending an empty version is accepted only as
+the profile's compatibility encoding; a nonempty value must be exactly
+`0.153.4`.
+
+```json
+{
+  "client_profile": {
+    "preset": "codex-exec",
+    "version": "0.153.4",
+    "installation_id": "e7ccd59d-93e4-4cf4-bab4-4cc65f55e922"
+  }
+}
+```
+
+Generate a distinct installation ID for each configured connection; the value
+above is only a configuration example.
+
+The console generates a fresh installation ID with secure browser randomness
+when this preset is selected. An operator may explicitly replace it with
+another valid canonical UUIDv4. The saved ID remains attached to that
+connection, while static profiles and passthrough omit the field. Selecting
+passthrough also removes static headers and version; selecting a static preset
+removes the installation ID.
+
+Each `codex-exec` invocation is an independent isolated exec session. Hoorific
+creates fresh UUIDv7 session, thread, request, turn, and context identities
+for every invocation. It does not borrow the incoming client's Codex identity,
+installation ID, or session state, and does not synthesize workspace facts.
+The caller's actual prompt and tool definitions remain request content; the
+gateway does not invent a harness prompt or tool implementation.
+
+The supported persona is `Linux/Arch Linux Unknown/x86_64/dumb`, with native
+OpenSSL `3.6.3` and HTTP/1.1 without ALPN. Native and existing portable Responses
+generation are supported on the compatible connectors above. Upstream requests
+always use Codex SSE; the caller still receives its requested JSON or streaming
+response. Portable routes retain their existing strict protocol subset.
+Unsupported endpoints, continuations, incompatible body controls, and connectors are
+rejected before inference admission. The profile does not execute tools and
+does not claim Codex TUI/Desktop, ZCode, full agent-loop, ChatGPT OAuth,
+subscription entitlement, or provider-billing parity.
+
+The native helper uses the gateway's validated network policy: Go validates
+DNS answers and pins all permitted concrete addresses for each request, while
+the helper does not independently resolve targets, proxies, or redirects.
+Redirects are disabled; the URL hostname remains the TLS SNI/certificate
+identity; certificate verification remains enabled. Native requests do not
+forward caller authentication, cookies, proxy credentials, routing/billing
+claims, trace headers, or arbitrary headers. The helper is supervised through
+a per-process Unix socket in a temporary `0700` directory with a `0600`
+socket, and a missing or broken helper fails closed before admission. These
+controls do not make the gateway a TLS terminator.
+Normalized numeric URL destinations must also match the approved IP pins.
+Native TLS requires TLS 1.2 or newer. The helper accepts the configured
+per-host limit up to 65536, separately caps active IPC requests at 256,
+and retains at most 64 idle connections per cached upstream client.
+
+### Native helper path and build
+
+The scratch image contains `hoorific-codex-wire` beside
+`/usr/local/bin/hoorific`. At runtime, an operator may set
+`transport.native_engine_path` to an explicit helper path. When it is empty,
+the gateway first looks for `hoorific-codex-wire` beside its executable and
+then on `PATH`. Keep this path controlled by the service owner; it is an
+executable-code trust boundary, not a provider setting.
+
+The helper is built as a static Linux musl binary with vendored OpenSSL. The
+Dockerfile uses the pinned
+`docker.io/library/rust:1.95.0-alpine3.23@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2`
+builder and Cargo cache mounts, then copies only the helper into the existing
+scratch runtime. The Go gateway remains `CGO_ENABLED=0`. The runtime retains
+the CA bundle, full timezone data, UID/GID `10001`, read-only-root
+compatibility, and writable `/tmp` and state-directory contracts. The
+measured `x86_64` persona does not constitute a qualification claim for other
+architectures.
+
+For a native host build, install Rust `1.95.0`, the
+`x86_64-unknown-linux-musl` target, and a musl C toolchain, then build the
+supplied crate without changing its lock:
+
+```sh
+rustup toolchain install 1.95.0 --profile minimal \
+  --target x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+OPENSSL_STATIC=1 \
+RUSTFLAGS='-C target-feature=+crt-static' \
+cargo +1.95.0 build --locked --release \
+  --manifest-path native/codex-wire/Cargo.toml \
+  --target x86_64-unknown-linux-musl \
+  --target-dir .artifacts/codex-wire-target
+```
+
+Point a development configuration at the resulting helper when it is not
+next to the gateway:
+
+```json
+{
+  "transport": {
+    "native_engine_path": "/absolute/path/to/.artifacts/codex-wire-target/x86_64-unknown-linux-musl/release/hoorific-codex-wire"
+  }
+}
+```
+
+The native profile is a pinned wire-compatibility implementation, not a
+general Codex runtime. It does not promise custom-CA rustls behavior, desktop
+UI behavior, OAuth account authorization, provider subscription access, tool
+execution, or billing equivalence.
+
+For static profiles, the console's **Identity header overrides
+(static/header-only)** JSON object accepts only identity headers such as
+`User-Agent`, `Originator`, `Version`, `HTTP-Referer`, `X-Title`, ZCode
+identity headers, `Anthropic-Beta`, and the X-Stainless runtime headers. For
+passthrough, only incoming `Originator`, `User-Agent`, `Session-Id`,
+`Thread-Id`, `X-Client-Request-Id`, `X-Codex-Window-Id`,
+`X-Codex-Turn-Metadata`, `X-Codex-Beta-Features`, `Accept`, `Content-Type`,
+and `Accept-Encoding` are eligible on native Responses. `Accept-Encoding` may
+be absent or `identity` only; compressed encodings are rejected because the
+gateway has no compressed-response decoder. Duplicate names, multivalues,
+controls, invalid UTF-8, edge whitespace, oversized values, oversized
+aggregate metadata, unknown `x-codex-*`, and headers nominated by
+`Connection` are rejected. Authentication, cookies, host, content length,
+forwarding, `X-Hoorific-*`, baggage, account/project/billing routing, and
+other caller headers are never forwarded.
+
+Omitting `client_profile` preserves the legacy/native connector behavior. A
+profile neither grants provider entitlement nor changes Hoorific gateway
+prices. If distinct client identities must be routed separately, give them
+distinct connections and route targets. To remove a profile, update the
+connection with the same data but omit `client_profile`; the omission is
+intentional and is not a request to synthesize native headers.
+
 
 ## Cost, caching, and replay safety
 
@@ -284,7 +464,20 @@ podman build --tag hoorific:local .
 # or: docker build --tag hoorific:local .
 ```
 
-The Dockerfile selects Go `1.27` and Bun `1.3.14` version tags. Those tags are not immutable supply-chain pins; production builders should pin and verify approved base-image digests. Its build graph copies `go.mod` and `go.sum` before backend sources and uses shared Go module/build caches. The schema stage copies only `tools/schema`, `internal/admin`, and `internal/core`; changes elsewhere do not invalidate that stage. The frontend stage installs from `web/package.json` and `web/bun.lock`, creates `web/src/generated`, generates API types from the fresh schema, and builds the console. The Go stage embeds those compiled assets; generated API types and host-built console output are not taken from the checkout.
+The Dockerfile selects Go `1.27`, Bun `1.3.14`, and the pinned Rust
+`1.95.0-alpine3.23` builder for the native helper. Go remains
+`CGO_ENABLED=0`. The Go and Rust base tags are not immutable supply-chain
+pins unless the approved digests are retained; the native Rust builder is
+pinned by digest in the Dockerfile. The build graph copies `go.mod` and
+`go.sum` before backend sources and uses shared Go module/build caches. The
+native stage copies `Cargo.toml` and `Cargo.lock` before helper sources and
+uses locked Cargo registry, Git, and target caches. The schema stage copies
+only `tools/schema`, `internal/admin`, and `internal/core`; changes elsewhere
+do not invalidate that stage. The frontend stage installs from
+`web/package.json` and `web/bun.lock`, creates `web/src/generated`, generates
+API types from the fresh schema, and builds the console. The Go stage embeds
+those compiled assets; generated API types and host-built console output are
+not taken from the checkout.
 
 To isolate builder caches, set a distinct namespace:
 
@@ -296,7 +489,8 @@ podman build \
 
 Cache mounts use locked sharing within a namespace. Separate namespaces avoid contention at the cost of reuse; they do not reduce total builder-side storage. The runtime-files stage copies certificates and timezone data from the selected Go image instead of running APT in the runtime stage. For debugging, use external tooling or a separate diagnostic container: `exec ... sh` is intentionally unavailable.
 
-The following is a host-side fresh-checkout source sequence, not a guarantee of the Dockerfile's target OS/architecture or runtime-image provenance:
+The following is a host-side fresh-checkout source sequence, not a guarantee
+of the Dockerfile's target OS/architecture or runtime-image provenance:
 
 ```sh
 mkdir -p .artifacts web/src/generated
@@ -304,10 +498,31 @@ go run ./tools/schema --output .artifacts/admin-openapi.json
 (cd web && bun install --frozen-lockfile)
 bun run --cwd web generate-api
 bun run --cwd web build
-CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o .artifacts/hoorific ./cmd/hoorific
+
+rustup toolchain install 1.95.0 --profile minimal \
+  --target x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+OPENSSL_STATIC=1 \
+RUSTFLAGS='-C target-feature=+crt-static' \
+cargo +1.95.0 build --locked --release \
+  --manifest-path native/codex-wire/Cargo.toml \
+  --target x86_64-unknown-linux-musl \
+  --target-dir .artifacts/codex-wire-target
+install -m 0755 \
+  .artifacts/codex-wire-target/x86_64-unknown-linux-musl/release/hoorific-codex-wire \
+  .artifacts/hoorific-codex-wire
+
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+  -o .artifacts/hoorific ./cmd/hoorific
 ```
 
-The schema must be generated before `bun run generate-api`; the console must be built before the Go binary is compiled. Source-only generated files are intentionally not committed.
+The schema must be generated before `bun run generate-api`; the console must
+be built before the Go binary is compiled; and the native helper must be
+built before a Codex exec request can use it. Source-only generated files and
+local helper/build outputs are intentionally not committed. Docker builds use
+the builder's native musl target for the image platform; the measured persona
+and CI helper target are `x86_64`.
 
 ## Standalone Compose
 

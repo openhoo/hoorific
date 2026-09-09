@@ -36,6 +36,7 @@ type Connection struct {
 	Version                                                      int64
 	Dedicated                                                    bool
 	Settings                                                     map[string]string
+	ClientProfile                                                *ClientProfile
 }
 type Model struct {
 	ID, CatalogID, ConnectionID       string

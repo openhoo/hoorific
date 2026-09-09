@@ -199,7 +199,11 @@ func serve(cfg core.BootstrapConfig, db *store.Store, keys credential.Keyring) e
 	if err != nil {
 		return err
 	}
-	defer pool.CloseIdleConnections()
+	defer func() {
+		if err := pool.Close(); err != nil {
+			slog.Warn("transport pool shutdown incomplete", "error_type", fmt.Sprintf("%T", err))
+		}
+	}()
 	clients := app.ClientFactory(pool)
 	runtimeState, err := app.NewRuntimeState(cfg, db)
 	if err != nil {

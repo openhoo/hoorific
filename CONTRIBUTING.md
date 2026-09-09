@@ -16,6 +16,8 @@ qualification.
 - Go 1.27.0, as declared by `go.mod`.
 - Bun 1.3.14, matching the frontend image and CI.
 - Python 3.13 for the SDK/browser qualification.
+- Rust 1.95.0 with the `x86_64-unknown-linux-musl` target and a musl C
+  toolchain for the native Codex wire helper.
 - Podman (preferred) or a Docker-compatible builder for the image. The full
   deterministic `all` scenario also requires local Podman and a cached
   `docker.io/library/postgres:17` image for its isolated FAL child. Cluster
@@ -28,7 +30,7 @@ paths. It does not use an operator database or ambient provider credentials.
 
 Generated API types and console assets are source-only build outputs. Start from
 an empty generated directory and run the schema stage before the frontend; run
-both before Go tests or a runtime build:
+both before Go checks or a runtime build from a fresh checkout:
 
 ```sh
 mkdir -p .artifacts
@@ -41,6 +43,17 @@ mkdir -p web/src/generated
   bun run typecheck
   bun run build
 )
+
+rustup toolchain install 1.95.0 --profile minimal \
+  --target x86_64-unknown-linux-musl
+cargo +1.95.0 build --locked --release \
+  --manifest-path native/codex-wire/Cargo.toml \
+  --target x86_64-unknown-linux-musl \
+  --target-dir .artifacts/codex-wire-target
+install -m 0755 \
+  .artifacts/codex-wire-target/x86_64-unknown-linux-musl/release/hoorific-codex-wire \
+  .artifacts/hoorific-codex-wire
+export HOORIFIC_TEST_CODEX_WIRE="$PWD/.artifacts/hoorific-codex-wire"
 
 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o .artifacts/hoorific ./cmd/hoorific
 CGO_ENABLED=0 go build -trimpath -tags qualification -ldflags='-s -w' \
@@ -206,9 +219,11 @@ podman build --tag hoorific:local .
 # docker build --tag hoorific:local .
 ```
 
-The current CI image step builds and inspects a local image; no artifact is
-published by default. Any future registry or release publication must be a
-separate, explicitly permissioned and reviewed change.
+Pull requests build and inspect the image without publishing it. After successful
+qualification on trusted pushes to `main`, CI refreshes console screenshots and
+publishes the Linux/amd64 image to GHCR. Hooversion manages release commits, tags,
+and GitHub Releases from Conventional Commits; do not create competing manual
+release tags. See `.github/workflows/ci.yml` for publication gates and permissions.
 
 ## Pull requests
 

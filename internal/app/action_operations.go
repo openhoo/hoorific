@@ -13,6 +13,7 @@ import (
 	"hoorific/internal/catalog"
 	"hoorific/internal/core"
 	"hoorific/internal/routing"
+	"hoorific/internal/transport"
 )
 
 const operationPayloadLimit = 1 << 20
@@ -312,6 +313,13 @@ func (a *Actions) jobAction(ctx context.Context, p core.Principal, id, action st
 	for k, values := range binding.Headers {
 		req.Header[k] = append([]string(nil), values...)
 	}
+	if conn.ClientProfile != nil {
+		if err = conn.ClientProfile.Apply(req.Header); err != nil {
+			_ = release(job.Status)
+			return nil, err
+		}
+	}
+	transport.SanitizeRequest(req)
 	if a.deps.Credentials == nil {
 		_ = release(job.Status)
 		return nil, actionError("connection_required", 400, "Connection credential source unavailable")

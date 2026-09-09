@@ -21,6 +21,7 @@ tools/verify
 **/*_test.go
 web/src/generated
 .local
+native/codex-wire/target
 deploy
 backups
 .venv

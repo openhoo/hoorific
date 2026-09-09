@@ -39,6 +39,9 @@ func Compile(s core.RuntimeSnapshot) (*Catalog, error) {
 		if key == "" || value.ID == "" || key != value.ID {
 			return nil, fmt.Errorf("connection key and ID must match")
 		}
+		if profileErr := value.ClientProfile.Validate(value.Connector); profileErr != nil {
+			return nil, profileErr
+		}
 		if _, ok := c.connections[key]; ok {
 			return nil, fmt.Errorf("duplicate connection %q", key)
 		}
@@ -241,6 +244,7 @@ func (c *Catalog) Snapshot() core.RuntimeSnapshot {
 
 func cloneConnection(v core.Connection) core.Connection {
 	v.Settings = copyStrings(v.Settings)
+	v.ClientProfile = v.ClientProfile.Clone()
 	return v
 }
 func cloneModel(v core.Model) core.Model {

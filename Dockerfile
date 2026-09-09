@@ -32,6 +32,21 @@ COPY web/src ./src
 COPY --from=schema /out/admin-openapi.json /src/.artifacts/admin-openapi.json
 RUN mkdir -p src/generated && bun run generate-api && bun run build
 
+FROM docker.io/library/rust:1.95.0-alpine3.23@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS native-build
+ARG HOORIFIC_CACHE_NAMESPACE
+WORKDIR /src
+ENV OPENSSL_STATIC=1 \
+    CARGO_TARGET_DIR=/src/target
+RUN apk add --no-cache build-base perl
+COPY native/codex-wire/Cargo.toml native/codex-wire/Cargo.lock ./native/codex-wire/
+COPY native/codex-wire/src ./native/codex-wire/src
+RUN --mount=type=cache,id=${HOORIFIC_CACHE_NAMESPACE}-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=${HOORIFIC_CACHE_NAMESPACE}-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=${HOORIFIC_CACHE_NAMESPACE}-cargo-target,target=/src/target,sharing=locked \
+    cargo build --locked --release --manifest-path native/codex-wire/Cargo.toml && \
+    mkdir -p /out && \
+    cp target/release/hoorific-codex-wire /out/hoorific-codex-wire
+
 FROM go-deps AS build
 ARG HOORIFIC_CACHE_NAMESPACE
 WORKDIR /src
@@ -64,6 +79,7 @@ RUN set -eux; \
 FROM scratch AS runtime
 COPY --from=runtime-files /runtime/ /
 COPY --from=build /out/hoorific /usr/local/bin/hoorific
+COPY --from=native-build /out/hoorific-codex-wire /usr/local/bin/hoorific-codex-wire
 USER 10001:10001
 ENV TZ=UTC
 ENTRYPOINT ["/usr/local/bin/hoorific"]
