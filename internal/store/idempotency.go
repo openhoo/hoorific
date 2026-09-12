@@ -523,6 +523,30 @@ func (s *Store) BeginIdempotency(ctx context.Context, req core.IdempotencyReques
 	return out, err
 }
 
+// DiscardIdempotency frees a pending claim whose request was rejected before
+// any upstream intent. Only the pending owner's row is removed; rows already
+// in a terminal state are left untouched so replay semantics never regress.
+func (s *Store) DiscardIdempotency(ctx context.Context, req core.IdempotencyRequest) error {
+	if err := validateIdempotencyRequest(req, true); err != nil {
+		return err
+	}
+	keyHash := idempotencyHash("key", req.Key)
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		row, err := s.loadIdempotencyRow(ctx, tx, req.TenantID, req.SubjectID, keyHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if row.OwnerID != req.OwnerID || row.State != "pending" {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, s.Query("DELETE FROM idempotency_records WHERE tenant_id=? AND subject_id=? AND key_hash=? AND owner_id=? AND state='pending'"), req.TenantID, req.SubjectID, keyHash, req.OwnerID)
+		return err
+	})
+}
+
 // FinishIdempotency durably records a terminal response or an unreplayable
 // tombstone. Only the owner that won BeginIdempotency may finish a pending row.
 func (s *Store) FinishIdempotency(ctx context.Context, req core.IdempotencyRequest, response *core.IdempotencyResponse) error {

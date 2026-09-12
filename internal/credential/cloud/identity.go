@@ -205,6 +205,45 @@ func NewWIF(c WIFConfig) (*WIF, error) {
 	}
 	return &WIF{cfg: c, client: cl}, nil
 }
+
+// readIdentityTokenFile applies bounded regular-file semantics: os.Stat
+// rejects non-regular or oversized tokens before os.Open (preventing
+// blocking opens on FIFOs or devices), the fd re-stat narrows the
+// stat-to-open swap window, and the read is capped at 4 MiB + 1 bytes.
+func readIdentityTokenFile(path string) ([]byte, error) {
+	const limit = 4 << 20
+	if path == "" {
+		return nil, errors.New("Anthropic WIF identity token read failed")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, errors.New("Anthropic WIF identity token read failed")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("Anthropic WIF identity token must be a regular file")
+	}
+	if info.Size() > limit {
+		return nil, errors.New("Anthropic WIF identity token has invalid size")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("Anthropic WIF identity token read failed")
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil {
+		return nil, errors.New("Anthropic WIF identity token read failed")
+	} else if !info.Mode().IsRegular() || info.Size() > limit {
+		return nil, errors.New("Anthropic WIF identity token has invalid size")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, errors.New("Anthropic WIF identity token read failed")
+	}
+	if len(raw) == 0 || int64(len(raw)) > limit {
+		return nil, errors.New("Anthropic WIF identity token has invalid size")
+	}
+	return raw, nil
+}
 func (w *WIF) Authorize(ctx context.Context, r *http.Request) error {
 	t, e := w.accessToken(ctx)
 	if e != nil {
@@ -230,12 +269,9 @@ func (w *WIF) accessToken(ctx context.Context) (string, error) {
 		return t, nil
 	}
 	w.mu.Unlock()
-	raw, e := os.ReadFile(w.cfg.IdentityTokenFile)
+	raw, e := readIdentityTokenFile(w.cfg.IdentityTokenFile)
 	if e != nil {
-		return "", errors.New("Anthropic WIF identity token read failed")
-	}
-	if len(raw) == 0 || len(raw) > 4<<20 {
-		return "", errors.New("Anthropic WIF identity token has invalid size")
+		return "", e
 	}
 	payload := map[string]string{"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": strings.TrimSpace(string(raw)), "federation_rule_id": w.cfg.FederationRuleID, "organization_id": w.cfg.OrganizationID, "service_account_id": w.cfg.ServiceAccountID}
 	if w.cfg.WorkspaceID != "" {

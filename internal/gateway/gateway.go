@@ -800,10 +800,14 @@ func (g *Gateway) attempt(ctx context.Context, w http.ResponseWriter, r *http.Re
 	plan := core.AttemptPlan{TenantID: p.TenantID, RequestID: id, AttemptID: requestID(), KeyID: p.KeyID, KeyRevision: p.KeyRevision, ConfigRevision: s.Revision, ConnectionID: t.connection.ID, AccountID: t.connection.AccountID, ModelID: t.model.CatalogID, Deadline: deadline}
 	plan, err = g.deps.Planner.PlanAttempt(ctx, p, s, t.target, op, body, plan)
 	if err != nil {
+		// Rejected before any upstream intent: nothing ambiguous executed, so
+		// idempotency finish may free the key instead of tombstoning it.
+		markIdempotency(ctx, "not_dispatched")
 		return false, markPreIntentStale(err)
 	}
 	permit, err := g.deps.Admission.BeginAttempt(ctx, plan)
 	if err != nil {
+		markIdempotency(ctx, "not_dispatched")
 		return false, markPreIntentStale(err)
 	}
 	ctx, attemptTelemetry := gatewayStartAttempt(ctx, x, binding, op, t.model.ID, t.connection.Connector, stream, gatewayIsRetry(ctx))

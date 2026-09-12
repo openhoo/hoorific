@@ -185,9 +185,24 @@ type idempotencyExecution struct {
 	write *idempotencyCaptureWriter
 }
 
+type idempotencyDiscarder interface {
+	DiscardIdempotency(ctx context.Context, req core.IdempotencyRequest) error
+}
+
 func (e *idempotencyExecution) finish(ctx context.Context) {
 	if e == nil || e.store == nil || e.write == nil {
 		return
+	}
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if e.state.value() == "not_dispatched" {
+		// The request was rejected before any upstream intent (plan or
+		// admission policy). Nothing ambiguous executed, so the key is freed
+		// for a retry instead of leaving a permanent unreplayable tombstone.
+		if d, ok := e.store.(idempotencyDiscarder); ok {
+			_ = d.DiscardIdempotency(finishCtx, e.req)
+			return
+		}
 	}
 	var response *core.IdempotencyResponse
 	if e.state.value() == "terminal" {
@@ -195,8 +210,6 @@ func (e *idempotencyExecution) finish(ctx context.Context) {
 			response = &captured
 		}
 	}
-	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
 	if err := e.store.FinishIdempotency(finishCtx, e.req, response); err != nil {
 		// A lost completion is intentionally left pending/unreplayable by the
 		// durable store. Never attempt a second provider dispatch here.

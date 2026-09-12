@@ -45,7 +45,7 @@ type cachedConnector struct {
 func (a *connectionAdapter) instance(c core.Connection) (core.Connector, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	key := c.TenantID + "/" + c.ID
+	key := c.TenantID + "\x00" + c.ID // NUL separator: tenant/connection IDs may contain "/"
 	if v, ok := a.cache[key]; ok && v.version == c.Version {
 		return v.connector, nil
 	}

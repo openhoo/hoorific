@@ -985,7 +985,7 @@ func (e *environment) streaming(key string) result {
 		return result{"streaming", "failed", err.Error(), time.Since(start).Milliseconds(), nil}
 	}
 	defer r.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	b, ttfb, err := readBodyWithTTFB(r.Body, 2<<20, start)
 	if err != nil {
 		return result{"streaming", "failed", err.Error(), time.Since(start).Milliseconds(), nil}
 	}
@@ -995,7 +995,7 @@ func (e *environment) streaming(key string) result {
 	if !bytes.Contains(b, []byte("[DONE]")) {
 		return result{"streaming", "failed", "stream omitted terminal [DONE]", time.Since(start).Milliseconds(), nil}
 	}
-	return result{"streaming", "passed", "actual gateway stream contained terminal marker", time.Since(start).Milliseconds(), map[string]any{"bytes": len(b), "ttfb_ms": time.Since(start).Milliseconds()}}
+	return result{"streaming", "passed", "actual gateway stream contained terminal marker", time.Since(start).Milliseconds(), map[string]any{"bytes": len(b), "ttfb_ms": ttfb.Milliseconds()}}
 }
 func (e *environment) get(name, url string, h func(*http.Request), check func(*http.Response, []byte) error) result {
 	start := time.Now()

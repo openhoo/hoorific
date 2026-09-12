@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -33,7 +34,13 @@ func (s *IdentitySource) Lease(ctx context.Context, c core.Connection) (core.Cre
 	if mode == "" || mode == "api_key" || mode == "oauth" || mode == "keyless" {
 		return s.Stored.Lease(ctx, c)
 	}
-	key := c.TenantID + "/" + c.ID
+	key := c.TenantID + "\x00" + c.ID // NUL separator: tenant/connection IDs may contain "/"
+	// Critical section must stay bounded: holders may block only on the capped
+	// regular-file read in readCredentialFile, never on FIFOs, devices, or
+	// unbounded files, so queued cloud leases cannot be wedged indefinitely.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if l, ok := s.leases[key]; ok && l.version == c.Version {
@@ -46,7 +53,7 @@ func (s *IdentitySource) Lease(ctx context.Context, c core.Connection) (core.Cre
 		lease, err = cloud.NewGoogle(ctx, cloud.GoogleConfig{EnableADC: true})
 	case "google_service_account":
 		var raw []byte
-		raw, err = os.ReadFile(c.Settings["credential_file"])
+		raw, err = readCredentialFile(ctx, c.Settings["credential_file"])
 		if err == nil {
 			lease, err = cloud.NewGoogle(ctx, cloud.GoogleConfig{CredentialsJSON: raw})
 		}
@@ -91,4 +98,46 @@ func ClientFactory(pool *transport.Pool) func(core.Connection) (*http.Client, er
 		}
 		return pool.Client(p)
 	}
+}
+
+const credentialFileLimit = 4 << 20 // matches the Anthropic WIF identity token boundary
+
+// readCredentialFile applies the same bounded regular-file semantics as
+// configuredOAuthSecret: os.Stat rejects non-regular or oversized inputs
+// before os.Open (a FIFO or device open would otherwise block while the
+// global IdentitySource mutex is held), the fd re-stat narrows the
+// stat-to-open swap window, and the read is capped at credentialFileLimit+1
+// bytes. ctx is checked before any potentially blocking call.
+func readCredentialFile(ctx context.Context, path string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return nil, fmt.Errorf("credential file path is required")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > credentialFileLimit {
+		return nil, fmt.Errorf("credential file must be a regular file no larger than %d MiB", credentialFileLimit>>20)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil {
+		return nil, err
+	} else if !info.Mode().IsRegular() || info.Size() > credentialFileLimit {
+		return nil, fmt.Errorf("credential file must be a regular file no larger than %d MiB", credentialFileLimit>>20)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, credentialFileLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > credentialFileLimit {
+		return nil, fmt.Errorf("credential file must be a regular file no larger than %d MiB", credentialFileLimit>>20)
+	}
+	return raw, nil
 }

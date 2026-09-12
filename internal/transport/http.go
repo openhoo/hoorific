@@ -257,7 +257,39 @@ func SanitizeRequestHeaders(h http.Header) {
 		}
 	}
 }
-func SanitizeResponseHeaders(h http.Header) { stripHop(h); h.Del("Set-Cookie"); h.Del("Server") }
+
+// SanitizeResponseHeaders is the authoritative boundary for relayed upstream
+// responses. Upstream bytes are data: they must never execute as an active
+// document on a Hoorific origin, including when a user agent navigates a relay
+// URL directly. Active content types are neutralized, sniffing is disabled, and
+// a sandboxing CSP keeps any remaining document inert. Header choices made here
+// are captured by response caches such as idempotency replay, so callers must
+// not rely on setting these headers earlier in the dispatch chain.
+func SanitizeResponseHeaders(h http.Header) {
+	stripHop(h)
+	h.Del("Set-Cookie")
+	h.Del("Server")
+	h.Del("Clear-Site-Data")
+	h.Del("Refresh")
+	h.Del("Content-Security-Policy-Report-Only")
+	if activeContentType(h.Get("Content-Type")) {
+		h.Set("Content-Type", "text/plain; charset=utf-8")
+	}
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Security-Policy", "sandbox")
+}
+
+// activeContentType reports whether the media type renders as an executable
+// or script-bearing document in browsers. Unknown types stay untouched; the
+// sandboxing CSP above already keeps any rendered document inert.
+func activeContentType(contentType string) bool {
+	media := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	switch media {
+	case "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml":
+		return true
+	}
+	return false
+}
 func SanitizeRequest(req *http.Request) {
 	if req == nil {
 		return
