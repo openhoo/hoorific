@@ -1,5 +1,11 @@
 # hoorific Changelog
 
+## 0.3.2 (2026-09-12)
+
+### Bug Fixes
+
+- **security:** bound identity file reads, neutralize relayed active content, free rejected idempotency keys (a5c8c34)
+
 ## 0.3.1 (2026-09-09)
 
 ### Bug Fixes
